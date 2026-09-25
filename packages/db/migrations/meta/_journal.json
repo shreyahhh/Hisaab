@@ -1,0 +1,34 @@
+{
+  "version": "7",
+  "dialect": "postgresql",
+  "entries": [
+    {
+      "idx": 0,
+      "version": "7",
+      "when": 1790328305255,
+      "tag": "0000_clean_sleeper",
+      "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1790333756129,
+      "tag": "0001_solid_viper",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1790334095717,
+      "tag": "0002_audit_log_no_org_fk",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1790334736136,
+      "tag": "0003_audit_log_no_actor_fk",
+      "breakpoints": true
+    }
+  ]
+}

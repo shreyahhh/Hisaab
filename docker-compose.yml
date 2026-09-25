@@ -1,0 +1,95 @@
+name: truepath
+
+# Local dev infra only (SPEC §3 / §12 M0-2). Credentials below are dev-only defaults, never used
+# outside this file. Real secrets always come from AWS Secrets Manager (CLAUDE.md rule 6).
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: truepath
+      POSTGRES_PASSWORD: truepath
+      POSTGRES_DB: truepath
+    ports:
+      - '5432:5432'
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U truepath -d truepath']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  clickhouse:
+    # 26.8 LTS (current as of 2026-09) — matches what ClickHouse Cloud runs far more closely than
+    # 24.8 did. Functionally 24.8 already had lightweight deletes/APPLY DELETED MASK (GA since
+    # 23.3) and min_age_to_force_merge_seconds (stable since ~22.x), so this bump is about ADR-0013's
+    # staging-parity condition, not a missing feature. Existing `chdata` volumes from 24.8 should be
+    # recreated (`docker compose down -v`) rather than upgraded in place — there's no production data
+    # to preserve yet.
+    image: clickhouse/clickhouse-server:26.8-alpine
+    restart: unless-stopped
+    environment:
+      CLICKHOUSE_USER: truepath
+      CLICKHOUSE_PASSWORD: truepath
+      CLICKHOUSE_DB: truepath
+    ports:
+      - '8123:8123' # HTTP
+      - '9000:9000' # native
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    volumes:
+      - chdata:/var/lib/clickhouse
+    healthcheck:
+      # 127.0.0.1, not localhost: some Docker networking setups resolve `localhost` to `::1` first,
+      # and the container has no working IPv6 stack (the server's own `[::]` bind attempts fail with
+      # "address family not supported"), so `localhost` would report unhealthy against a server
+      # that's actually up and serving fine on IPv4.
+      test: ['CMD', 'wget', '--spider', '-q', 'http://127.0.0.1:8123/ping']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # Durable Redis — stream:events-raw, BullMQ queues, dedupe keys, suppression sets (HLD §4/§8).
+  # AOF persistence, noeviction: this data must never be evicted or silently lost.
+  redis-durable:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: >
+      redis-server
+      --appendonly yes
+      --maxmemory-policy noeviction
+    ports:
+      - '6379:6379'
+    volumes:
+      - redis-durable-data:/data
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # Cache Redis — report query cache (5 min TTL) + Better Auth rate-limit counters (HLD §8).
+  # No persistence: disposable, LRU eviction.
+  redis-cache:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: >
+      redis-server
+      --save ""
+      --appendonly no
+      --maxmemory-policy allkeys-lru
+    ports:
+      - '6380:6379'
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  pgdata:
+  chdata:
+  redis-durable-data:
