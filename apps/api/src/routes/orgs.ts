@@ -1,6 +1,7 @@
 import { fromNodeHeaders } from 'better-auth/node';
 import type { FastifyInstance } from 'fastify';
 import { createAuditLogRepository, createStoreRepository } from '@truepath/db';
+import { authCall } from '../authCall.js';
 import {
   requireOrgScope,
   requirePermission,
@@ -17,10 +18,12 @@ export function registerOrgRoutes(app: FastifyInstance, deps: TenantScopeDeps): 
     const session = await requireSession(deps, request, reply);
     if (!session) return;
 
-    const org = await deps.auth.api.createOrganization({
-      body: { name: request.body.name, slug: request.body.slug },
-      headers: fromNodeHeaders(request.headers),
-    });
+    const org = await authCall(() =>
+      deps.auth.api.createOrganization({
+        body: { name: request.body.name, slug: request.body.slug },
+        headers: fromNodeHeaders(request.headers),
+      }),
+    );
     await reply.code(201).send(org);
   });
 
@@ -28,9 +31,9 @@ export function registerOrgRoutes(app: FastifyInstance, deps: TenantScopeDeps): 
     const session = await requireSession(deps, request, reply);
     if (!session) return;
 
-    const organizations = await deps.auth.api.listOrganizations({
-      headers: fromNodeHeaders(request.headers),
-    });
+    const organizations = await authCall(() =>
+      deps.auth.api.listOrganizations({ headers: fromNodeHeaders(request.headers) }),
+    );
     await reply.send({ organizations });
   });
 

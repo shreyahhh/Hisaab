@@ -24,3 +24,18 @@ from `@truepath/privacy`; nothing here implements its own hashing.
 
 Tests run files one at a time (`vitest.config.ts`): they share one Postgres and one durable Redis
 and assert on global state.
+
+## Calling Better Auth: `authCall`
+
+Better Auth reports failure two ways: `auth.api.*` throws an `APIError`, or, with `asResponse: true`,
+it **returns** a 4xx `Response` without throwing. Treating "no exception" as success audited every
+wrong password as `login_succeeded`. Every `auth.api.*` call goes through `authCall`
+(`src/authCall.ts`), which turns both forms into one thrown `AuthApiError` (status + Better Auth's
+error code). `app.ts` maps an uncaught one to that status with `{ "error": "<code>" }`; a handler
+that needs to act on a failure (login's audit row, the members routes' `last_owner`) catches it
+and rethrows. Anything else that is thrown (a database outage, a bug) is not converted and stays a 500.
+`src/authCall.test.ts` fails if any `auth.api.*` call in the app is not wrapped, and
+`src/authFailurePaths.test.ts` covers each call site's failure (HTTP response and audit rows).
+
+Failed sign-up, login and logout now answer `{ "error": "<code>" }` like every other route, instead of
+forwarding Better Auth's own `{ "code", "message" }` body.

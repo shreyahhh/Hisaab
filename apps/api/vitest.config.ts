@@ -2,7 +2,8 @@ import { defineConfig } from 'vitest/config';
 
 // These tests share one Postgres and one durable Redis, and some assert on global state (the
 // audit_log, the login rate-limit buckets — including the one bucket every unusable email shares).
-// Running files one at a time keeps them from seeing each other's rows and counters.
+// Running files one at a time keeps them from seeing each other's rows and counters. Parallel runs
+// need per-worker isolation: see issue #11.
 export default defineConfig({
   test: { fileParallelism: false },
 });

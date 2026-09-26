@@ -3,6 +3,7 @@ import type { FastifyReply, FastifyRequest } from 'fastify';
 import { createStoreRepository, resolveStoreOrganization, type Db } from '@truepath/db';
 import { resolveMembership, type Auth } from '@truepath/auth';
 import { can, type Permission, type TenantScope } from '@truepath/shared';
+import { authCall } from './authCall.js';
 
 declare module 'fastify' {
   interface FastifyRequest {
@@ -27,7 +28,9 @@ export async function requireSession(
   request: FastifyRequest,
   reply: FastifyReply,
 ): Promise<Session | undefined> {
-  const session = await deps.auth.api.getSession({ headers: fromNodeHeaders(request.headers) });
+  const session = await authCall(() =>
+    deps.auth.api.getSession({ headers: fromNodeHeaders(request.headers) }),
+  );
   if (!session) {
     await reply.code(401).send({ error: 'unauthenticated' });
     return undefined;

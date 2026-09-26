@@ -1,10 +1,10 @@
-import { APIError } from 'better-auth/api';
 import { fromNodeHeaders } from 'better-auth/node';
 import type { FastifyInstance } from 'fastify';
 import { findUserIdByEmail } from '@truepath/auth';
 import { createAuditLogRepository } from '@truepath/db';
 import { normaliseEmail } from '@truepath/privacy';
-import { forwardResponse, sendAuthApiError } from '../errors.js';
+import { AuthApiError, authCall } from '../authCall.js';
+import { forwardResponse } from '../errors.js';
 import type { RouteLimits } from '../rateLimit.js';
 import { requireSession, type TenantScopeDeps } from '../tenantScope.js';
 
@@ -13,6 +13,10 @@ import { requireSession, type TenantScopeDeps } from '../tenantScope.js';
  * `/v1/auth/*` bridge in app.ts already exposes Better Auth's default paths; these add the
  * friendlier `/v1/auth/signup|login|logout` names plus our own login audit trail (S-4), which the
  * generic bridge has no hook to add.
+ *
+ * These call Better Auth with `asResponse: true`, which returns a 4xx Response on failure instead
+ * of throwing; `authCall` turns that into an AuthApiError, and app.ts maps an uncaught one to
+ * `{ error: <code> }` with Better Auth's status.
  *
  * login_failed's metadata holds no email and no hash of one (privacy-dpdp.md: audit metadata is ids
  * and counts only). It says which account the attempt targeted — `target_user_id` when the attempted
@@ -28,15 +32,10 @@ export function registerAuthWrapperRoutes(
     '/v1/auth/signup',
     { config: limits.signupIp },
     async (request, reply) => {
-      try {
-        const response = await deps.auth.api.signUpEmail({
-          body: request.body,
-          asResponse: true,
-        });
-        await forwardResponse(reply, response);
-      } catch (error) {
-        await sendAuthApiError(reply, error);
-      }
+      const response = await authCall(() =>
+        deps.auth.api.signUpEmail({ body: request.body, asResponse: true }),
+      );
+      await forwardResponse(reply, response);
     },
   );
 
@@ -48,57 +47,44 @@ export function registerAuthWrapperRoutes(
       if (!(await limits.loginEmail(request, reply))) return;
       const auditLog = createAuditLogRepository(deps.db);
 
-      // With `asResponse: true` Better Auth returns a 4xx Response for a wrong password rather than
-      // throwing, so success is decided by the status, not by the absence of an exception.
-      let response: Response | undefined;
-      let failure: unknown;
+      let response: Response;
       try {
-        response = await deps.auth.api.signInEmail({ body: request.body, asResponse: true });
+        response = await authCall(() =>
+          deps.auth.api.signInEmail({ body: request.body, asResponse: true }),
+        );
       } catch (error) {
-        failure = error;
-      }
-
-      if (response?.ok) {
+        // Anything that isn't a Better Auth rejection (a database outage, a bug) is a server error,
+        // not a failed login: it propagates unaudited.
+        if (!(error instanceof AuthApiError)) throw error;
+        const email =
+          typeof request.body?.email === 'string' ? normaliseEmail(request.body.email) : null;
+        const userId = email === null ? null : await findUserIdByEmail(deps.db, email);
         await auditLog.recordGlobal({
           actorType: 'user',
-          action: 'login_succeeded',
+          action: 'login_failed',
           targetType: 'auth',
           targetId: 'login',
+          metadata: userId === null ? { unknown_account: true } : { target_user_id: userId },
         });
-        await forwardResponse(reply, response);
-        return;
+        throw error;
       }
 
-      // Anything that isn't a Better Auth rejection (a database outage, a bug) is a server error,
-      // not a failed login: rethrow it rather than audit it as one.
-      if (!response && !(failure instanceof APIError)) throw failure;
-
-      const email =
-        typeof request.body?.email === 'string' ? normaliseEmail(request.body.email) : null;
-      const userId = email === null ? null : await findUserIdByEmail(deps.db, email);
       await auditLog.recordGlobal({
         actorType: 'user',
-        action: 'login_failed',
+        action: 'login_succeeded',
         targetType: 'auth',
         targetId: 'login',
-        metadata: userId === null ? { unknown_account: true } : { target_user_id: userId },
       });
-      if (response) await forwardResponse(reply, response);
-      else await sendAuthApiError(reply, failure);
+      await forwardResponse(reply, response);
     },
   );
 
   app.post('/v1/auth/logout', async (request, reply) => {
     const session = await requireSession(deps, request, reply);
     if (!session) return;
-    try {
-      const response = await deps.auth.api.signOut({
-        headers: fromNodeHeaders(request.headers),
-        asResponse: true,
-      });
-      await forwardResponse(reply, response);
-    } catch (error) {
-      await sendAuthApiError(reply, error);
-    }
+    const response = await authCall(() =>
+      deps.auth.api.signOut({ headers: fromNodeHeaders(request.headers), asResponse: true }),
+    );
+    await forwardResponse(reply, response);
   });
 }

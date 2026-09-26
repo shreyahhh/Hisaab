@@ -3,7 +3,7 @@ import type { FastifyInstance } from 'fastify';
 import { createAuditLogRepository } from '@truepath/db';
 import { getInvitation, resolveMembership } from '@truepath/auth';
 import { isAtOrBelowOwnRank, RoleSchema, roleCan } from '@truepath/shared';
-import { sendAuthApiError } from '../errors.js';
+import { authCall } from '../authCall.js';
 import type { RouteLimits } from '../rateLimit.js';
 import {
   requireOrgScope,
@@ -37,10 +37,12 @@ export function registerInviteRoutes(
         return;
       }
 
-      const invitation = await deps.auth.api.createInvitation({
-        body: { email: request.body.email, role, organizationId: scope.organizationId },
-        headers: fromNodeHeaders(request.headers),
-      });
+      const invitation = await authCall(() =>
+        deps.auth.api.createInvitation({
+          body: { email: request.body.email, role, organizationId: scope.organizationId },
+          headers: fromNodeHeaders(request.headers),
+        }),
+      );
 
       await createAuditLogRepository(deps.db).record(scope, {
         organizationId: scope.organizationId,
@@ -89,36 +91,34 @@ export function registerInviteRoutes(
         }
       }
 
-      try {
-        const result = await deps.auth.api.acceptInvitation({
+      const result = await authCall(() =>
+        deps.auth.api.acceptInvitation({
           body: { invitationId: request.params.token },
           headers: fromNodeHeaders(request.headers),
-        });
+        }),
+      );
 
-        if (result?.invitation) {
-          await createAuditLogRepository(deps.db).record(
-            {
-              kind: 'tenant',
-              userId: session.user.id,
-              organizationId: result.invitation.organizationId,
-              role: 'job',
-              storeIds: new Set(),
-            },
-            {
-              organizationId: result.invitation.organizationId,
-              actorUserId: session.user.id,
-              actorType: 'user',
-              action: 'member_invite_accepted',
-              targetType: 'invite',
-              targetId: result.invitation.id,
-            },
-          );
-        }
-
-        await reply.send(result);
-      } catch (error) {
-        await sendAuthApiError(reply, error);
+      if (result?.invitation) {
+        await createAuditLogRepository(deps.db).record(
+          {
+            kind: 'tenant',
+            userId: session.user.id,
+            organizationId: result.invitation.organizationId,
+            role: 'job',
+            storeIds: new Set(),
+          },
+          {
+            organizationId: result.invitation.organizationId,
+            actorUserId: session.user.id,
+            actorType: 'user',
+            action: 'member_invite_accepted',
+            targetType: 'invite',
+            targetId: result.invitation.id,
+          },
+        );
       }
+
+      await reply.send(result);
     },
   );
 }
