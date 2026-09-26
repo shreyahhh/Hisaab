@@ -50,6 +50,11 @@ export const auth = betterAuth({
     ipAddress: { ipAddressHeaders: ['x-forwarded-for'] },  // behind one ALB hop; used for rate limiting
     useSecureCookies: true,
     crossSubDomainCookies: { enabled: true, domain: '<registrable domain>' },   // app.<d> and api.<d>
+    // Explicit, not left to Better Auth's own default: it silently disables this check whenever
+    // NODE_ENV reads "test" (isTest(), @better-auth/core), which is exactly Vitest's default and
+    // is cached at module load, so it can't be toggled per-instance — trustedOrigins matters too
+    // much to depend on an env-detection heuristic (M0-4 review; betterAuth.ts).
+    disableOriginCheck: false,
   },
   trustedOrigins: ['https://app.<domain>'],
   emailAndPassword: {
@@ -59,7 +64,7 @@ export const auth = betterAuth({
   emailVerification: { sendVerificationEmail: sesSend('verify') },
   socialProviders: { google: { clientId, clientSecret, scope: ['openid', 'email', 'profile'] } },
   session: { modelName: 'sessions', expiresIn: 60 * 60 * 24 * 14, updateAge: 60 * 60 * 24 },   // 14-day sliding
-  rateLimit: { enabled: true, window: 60, max: 10, storage: 'secondary-storage' },  // on the cache Redis, prefix ba:
+  rateLimit: { enabled: true, window: 60, max: 10, storage: 'secondary-storage' },  // durable Redis, prefix ba: (ADR-0019)
   user:         { modelName: 'users' },
   account:      { modelName: 'auth_accounts' },
   verification: { modelName: 'auth_tokens' },
@@ -220,8 +225,8 @@ sequenceDiagram
 
 | Failure | Behaviour |
 |---|---|
-| Brute-force login | Better Auth rate limit (10 per 60 s per IP on auth routes, counters in cache Redis `ba:`) → `429`; audit `login_failed` with only an HMAC of the email in metadata |
-| Cache Redis down | Better Auth rate limiting falls back as configured (**fail closed** on auth routes: `503`), so logins pause rather than going unthrottled |
+| Brute-force login | Better Auth rate limit (10 per 60 s per IP on auth routes, counters in durable Redis `ba:` — ADR-0019) → `429`; audit `login_failed` with only an HMAC of the email in metadata |
+| Durable Redis down | Better Auth rate limiting falls back as configured (**fail closed** on auth routes: `503`), so logins pause rather than going unthrottled — the same outage HLD Q2/Q14 already treat as collector- and worker-wide, so auth failing closed too is consistent, not a new failure mode |
 | Session lookup failure (Postgres) | `503`; never treated as unauthenticated-but-allowed |
 | Membership removed mid-session | the next request → `404` for that org |
 | Invite for an email different from the logged-in user | `403 invite_email_mismatch` |

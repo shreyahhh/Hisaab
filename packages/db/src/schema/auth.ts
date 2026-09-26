@@ -1,6 +1,16 @@
-import { boolean, jsonb, pgTable, text, timestamp, uniqueIndex, uuid } from 'drizzle-orm/pg-core';
-import { ORGANIZATION_STATUSES } from '@truepath/shared';
+import {
+  boolean,
+  index,
+  jsonb,
+  pgTable,
+  text,
+  timestamp,
+  uniqueIndex,
+  uuid,
+} from 'drizzle-orm/pg-core';
+import { INVITE_STATUSES, ORGANIZATION_STATUSES } from '@truepath/shared';
 import { checkOneOf } from './columns.js';
+import { roleEnum } from './enums.js';
 
 // Better Auth's own identity tables (Accepted ADR-0012). Schema only, matching auth-tenancy.md §3
 // column-for-column so Better Auth's Drizzle adapter can point at these tables via `modelName`
@@ -89,31 +99,50 @@ export const organizations = pgTable(
   }),
 );
 
-export const memberships = pgTable('memberships', {
-  id: uuid('id').primaryKey().defaultRandom(),
-  organizationId: uuid('organization_id')
-    .notNull()
-    .references(() => organizations.id, { onDelete: 'cascade' }),
-  userId: uuid('user_id')
-    .notNull()
-    .references(() => users.id, { onDelete: 'cascade' }),
-  role: text('role').notNull(), // owner | admin | analyst | viewer (auth-tenancy.md §2.4)
-  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
-});
+export const memberships = pgTable(
+  'memberships',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    organizationId: uuid('organization_id')
+      .notNull()
+      .references(() => organizations.id, { onDelete: 'cascade' }),
+    userId: uuid('user_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'cascade' }),
+    role: roleEnum('role').notNull(), // owner | admin | analyst | viewer (auth-tenancy.md §2.4)
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => ({
+    // Backs the tenant-scope-building membership lookup (auth-tenancy.md §4.3) — a hot path with
+    // a < 10 ms p95 target (auth-tenancy.md §7).
+    orgUserIdx: index('memberships_organization_id_user_id_idx').on(
+      table.organizationId,
+      table.userId,
+    ),
+  }),
+);
 
-export const invites = pgTable('invites', {
-  id: uuid('id').primaryKey().defaultRandom(),
-  organizationId: uuid('organization_id')
-    .notNull()
-    .references(() => organizations.id, { onDelete: 'cascade' }),
-  email: text('email').notNull(),
-  role: text('role').notNull(),
-  // No CHECK: Better Auth's organization plugin owns this field's value set and lifecycle
-  // (M0-4). Constraining it here, before that's wired up, risks rejecting a value the plugin
-  // itself considers valid.
-  status: text('status').notNull().default('pending'),
-  expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(),
-  inviterId: uuid('inviter_id')
-    .notNull()
-    .references(() => users.id),
-});
+export const invites = pgTable(
+  'invites',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    organizationId: uuid('organization_id')
+      .notNull()
+      .references(() => organizations.id, { onDelete: 'cascade' }),
+    email: text('email').notNull(),
+    role: roleEnum('role').notNull(),
+    // Better Auth's organization plugin owns this field's lifecycle; value set confirmed against
+    // its crud-invites route source (M0-4) — see @truepath/shared INVITE_STATUSES.
+    status: text('status').notNull().default('pending'),
+    expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(),
+    inviterId: uuid('inviter_id')
+      .notNull()
+      .references(() => users.id),
+    // Not in SPEC's column list; required by Better Auth's own `invitation` model — its Drizzle
+    // schema check (M0-4) fails without it. Additive and harmless (metadata only).
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => ({
+    statusCheck: checkOneOf('invites_status_check', table.status, INVITE_STATUSES),
+  }),
+);

@@ -26,7 +26,7 @@ Use **Better Auth, self-hosted on our Postgres in ap-south-1**, with the organiz
 - UUID ids; custom roles (`owner`, `admin`, `analyst`, `viewer`); 7-day invitations.
 - Email verification required; minimum password length 12.
 - 14-day sliding sessions with session IPs truncated; Google tokens nulled after sign-in.
-- Rate-limit counters on the cache Redis (prefix `ba:`).
+- Rate-limit counters on the **durable** Redis (prefix `ba:`) — moved off the cache Redis by **Accepted ADR-0019**; see that ADR for why.
 - Mounted under `/v1/auth/*`, with SPEC's named auth routes as thin wrappers.
 
 Clerk is recorded as the **rejected alternative** (a US sub-processor for staff personal data).

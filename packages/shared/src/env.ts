@@ -51,6 +51,18 @@ export const collectorPortEnvSchema = z.object({
   COLLECTOR_PORT: z.coerce.number().int().positive().default(3001),
 });
 
+// Better Auth config (ADR-0012, auth-tenancy.md §2.2). BETTER_AUTH_URL is this API's own base URL
+// (used to build OAuth callback URLs); DASHBOARD_URL is the one trusted origin allowed to call
+// auth routes with credentials.
+export const authEnvSchema = z.object({
+  BETTER_AUTH_SECRET: z.string().min(32),
+  BETTER_AUTH_URL: z.string().url(),
+  DASHBOARD_URL: z.string().url(),
+  GOOGLE_CLIENT_ID: z.string().min(1),
+  GOOGLE_CLIENT_SECRET: z.string().min(1),
+});
+export type AuthEnv = z.infer<typeof authEnvSchema>;
+
 type WithCommon<Schema extends z.ZodTypeAny> = z.ZodIntersection<typeof commonEnvSchema, Schema>;
 
 // Pure validation, no process access beyond reading `source` — this is what's unit tested.

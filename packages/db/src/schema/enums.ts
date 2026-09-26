@@ -1,4 +1,5 @@
 import { pgEnum } from 'drizzle-orm/pg-core';
+import { ROLES } from '@truepath/shared';
 
 // Native pgEnum reserved for value sets that are stable and fully code-controlled — SPEC-defined
 // constants, not external-facing categories (contrast packages/shared valueLists.ts, whose lists
@@ -37,3 +38,8 @@ export const attributionModelEnum = pgEnum('attribution_model', [
 ]);
 
 export const revenueBasisEnum = pgEnum('revenue_basis', ['placed', 'delivered']);
+
+// owner | admin | analyst | viewer (auth-tenancy.md §2.4) — fully code-controlled by the can()
+// permission matrix in @truepath/shared, so a native pgEnum rather than valueLists.ts's
+// text+CHECK pattern (see this file's header comment).
+export const roleEnum = pgEnum('role', ROLES);

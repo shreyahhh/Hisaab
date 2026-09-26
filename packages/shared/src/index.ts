@@ -5,3 +5,5 @@ export const PACKAGE_NAME = '@truepath/shared';
 
 export * from './env.js';
 export * from './valueLists.js';
+export * from './auth.js';
+export * from './keys.js';

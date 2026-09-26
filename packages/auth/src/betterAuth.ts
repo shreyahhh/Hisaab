@@ -1,0 +1,145 @@
+import { betterAuth } from 'better-auth';
+import { drizzleAdapter } from 'better-auth/adapters/drizzle';
+import { organization } from 'better-auth/plugins/organization';
+import { redisStorage } from '@better-auth/redis-storage';
+import { Redis } from 'ioredis';
+import { schema, type Db } from '@truepath/db';
+import type { AuthEnv } from '@truepath/shared';
+import { ac, adminRole, analystRole, ownerRole, viewerRole } from './accessControl.js';
+import { noopEmailSender, type AuthEmailSender } from './email.js';
+import { nullGoogleTokensAfterCreate, truncateIp } from './hooks.js';
+
+export type { AuthEnv };
+
+// The Drizzle adapter looks up `config.schema[modelName]` by exact key (verified against
+// @better-auth/drizzle-adapter@1.7.6's implementation), so this must be keyed by the snake_case
+// modelName strings configured below (auth-tenancy.md §2.2/§3), not packages/db's camelCase export
+// names.
+const authDrizzleSchema = {
+  users: schema.users,
+  auth_accounts: schema.authAccounts,
+  sessions: schema.sessions,
+  auth_tokens: schema.authTokens,
+  organizations: schema.organizations,
+  memberships: schema.memberships,
+  invites: schema.invites,
+};
+
+export interface CreateAuthOptions {
+  readonly db: Db;
+  readonly env: AuthEnv;
+  /**
+   * Rate-limit counters live on the **durable** Redis, not the cache instance (ADR-0019,
+   * superseding ADR-0012's original "cache Redis" placement): the cache instance is
+   * `allkeys-lru` and can evict a counter under memory pressure, silently disabling rate
+   * limiting for that key. The durable instance is `noeviction`, so a counter is never evicted
+   * — it only ever goes away via the TTL `@better-auth/redis-storage` sets on every key
+   * (`EXPIRE`/`SETEX`), which still bounds its lifetime to the rate-limit window.
+   */
+  readonly redisDurableUrl: string;
+  /** false in local dev/test (plain HTTP); true in every deployed environment. */
+  readonly useSecureCookies: boolean;
+  /** Set only once a real registrable domain exists, to enable crossSubDomainCookies (app.<d>/api.<d>). */
+  readonly cookieDomain?: string;
+  /** SES wiring lands in a later ticket; defaults to a logging no-op (email.ts). */
+  readonly emailSender?: AuthEmailSender;
+}
+
+/** Builds the Better Auth instance (ADR-0012, auth-tenancy.md §2.2). */
+export function createAuth(options: CreateAuthOptions) {
+  const { db, env } = options;
+  const emailSender = options.emailSender ?? noopEmailSender;
+  const redis = new Redis(options.redisDurableUrl);
+
+  return betterAuth({
+    database: drizzleAdapter(db, { provider: 'pg', schema: authDrizzleSchema }),
+    basePath: '/v1/auth',
+    baseURL: env.BETTER_AUTH_URL,
+    secret: env.BETTER_AUTH_SECRET,
+    advanced: {
+      database: { generateId: 'uuid' },
+      // Behind one ALB hop (HLD §7); used only for Better Auth's own rate limiting.
+      ipAddress: { ipAddressHeaders: ['x-forwarded-for'] },
+      useSecureCookies: options.useSecureCookies,
+      // Better Auth otherwise disables its own origin/CSRF check whenever it detects a test
+      // environment (`isTest()`: NODE_ENV==='test' — @better-auth/core's env-impl.ts, cached at
+      // module load, so it can't be toggled per-instance at runtime). trustedOrigins is a real
+      // security boundary (auth-tenancy.md §4.1); it must never be silently off just because
+      // NODE_ENV happens to read "test" somewhere, so this is set explicitly rather than left to
+      // that default.
+      disableOriginCheck: false,
+      ...(options.cookieDomain
+        ? { crossSubDomainCookies: { enabled: true, domain: options.cookieDomain } }
+        : {}),
+    },
+    trustedOrigins: [env.DASHBOARD_URL],
+    emailAndPassword: {
+      enabled: true,
+      minPasswordLength: 12,
+      requireEmailVerification: true,
+      sendResetPassword: async ({ user, url }) =>
+        emailSender.sendPasswordReset({ to: user.email, url }),
+    },
+    emailVerification: {
+      sendVerificationEmail: async ({ user, url }) =>
+        emailSender.sendVerificationEmail({ to: user.email, url }),
+    },
+    socialProviders: {
+      google: {
+        clientId: env.GOOGLE_CLIENT_ID,
+        clientSecret: env.GOOGLE_CLIENT_SECRET,
+        scope: ['openid', 'email', 'profile'],
+      },
+    },
+    session: {
+      modelName: 'sessions',
+      expiresIn: 60 * 60 * 24 * 14, // 14-day sliding
+      updateAge: 60 * 60 * 24,
+    },
+    rateLimit: {
+      enabled: true,
+      window: 60,
+      max: 10,
+      storage: 'secondary-storage',
+    },
+    secondaryStorage: redisStorage({ client: redis, keyPrefix: 'ba:' }),
+    user: { modelName: 'users' },
+    account: { modelName: 'auth_accounts' },
+    verification: { modelName: 'auth_tokens' },
+    databaseHooks: {
+      session: {
+        create: {
+          before: async (session) => ({
+            data: { ...session, ipAddress: truncateIp(session.ipAddress) },
+          }),
+        },
+      },
+      account: {
+        create: {
+          after: async (account) => nullGoogleTokensAfterCreate(db, account),
+        },
+      },
+    },
+    plugins: [
+      organization({
+        schema: {
+          organization: { modelName: 'organizations' },
+          member: { modelName: 'memberships' },
+          invitation: { modelName: 'invites' },
+        },
+        ac,
+        roles: { owner: ownerRole, admin: adminRole, analyst: analystRole, viewer: viewerRole },
+        invitationExpiresIn: 60 * 60 * 24 * 7, // 7 days (plugin default is 48h)
+        sendInvitationEmail: async (data) =>
+          emailSender.sendInvitation({
+            to: data.email,
+            url: `${env.DASHBOARD_URL}/invite/${data.id}`,
+            organizationName: data.organization.name,
+          }),
+        allowUserToCreateOrganization: true,
+      }),
+    ],
+  });
+}
+
+export type Auth = ReturnType<typeof createAuth>;

@@ -22,6 +22,7 @@ Michael Nygard format (Title, Status, Context, Decision, Consequences). **Accept
 | [0016](0016-tenant-isolation-strategy.md) | Tenant isolation strategy | Accepted | HLD review (not in SPEC §15) |
 | [0017](0017-event-dedup-strategy.md) | Event de-duplication for `events` / `touchpoints` | Accepted | HLD review |
 | [0018](0018-vitest-for-testing.md) | Vitest as the unit test runner | Accepted | SPEC §15 (open decision, M0-1) |
+| [0019](0019-better-auth-rate-limit-storage-durable-redis.md) | Better Auth rate-limit storage: durable Redis, not cache Redis | Accepted, supersedes ADR-0012's placement | M0-4 review |
 
 **Decisions made during the review that are recorded in HLD §8 / SPEC v0.5 rather than as separate ADRs** (candidates to promote if they are ever revisited):
 - query-time delivered revenue via `order_status`;

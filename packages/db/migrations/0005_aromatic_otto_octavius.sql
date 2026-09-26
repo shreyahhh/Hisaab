@@ -1,0 +1,2 @@
+ALTER TABLE "invites" ADD COLUMN "created_at" timestamp with time zone DEFAULT now() NOT NULL;--> statement-breakpoint
+ALTER TABLE "invites" ADD CONSTRAINT "invites_status_check" CHECK ("invites"."status" IN ('pending', 'accepted', 'rejected', 'canceled'));

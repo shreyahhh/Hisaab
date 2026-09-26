@@ -117,8 +117,8 @@ describe('Postgres schema (SPEC §6.1)', () => {
     }
   });
 
-  it('deliberately has no CHECK on invites.status — Better Auth owns that field (M0-4)', () => {
-    expect(checkNames(schema.invites)).toEqual([]);
+  it("checks invites.status against Better Auth's own invitation value set, confirmed at M0-4 (auth-tenancy.md §3)", () => {
+    expect(checkNames(schema.invites)).toEqual(['invites_status_check']);
   });
 
   it('has the idempotency unique constraints the LLDs rely on for upserts', () => {
@@ -149,6 +149,22 @@ describe('Postgres schema (SPEC §6.1)', () => {
     );
     expect(fk).toBeUndefined();
     expect(config.indexes.map((i) => i.config.name)).toContain('audit_log_organization_id_idx');
+  });
+
+  it('memberships and invites store role as the code-controlled role enum, not a free-form CHECK (auth-tenancy.md §2.4)', () => {
+    expect(
+      getTableConfig(schema.memberships).columns.find((c) => c.name === 'role')?.enumValues,
+    ).toEqual(['owner', 'admin', 'analyst', 'viewer']);
+    expect(
+      getTableConfig(schema.invites).columns.find((c) => c.name === 'role')?.enumValues,
+    ).toEqual(['owner', 'admin', 'analyst', 'viewer']);
+  });
+
+  it('memberships has the (organization_id, user_id) index the scope-building lookup relies on (auth-tenancy.md §4.3/§7)', () => {
+    const config = getTableConfig(schema.memberships);
+    expect(config.indexes.map((i) => i.config.name)).toContain(
+      'memberships_organization_id_user_id_idx',
+    );
   });
 
   it('audit_log.actor_user_id has no FK (audit history stays attributable after the user is deleted, and user/org deletion is never blocked by audit rows)', () => {

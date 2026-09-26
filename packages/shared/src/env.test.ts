@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { parseEnv, postgresEnvSchema, redisDurableEnvSchema } from './env.js';
+import { authEnvSchema, parseEnv, postgresEnvSchema, redisDurableEnvSchema } from './env.js';
 
 describe('parseEnv', () => {
   it('accepts a valid environment', () => {
@@ -29,6 +29,28 @@ describe('parseEnv', () => {
       expect(result.data.NODE_ENV).toBe('development');
       expect(result.data.LOG_LEVEL).toBe('info');
     }
+  });
+
+  it('rejects a Better Auth secret shorter than 32 chars', () => {
+    const result = parseEnv(authEnvSchema, {
+      BETTER_AUTH_SECRET: 'too-short',
+      BETTER_AUTH_URL: 'http://localhost:3000',
+      DASHBOARD_URL: 'http://localhost:5173',
+      GOOGLE_CLIENT_ID: 'client-id',
+      GOOGLE_CLIENT_SECRET: 'client-secret',
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it('accepts a valid auth environment', () => {
+    const result = parseEnv(authEnvSchema, {
+      BETTER_AUTH_SECRET: 'a'.repeat(32),
+      BETTER_AUTH_URL: 'http://localhost:3000',
+      DASHBOARD_URL: 'http://localhost:5173',
+      GOOGLE_CLIENT_ID: 'client-id',
+      GOOGLE_CLIENT_SECRET: 'client-secret',
+    });
+    expect(result.success).toBe(true);
   });
 
   it('never echoes the source values back in a way that would leak them into a diff of this test', () => {
