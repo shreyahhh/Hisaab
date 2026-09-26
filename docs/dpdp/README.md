@@ -1,6 +1,6 @@
 # DPDP documents
 
-This folder will hold the privacy notice templates, DPA template, RoPA, breach runbook and sub-processor list listed in SPEC §4 and §5. Those are drafted with counsel (SPEC M0-7) and are not written here.
+This folder holds the privacy documents listed in SPEC §4 and §5. The DPA template and shopper notice are **engineering drafts for counsel** (SPEC M0-7), not approved legal text. The RoPA and breach runbook are not drafted yet.
 
 ## Engineering facts the shopper notice must reflect
 
@@ -27,4 +27,7 @@ The exact admin labels in steps 1–2 are confirmed in the dev-store test (colle
 
 ## Files in this folder
 - [subprocessors.md](subprocessors.md) — sub-processor list (S-7).
-- To be drafted with counsel: `shopper-notice.md` (EN + HI), DPA template, RoPA, `breach-runbook.md`.
+- [dpa-template.md](dpa-template.md) — DPA draft, version `0.1-draft`, with an open-items list for counsel.
+- [shopper-notice.md](shopper-notice.md) — shopper notice draft, English + Hindi (SPEC P-2).
+- [../m0-7-external-setup.md](../m0-7-external-setup.md) — the human-only steps of M0-7 (app registrations, access requests, counsel review).
+- To be drafted with counsel: RoPA, `breach-runbook.md`.
