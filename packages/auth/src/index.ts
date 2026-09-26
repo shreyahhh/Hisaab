@@ -18,4 +18,10 @@ export {
   type MembershipInfo,
   type OrganizationMembership,
 } from './scope.js';
+export {
+  AUTH_BASE_PATH,
+  DISABLED_AUTH_PATHS,
+  EXPOSED_AUTH_ROUTES,
+  type ExposedAuthRoute,
+} from './exposure.js';
 export { noopEmailSender, type AuthEmailSender } from './email.js';

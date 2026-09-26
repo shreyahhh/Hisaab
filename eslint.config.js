@@ -25,6 +25,20 @@ const SCOPE_RESOLUTION_ALLOWED = ['apps/api/src/tenantScope.ts'];
 const META_CAPI_ENTRY = '@truepath/privacy/meta-capi';
 const META_CAPI_ALLOWED = ['packages/integrations/meta', 'packages/integrations/src/meta'];
 
+// `exposeAllPathsForTests` (packages/auth's createAuth option) switches off Better Auth's
+// `disabledPaths`, i.e. re-exposes every route the API deliberately doesn't (ADR-0022). createAuth
+// throws under NODE_ENV=production, but that is a runtime backstop; this keeps it out of application
+// code in the first place. Only test files and test helpers may pass it. It is a syntax rule: it
+// catches the option written as a property (`{ exposeAllPathsForTests: true }`, the shorthand, or a
+// quoted key), not one smuggled in through a spread or a computed key.
+const TEST_ONLY_OPTION = 'exposeAllPathsForTests';
+const TEST_FILES = [
+  '**/*.test.{ts,tsx}',
+  '**/testing.ts',
+  'apps/api/src/testApp.ts',
+  'apps/api/src/testAuthTenant.ts',
+];
+
 // no-restricted-imports options for a file, built from which of the three restrictions apply to it.
 // Flat config doesn't merge two matching blocks' options for the same rule (the later block simply
 // wins), so each file must match exactly ONE block below, and each block asks for exactly the
@@ -125,6 +139,24 @@ export default tseslint.config(
       'no-restricted-imports': [
         'error',
         boundaryRule({ dbClients: true, scopeResolution: true, metaCapi: false }),
+      ],
+    },
+  },
+  {
+    // Test-only createAuth options stay in test files and test helpers.
+    files: ['**/*.{ts,tsx}'],
+    ignores: TEST_FILES,
+    rules: {
+      'no-restricted-syntax': [
+        'error',
+        {
+          selector: `Property[key.name='${TEST_ONLY_OPTION}']`,
+          message: `${TEST_ONLY_OPTION} re-exposes every Better Auth route the API disables (ADR-0022) and is test-only: pass it only from test files (*.test.ts) and test helpers (testing.ts, apps/api/src/testApp.ts, testAuthTenant.ts).`,
+        },
+        {
+          selector: `Property[key.value='${TEST_ONLY_OPTION}']`,
+          message: `${TEST_ONLY_OPTION} re-exposes every Better Auth route the API disables (ADR-0022) and is test-only: pass it only from test files (*.test.ts) and test helpers (testing.ts, apps/api/src/testApp.ts, testAuthTenant.ts).`,
+        },
       ],
     },
   },

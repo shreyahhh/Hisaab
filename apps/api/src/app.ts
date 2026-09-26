@@ -3,7 +3,7 @@ import fastifyCors from '@fastify/cors';
 import type { Auth } from '@truepath/auth';
 import { createAuditLogRepository, type Db } from '@truepath/db';
 import { createAuditService, type AuditService } from './audit.js';
-import { bridgeToBetterAuth } from './authBridge.js';
+import { registerAuthBridge } from './authBridge.js';
 import { registerAuthErrorHandler } from './errors.js';
 import {
   createEmailLimiter,
@@ -54,13 +54,14 @@ export function buildApp(deps: AppDeps): FastifyInstance {
 
   void app.register(fastifyCors, { origin: deps.trustedOrigin, credentials: true });
 
-  // CSRF check for our own state-changing routes (auth-tenancy.md §4.1): the generic /v1/auth/*
-  // bridge below is exempt because Better Auth enforces its own origin check on those routes
-  // (betterAuth.ts's disableOriginCheck: false). @fastify/cors already blocks a *browser* reading
-  // a cross-origin response, but a non-preflighted "simple" cross-site form POST still reaches the
-  // handler and executes before CORS ever comes into it — this hook is what actually stops that.
+  // CSRF check for every state-changing route (auth-tenancy.md §4.1), including our /v1/auth/signup|
+  // login|logout wrappers: they call `auth.api.*` directly, which skips Better Auth's own origin
+  // check (that check lives in its HTTP router), so this hook is their only one. The routes still
+  // bridged to Better Auth are GET-only, which the hook lets through. @fastify/cors already blocks a
+  // *browser* reading a cross-origin response, but a non-preflighted "simple" cross-site form POST
+  // still reaches the handler and executes before CORS ever comes into it — this hook is what
+  // actually stops that.
   app.addHook('onRequest', async (request, reply) => {
-    if (request.url.startsWith('/v1/auth/')) return;
     if (request.method === 'GET' || request.method === 'HEAD' || request.method === 'OPTIONS')
       return;
 
@@ -82,12 +83,11 @@ export function buildApp(deps: AppDeps): FastifyInstance {
 
   app.get('/healthz', async () => ({ status: 'ok' }));
 
-  // Better Auth's own routes (sign-in/social, callback/google, verify-email, reset-password, ...)
-  // — auth-tenancy.md §2.1. Mounted as a catch-all; only the routes of enabled features respond.
-  app.route({
-    method: ['GET', 'POST'],
-    url: '/v1/auth/*',
-    handler: (request, reply) => bridgeToBetterAuth(deps.auth, request, reply),
+  // The few Better Auth routes we expose (EXPOSED_AUTH_ROUTES in @truepath/auth, ADR-0022). Not a
+  // catch-all: any other path is a 404 from Fastify, and Better Auth disables it too.
+  registerAuthBridge(app, deps.auth);
+  app.setNotFoundHandler(async (_request, reply) => {
+    await reply.code(404).send({ error: 'not_found' });
   });
 
   // Routes register inside a plugin that loads *after* the rate-limit plugin, because the plugin

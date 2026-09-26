@@ -35,6 +35,8 @@ beforeAll(() => {
     },
     redisDurableUrl: 'redis://localhost:6379',
     allowInsecureCookies: true,
+    // These tests drive the HTTP handler through sign-in and organization paths that the API disables.
+    exposeAllPathsForTests: true,
     emailSender: testEmailSender,
   });
 });
@@ -318,5 +320,47 @@ describe('createAuth — rate limiting (auth-tenancy.md §5; ADR-0019, durable R
       }
     }
     expect(sawRateLimited).toBe(true);
+  });
+});
+
+describe('createAuth — exposure (ADR-0022)', () => {
+  const baseOptions = {
+    db,
+    env: {
+      BETTER_AUTH_SECRET: 'a'.repeat(32),
+      BETTER_AUTH_URL: 'http://localhost:3000',
+      DASHBOARD_URL: 'http://localhost:5173',
+      GOOGLE_CLIENT_ID: 'test-google-client-id',
+      GOOGLE_CLIENT_SECRET: 'test-google-client-secret',
+    },
+    redisDurableUrl: 'redis://localhost:6379',
+    allowInsecureCookies: true,
+  };
+  const request = (path: string) =>
+    new Request(`http://localhost:3000/v1/auth${path}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', origin: 'http://localhost:5173' },
+      body: '{}',
+    });
+
+  it('disables the paths we do not use by default, and the test opt-in turns that off', async () => {
+    const locked = createAuth(baseOptions);
+    const open = createAuth({ ...baseOptions, exposeAllPathsForTests: true });
+    for (const path of ['/sign-in/email', '/organization/delete']) {
+      expect((await locked.handler(request(path))).status, path).toBe(404);
+      expect((await open.handler(request(path))).status, path).not.toBe(404);
+    }
+  });
+
+  it('refuses the test opt-in in production', () => {
+    const before = process.env.NODE_ENV;
+    process.env.NODE_ENV = 'production';
+    try {
+      expect(() =>
+        createAuth({ ...baseOptions, allowInsecureCookies: false, exposeAllPathsForTests: true }),
+      ).toThrow(/exposeAllPathsForTests is test-only/);
+    } finally {
+      process.env.NODE_ENV = before;
+    }
   });
 });
