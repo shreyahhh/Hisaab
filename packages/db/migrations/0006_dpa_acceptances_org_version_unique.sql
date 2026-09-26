@@ -1,0 +1,1 @@
+CREATE UNIQUE INDEX "dpa_acceptances_org_version_uniq" ON "dpa_acceptances" USING btree ("organization_id","dpa_version");

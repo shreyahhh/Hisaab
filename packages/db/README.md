@@ -56,9 +56,10 @@ pnpm --filter @truepath/db db:generate   # drizzle-kit generate — schema -> SQ
 pnpm --filter @truepath/db db:migrate    # applies migrations/*.sql to DATABASE_URL
 ```
 
-Two migrations: `0000_clean_sleeper.sql` (M0-3, applied — never edit it) and a second one from the
-M0-3 fix-up (enum→text+CHECK, new unique constraints, composite indexes, `audit_log`'s FK). CI
-(`db-migrations` job) applies both against real Postgres/ClickHouse containers on every PR.
+Applied migrations are never edited; each change is a new file (see `migrations/`). The latest,
+`0006_dpa_acceptances_org_version_unique.sql`, adds the unique index the DPA acceptance repository
+relies on. CI (`db-migrations` job) applies them all against real Postgres/ClickHouse containers on
+every PR.
 
 ## Audit log repository
 
@@ -69,3 +70,13 @@ against the action's metadata schema first. `list` is newest first with an opaqu
 `(created_at, id)` at full microsecond precision, so rows that share a millisecond are neither skipped
 nor repeated; the page size is clamped to 200. Pass a transaction as the executor to commit an audit
 row with the change it records. Database-level immutability (a trigger and/or role split) is #12.
+
+## DPA acceptance repository
+
+`createDpaAcceptanceRepository(db | tx)` is the only code that touches `dpa_acceptances`.
+`record(scope, {organizationId, dpaVersion, acceptedByUserId, ipTruncated})` is idempotent (a unique
+index on `(organization_id, dpa_version)` plus `ON CONFLICT DO NOTHING`): it returns `{ row, created }`
+and `created: false` means the version was already accepted and nothing was written. It refuses to
+record for a user other than the scope's own signed-in user. `findForVersion(scope, organizationId,
+dpaVersion)` matches that exact version only, so an older acceptance never satisfies a newer one.
+Pass a transaction to commit the acceptance with its audit row.

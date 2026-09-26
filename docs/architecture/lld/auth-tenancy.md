@@ -194,11 +194,11 @@ sequenceDiagram
 ```
 
 ### 4.5 DPA gating
-`POST /v1/orgs/:id/dpa/accept` (owner):
-- `dpa_version` must equal `DPA_VERSION`, else `409`;
-- insert `dpa_acceptances` with `ip_truncated` (/24 or /48);
-- audit;
-- republish collector configs (privacy-dpdp §4.10).
+`POST /v1/orgs/:id/dpa/accept` (owner) — **implemented** (M0 exit, #7), except the last step:
+- `dpa_version` must equal `DPA_VERSION`, else `409 dpa_version_mismatch` (the body also carries `current_version`);
+- insert `dpa_acceptances` with `ip_truncated` (/24 or /48). One row per (organization, version): a repeat is a `200` with the existing record and writes nothing;
+- audit `dpa_accepted`, committed in the same transaction as the insert;
+- republish collector configs (privacy-dpdp §4.10) — **not built**: there is no Collector until M1-5.
 
 ### 4.6 Org deletion (approved lifecycle)
 1. **Export first.** The dashboard offers downloads (aggregate report CSVs, plus DSR exports still within their 30-day window) before the confirm step (dashboard §4.7).

@@ -16,6 +16,7 @@ import {
 import { registerRouteRegistry } from './routeRegistry.js';
 import type { TenantScopeDeps } from './tenantScope.js';
 import { registerAuthWrapperRoutes } from './routes/authWrappers.js';
+import { registerDpaRoutes } from './routes/dpa.js';
 import { registerInviteRoutes } from './routes/invites.js';
 import { registerMemberRoutes } from './routes/members.js';
 import { registerMeRoutes } from './routes/me.js';
@@ -30,6 +31,8 @@ export interface AppDeps {
   readonly audit?: AuditService;
   /** Durable-Redis limiter for our own routes (signup, login, invite-accept) — see rateLimit.ts. */
   readonly rateLimit: RateLimitDeps;
+  /** The DPA version organizations must accept (env DPA_VERSION, docs/dpdp/). Required: no silent default. */
+  readonly dpaVersion: string;
   /**
    * Fastify `trustProxy`: which proxies (e.g. the ALB's VPC CIDR) to trust for `request.ip`. Left
    * unset, every client behind the ALB shares the ALB's IP, so the per-IP limits fail closed for all
@@ -108,6 +111,7 @@ export function buildApp(deps: AppDeps): FastifyInstance {
     registerOrgRoutes(scope, tenantDeps);
     registerInviteRoutes(scope, tenantDeps, limits);
     registerMemberRoutes(scope, tenantDeps);
+    registerDpaRoutes(scope, tenantDeps, { dpaVersion: deps.dpaVersion });
   });
 
   app.decorate('appDeps', deps);

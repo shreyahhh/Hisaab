@@ -25,6 +25,12 @@ export {
   type ListAuditLogOptions,
 } from './repositories/auditLogRepository.js';
 export {
+  createDpaAcceptanceRepository,
+  type DpaAcceptanceRepository,
+  type DpaAcceptanceRow,
+  type RecordDpaAcceptanceInput,
+} from './repositories/dpaAcceptanceRepository.js';
+export {
   repositoryRegistry,
   type RepositoryDescriptor,
   type RepositoryMethodDescriptor,

@@ -38,12 +38,16 @@ export const testAudit = createAuditService(createAuditLogRepository(testDb));
 // Random keys, per test process, never written anywhere.
 export const testHasher = createTestIdentityHasher();
 
+// The DPA version the test apps require; tests accept exactly this string.
+export const TEST_DPA_VERSION = 'test-1';
+
 export function buildTestApp(overrides: Partial<AppDeps> = {}) {
   return buildApp({
     db: testDb,
     auth: testAuth,
     trustedOrigin: 'http://localhost:5173',
     rateLimit: { redis: testRedis, hasher: testHasher },
+    dpaVersion: TEST_DPA_VERSION,
     ...overrides,
   });
 }

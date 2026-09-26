@@ -14,7 +14,8 @@ Boot validates the environment with zod (`apiEnvSchema` in `src/index.ts`). Beyo
 ClickHouse, the two Redis instances and `API_PORT`, it **requires** the identity hash keys —
 `IDENTITY_KEY_READ`, `IDENTITY_KEY_WRITE` and one `IDENTITY_MASTER_K<N>` per readable version — with no
 default, in any environment. See `packages/privacy/README.md` and ADR-0020; locally,
-`IDENTITY_MASTER_K1=$(pnpm -s gen:identity-key)`.
+`IDENTITY_MASTER_K1=$(pnpm -s gen:identity-key)`. It also requires `DPA_VERSION` (no default; locally
+`DPA_VERSION=0.1-draft`, the draft in `docs/dpdp/dpa-template.md`).
 
 Rate-limit keys (`rateLimit.ts`) and everything else that pseudonymises an identifier use the hasher
 from `@truepath/privacy`; nothing here implements its own hashing.
@@ -77,3 +78,23 @@ Every state-changing request (anything but GET, HEAD and OPTIONS) needs exactly 
 `Origin`, or it is a 403 `invalid_origin`, a missing header included; we have no non-browser clients.
 POST, PUT and PATCH also need `Content-Type: application/json` (judged first). `app.test.ts` covers the
 methods, routes (unknown ones too) and Origin variants.
+
+## DPA acceptance (`POST /v1/orgs/:id/dpa/accept`)
+
+Owner only (`dpa.accept`). The body is exactly `{ "dpa_version": "<string>" }` and must equal the
+`DPA_VERSION` this deployment requires (env, validated at boot with no default, so a draft DPA can't
+reach production silently; the texts are in `docs/dpdp/`). Anything else is `409 dpa_version_mismatch`
+with `current_version`, so an old or unknown text can't satisfy the tracking gate.
+
+- `201 { id, dpa_version, accepted_at }` on the first acceptance; `200` with the same record on a
+  repeat. One row per organization per version (unique index), so repeats and races write neither a
+  second row nor a second audit entry.
+- The `dpa_acceptances` row and its `dpa_accepted` audit row commit in **one transaction**; if either
+  fails, neither exists and the caller gets a 500 (not the after-commit pattern of ADR-0021, which is only
+  for Better Auth actions). Audit metadata is `{ dpa_version }` only.
+- The accepting IP is stored as /24 (IPv4) or /48 (IPv6), never in full. Behind the ALB this needs
+  Fastify's `trustProxy` set correctly (#3), or every request reports the ALB's address.
+- `400 invalid_body` (with field names), `403 forbidden_role`, `404` for another organization (decided
+  before the body is read), `401` without a session; the usual CSRF checks apply.
+- **Not yet:** publishing the Collector store configs so tracking switches on (privacy-dpdp.md §4.10).
+  There is no Collector yet (M1-5). It reads `createDpaAcceptanceRepository(...).findForVersion(...)`.

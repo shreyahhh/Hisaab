@@ -17,6 +17,7 @@ function env(overrides: Record<string, string | undefined> = {}): NodeJS.Process
     IDENTITY_KEY_READ: 'k1',
     IDENTITY_KEY_WRITE: 'k1',
     IDENTITY_MASTER_K1: key(),
+    DPA_VERSION: '0.1-draft',
     ...overrides,
   };
 }
@@ -30,6 +31,15 @@ describe('apps/api', () => {
 describe('apps/api boot environment', () => {
   it('accepts a complete environment', () => {
     expect(parseEnv(apiEnvSchema, env()).success).toBe(true);
+  });
+
+  it('refuses to start without DPA_VERSION or with a malformed one, in any NODE_ENV', () => {
+    for (const NODE_ENV of ['development', 'test', 'production']) {
+      expect(parseEnv(apiEnvSchema, env({ NODE_ENV, DPA_VERSION: undefined })).success).toBe(false);
+      expect(parseEnv(apiEnvSchema, env({ NODE_ENV, DPA_VERSION: 'not a version' })).success).toBe(
+        false,
+      );
+    }
   });
 
   it('refuses to start without the identity hash keys, in any NODE_ENV', () => {
