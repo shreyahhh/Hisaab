@@ -1,4 +1,5 @@
 import { eq } from 'drizzle-orm';
+import { AuditMetadataError } from '@truepath/privacy';
 import { describe, expect, it } from 'vitest';
 import { createSystemScope } from './systemScope.js';
 import { auditLog } from './schema/index.js';
@@ -33,5 +34,17 @@ describe('createSystemScope (ADR-0016 §4.4 — the only SystemScope constructor
     } finally {
       await db.delete(auditLog).where(eq(auditLog.id, scope.auditId));
     }
+  });
+
+  it('rejects metadata that is not flat scalars or looks like personal data, and writes no row', async () => {
+    const since = new Date();
+    await expect(
+      createSystemScope(db, 'retention', { metadata: { email: 'someone@example.com' } }),
+    ).rejects.toThrow(AuditMetadataError);
+    await expect(
+      createSystemScope(db, 'retention', { metadata: { note: 'someone@example.com' } }),
+    ).rejects.toThrow(AuditMetadataError);
+    const rows = await db.select().from(auditLog).where(eq(auditLog.action, 'system_scope_used'));
+    expect(rows.filter((r) => r.createdAt >= since && r.targetId === 'retention')).toEqual([]);
   });
 });

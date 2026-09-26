@@ -1,7 +1,8 @@
 import Fastify, { type FastifyInstance } from 'fastify';
 import fastifyCors from '@fastify/cors';
 import type { Auth } from '@truepath/auth';
-import type { Db } from '@truepath/db';
+import { createAuditLogRepository, type Db } from '@truepath/db';
+import { createAuditService, type AuditService } from './audit.js';
 import { bridgeToBetterAuth } from './authBridge.js';
 import { registerAuthErrorHandler } from './errors.js';
 import {
@@ -13,6 +14,7 @@ import {
   type RouteLimits,
 } from './rateLimit.js';
 import { registerRouteRegistry } from './routeRegistry.js';
+import type { TenantScopeDeps } from './tenantScope.js';
 import { registerAuthWrapperRoutes } from './routes/authWrappers.js';
 import { registerInviteRoutes } from './routes/invites.js';
 import { registerMemberRoutes } from './routes/members.js';
@@ -24,6 +26,8 @@ export interface AppDeps {
   readonly auth: Auth;
   /** Dashboard origin allowed to call this API with credentials (auth-tenancy.md §4.1 CSRF check). */
   readonly trustedOrigin: string;
+  /** Audit writer; defaults to one on `db`. Tests inject one whose writes fail. */
+  readonly audit?: AuditService;
   /** Durable-Redis limiter for our own routes (signup, login, invite-accept) — see rateLimit.ts. */
   readonly rateLimit: RateLimitDeps;
   /**
@@ -41,6 +45,11 @@ export function buildApp(deps: AppDeps): FastifyInstance {
   const app = Fastify({ logger: false, trustProxy: deps.trustProxy ?? false });
 
   registerRouteRegistry(app);
+  const tenantDeps: TenantScopeDeps = {
+    auth: deps.auth,
+    db: deps.db,
+    audit: deps.audit ?? createAuditService(createAuditLogRepository(deps.db)),
+  };
   registerAuthErrorHandler(app);
 
   void app.register(fastifyCors, { origin: deps.trustedOrigin, credentials: true });
@@ -94,11 +103,11 @@ export function buildApp(deps: AppDeps): FastifyInstance {
         { name: 'login-hourly', limit: LIMITS.login.emailHourly },
       ]),
     };
-    registerAuthWrapperRoutes(scope, deps, limits);
-    registerMeRoutes(scope, deps);
-    registerOrgRoutes(scope, deps);
-    registerInviteRoutes(scope, deps, limits);
-    registerMemberRoutes(scope, deps);
+    registerAuthWrapperRoutes(scope, tenantDeps, limits);
+    registerMeRoutes(scope, tenantDeps);
+    registerOrgRoutes(scope, tenantDeps);
+    registerInviteRoutes(scope, tenantDeps, limits);
+    registerMemberRoutes(scope, tenantDeps);
   });
 
   app.decorate('appDeps', deps);

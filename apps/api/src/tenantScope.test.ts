@@ -1,7 +1,7 @@
 import Fastify from 'fastify';
 import { describe, expect, it } from 'vitest';
 import { requireStoreScope } from './tenantScope.js';
-import { testAuth, testDb } from './testApp.js';
+import { testAudit, testAuth, testDb } from './testApp.js';
 import { addRealMember, cleanupRealTenant, seedRealTenant } from './testAuthTenant.js';
 
 // requireStoreScope has no production caller yet (M0-4's confirmed route set is all :id-as-org —
@@ -11,7 +11,7 @@ function buildProbeApp() {
   const app = Fastify({ logger: false });
   app.get<{ Params: { storeId: string } }>(
     '/test/stores/:storeId',
-    { preHandler: [requireStoreScope({ auth: testAuth, db: testDb })] },
+    { preHandler: [requireStoreScope({ auth: testAuth, db: testDb, audit: testAudit })] },
     async (request, reply) => {
       const scope = request.scope!;
       // Sets don't survive JSON.stringify (they serialize to `{}`) — spell it out as an array.

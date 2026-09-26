@@ -15,10 +15,13 @@ export {
 } from './repositories/storeRepository.js';
 export {
   createAuditLogRepository,
+  DEFAULT_AUDIT_PAGE_SIZE,
+  InvalidAuditCursorError,
+  MAX_AUDIT_PAGE_SIZE,
+  type AuditLogPage,
   type AuditLogRepository,
   type AuditLogRow,
-  type RecordAuditEntryInput,
-  type RecordGlobalAuditEntryInput,
+  type DbExecutor,
   type ListAuditLogOptions,
 } from './repositories/auditLogRepository.js';
 export {

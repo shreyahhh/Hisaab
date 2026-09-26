@@ -1,0 +1,219 @@
+import { z } from 'zod';
+import { RoleSchema } from './auth.js';
+import { AUDIT_ACTIONS, DSR_TYPES, INTEGRATION_PROVIDERS } from './valueLists.js';
+
+// The audit contract (SPEC S-4, privacy-dpdp.md §2.1): what may be written to `audit_log`, per
+// action. The writer (packages/db) validates every entry against these schemas, so metadata is
+// "ids, enums and counts only" by construction; the PII scan in packages/privacy is a backstop.
+
+export type AuditActionName = (typeof AUDIT_ACTIONS)[number];
+export const AUDIT_ACTOR_TYPES = ['user', 'system', 'shopify_webhook'] as const;
+export type AuditActorType = (typeof AUDIT_ACTOR_TYPES)[number];
+
+// ---- Platform actions -----------------------------------------------------------------------
+// Rows with no owning organization (organization_id null). Everything else is written for an
+// organization. `system_scope_used` is deliberately not listed: it is org-scoped when a system
+// action targets one organization (org deletion) and is then written through a SystemScope.
+export const PLATFORM_AUDIT_ACTIONS = [
+  'login_succeeded',
+  'login_failed',
+  'retention_run',
+  'suppression_rebuilt',
+  'breach_created',
+  'breach_confirmed',
+  'breach_notified',
+  'breach_closed',
+] as const satisfies readonly AuditActionName[];
+export type PlatformAuditAction = (typeof PLATFORM_AUDIT_ACTIONS)[number];
+
+export function isPlatformAuditAction(action: string): action is PlatformAuditAction {
+  return (PLATFORM_AUDIT_ACTIONS as readonly string[]).includes(action);
+}
+
+// ---- Metadata schemas -----------------------------------------------------------------------
+const empty = z.object({}).strict();
+const count = z.number().int().min(0);
+const snake = z
+  .string()
+  .regex(/^[a-z][a-z0-9_]*$/)
+  .max(64);
+// Names of the settings fields that changed — names only, never values.
+const changedFields = z
+  .string()
+  .max(200)
+  .regex(/^[a-z][a-z0-9_]*(,[a-z][a-z0-9_]*)*$/);
+const provider = z.enum(INTEGRATION_PROVIDERS);
+const dsrType = z.enum(DSR_TYPES);
+const dsrTrigger = z.enum([
+  'merchant',
+  'shopify_webhook',
+  'consent_withdrawn',
+  'consent_region_remediation',
+]);
+const isoDateTime = z.string().datetime();
+const isoDate = z.string().regex(/^\d{4}-\d{2}-\d{2}$/);
+// Scalar-only free-form maps, for actions whose keys are per-run (row counts per table).
+const counts = z.record(snake, count);
+const scalars = z.record(snake, z.union([z.string().max(200), z.number(), z.boolean()]));
+
+// Metadata is a flat object of strings, numbers and booleans. Where a schema is provisional (the
+// emitting ticket hasn't landed) its owner in AUDIT_ACTION_OWNERS says so; tighten it there.
+export const AUDIT_METADATA_SCHEMAS = {
+  dpa_accepted: z.object({ dpa_version: z.string().min(1).max(32) }).strict(),
+  privacy_settings_changed: z.object({ changed_fields: changedFields }).strict(),
+  attribution_settings_changed: z.object({ changed_fields: changedFields }).strict(),
+  channel_rules_changed: z.object({ changed_fields: changedFields }).strict(),
+  integration_connected: z.object({ provider }).strict(),
+  integration_disconnected: z.object({ provider }).strict(),
+  integration_settings_changed: z.object({ provider, changed_fields: changedFields }).strict(),
+  login_succeeded: empty,
+  // Which account an attempt targeted, never what was typed: no email and no hash of one.
+  login_failed: z.union([
+    z.object({ target_user_id: z.string().uuid() }).strict(),
+    z.object({ unknown_account: z.literal(true) }).strict(),
+  ]),
+  member_invited: z.object({ role: RoleSchema }).strict(),
+  member_invite_accepted: empty,
+  member_role_changed: z.object({ from: RoleSchema, to: RoleSchema }).strict(),
+  member_removed: z.object({ role: RoleSchema, self: z.boolean() }).strict(),
+  org_deletion_requested: z
+    .object({ deletion_scheduled_at: isoDateTime, deletion_due_by: isoDateTime })
+    .strict(),
+  org_deletion_cancelled: empty,
+  org_deleted: z.object({ stores: count }).strict(),
+  consent_region_confirmed: empty,
+  consent_default_on_warned: z
+    .object({ ratio: z.number().min(0).max(1), new_visitors: count })
+    .strict(),
+  consent_default_on_paused: z
+    .object({ ratio: z.number().min(0).max(1), new_visitors: count })
+    .strict(),
+  consent_default_on_resumed: empty,
+  dsr_created: z.object({ type: dsrType, trigger: dsrTrigger }).strict(),
+  dsr_completed: z.object({ type: dsrType, trigger: dsrTrigger }).strict(),
+  dsr_failed: z.object({ type: dsrType, attempts: count }).strict(),
+  dsr_followup_erasure: z.object({ visitor_count: count, rows_deleted: count }).strict(),
+  dsr_export_downloaded: empty,
+  report_exported: z
+    .object({
+      level: z.enum(['channel', 'campaign', 'adset', 'ad']),
+      from: isoDate,
+      to: isoDate,
+      model: z.enum([
+        'first_click',
+        'last_click',
+        'last_non_direct',
+        'linear',
+        'time_decay',
+        'position_based',
+      ]),
+      basis: z.enum(['placed', 'delivered']),
+      rows: count,
+    })
+    .strict(),
+  order_journey_viewed: empty,
+  audit_log_viewed: empty,
+  retention_run: counts,
+  system_scope_used: scalars,
+  suppression_rebuilt: z.object({ stores: count, entries: count }).strict(),
+  breach_created: z.object({ severity: z.enum(['low', 'medium', 'high', 'critical']) }).strict(),
+  breach_confirmed: empty,
+  breach_notified: z.object({ tenants: count }).strict(),
+  breach_closed: empty,
+} as const satisfies Record<AuditActionName, z.ZodTypeAny>;
+
+export type AuditMetadataOf<A extends AuditActionName> = z.infer<
+  (typeof AUDIT_METADATA_SCHEMAS)[A]
+>;
+
+// ---- Entries --------------------------------------------------------------------------------
+interface AuditEntryBase<A extends AuditActionName> {
+  readonly action: A;
+  readonly actorUserId?: string | null;
+  readonly actorType: AuditActorType;
+  readonly targetType: string;
+  readonly targetId: string;
+}
+
+// Metadata is optional only where an empty object satisfies the schema.
+type MetadataField<A extends AuditActionName> =
+  object extends AuditMetadataOf<A>
+    ? { readonly metadata?: AuditMetadataOf<A> }
+    : { readonly metadata: AuditMetadataOf<A> };
+
+type EntryFor<A extends AuditActionName> = AuditEntryBase<A> & MetadataField<A>;
+
+/** Any audit entry without its organization: `action` selects which `metadata` shape is required. */
+export type AuditEntryInput = { [A in AuditActionName]: EntryFor<A> }[AuditActionName];
+
+/** Every action that belongs to an organization, i.e. all but the platform-wide ones. */
+export type OrganizationAuditAction = Exclude<AuditActionName, PlatformAuditAction>;
+
+/**
+ * An entry for an organization (written under a TenantScope, or a SystemScope acting on one). The
+ * platform-wide actions are excluded: they have no organization and go through `writePlatform`.
+ */
+export type OrganizationAuditEntry = {
+  [A in OrganizationAuditAction]: EntryFor<A>;
+}[OrganizationAuditAction] & { readonly organizationId: string };
+
+/** A platform-wide entry: only the actions in PLATFORM_AUDIT_ACTIONS, and no organization. */
+export type PlatformAuditEntry = { [A in PlatformAuditAction]: EntryFor<A> }[PlatformAuditAction];
+
+// ---- Who emits each action ------------------------------------------------------------------
+// SPEC §5.10 test 8: "an audit row exists for every DSR, export and settings change". Most of those
+// features land in later tickets, so this registry names, for every catalogue action, the ticket
+// that emits it and — once it does — the test that proves a row is written. A test fails if an
+// action is missing here, or is `implemented` without evidence, so the catalogue can't grow silently.
+export type AuditActionOwner =
+  | {
+      readonly status: 'implemented';
+      readonly ticket: string;
+      readonly evidence: readonly string[];
+    }
+  | { readonly status: 'pending'; readonly ticket: string };
+
+const pending = (ticket: string): AuditActionOwner => ({ status: 'pending', ticket });
+const implemented = (ticket: string, ...evidence: string[]): AuditActionOwner => ({
+  status: 'implemented',
+  ticket,
+  evidence,
+});
+
+export const AUDIT_ACTION_OWNERS = {
+  dpa_accepted: pending('deploy #7 (POST /v1/orgs/:id/dpa/accept)'),
+  privacy_settings_changed: pending('M4-2'),
+  attribution_settings_changed: pending('M3-3'),
+  channel_rules_changed: pending('M3-3'),
+  integration_connected: pending('M1-1 / M2-1'),
+  integration_disconnected: pending('M1-1 / M2-1'),
+  integration_settings_changed: pending('M1-1 / M2-1'),
+  login_succeeded: implemented('M0-4', 'apps/api/src/auditTrail.test.ts'),
+  login_failed: implemented('M0-4', 'apps/api/src/loginAudit.test.ts'),
+  member_invited: implemented('M0-4', 'apps/api/src/auditTrail.test.ts'),
+  member_invite_accepted: implemented('M0-4', 'apps/api/src/auditTrail.test.ts'),
+  member_role_changed: implemented('M0-4', 'apps/api/src/auditTrail.test.ts'),
+  member_removed: implemented('M0-4', 'apps/api/src/auditTrail.test.ts'),
+  org_deletion_requested: pending('deploy #8 (DELETE /v1/orgs/:id)'),
+  org_deletion_cancelled: pending('deploy #8 (DELETE /v1/orgs/:id)'),
+  org_deleted: pending('deploy #8 (DELETE /v1/orgs/:id)'),
+  consent_region_confirmed: pending('M4-2'),
+  consent_default_on_warned: pending('M1-6'),
+  consent_default_on_paused: pending('M1-6'),
+  consent_default_on_resumed: pending('M1-6'),
+  dsr_created: pending('M1-2 / M4-2'),
+  dsr_completed: pending('M1-2 / M4-2'),
+  dsr_failed: pending('M1-2 / M4-2'),
+  dsr_followup_erasure: pending('M4-2'),
+  dsr_export_downloaded: pending('M4-2'),
+  report_exported: pending('M3-3'),
+  order_journey_viewed: pending('M3-3'),
+  audit_log_viewed: implemented('M0-6', 'apps/api/src/auditTrail.test.ts'),
+  retention_run: pending('M4-3'),
+  system_scope_used: implemented('M0-4', 'packages/db/src/systemScope.test.ts'),
+  suppression_rebuilt: pending('M1-5'),
+  breach_created: pending('M4-4'),
+  breach_confirmed: pending('M4-4'),
+  breach_notified: pending('M4-4'),
+  breach_closed: pending('M4-4'),
+} as const satisfies Record<AuditActionName, AuditActionOwner>;

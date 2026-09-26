@@ -1,7 +1,6 @@
 import { fromNodeHeaders } from 'better-auth/node';
 import type { FastifyInstance } from 'fastify';
 import { findUserIdByEmail } from '@truepath/auth';
-import { createAuditLogRepository } from '@truepath/db';
 import { normaliseEmail } from '@truepath/privacy';
 import { AuthApiError, authCall } from '../authCall.js';
 import { forwardResponse } from '../errors.js';
@@ -17,6 +16,10 @@ import { requireSession, type TenantScopeDeps } from '../tenantScope.js';
  * These call Better Auth with `asResponse: true`, which returns a 4xx Response on failure instead
  * of throwing; `authCall` turns that into an AuthApiError, and app.ts maps an uncaught one to
  * `{ error: <code> }` with Better Auth's status.
+ *
+ * Better Auth has already created the session (or refused) by the time the audit row is written, so
+ * these use the after-commit writer: a failing audit write never turns the real response into a 500
+ * (ADR-0021).
  *
  * login_failed's metadata holds no email and no hash of one (privacy-dpdp.md: audit metadata is ids
  * and counts only). It says which account the attempt targeted — `target_user_id` when the attempted
@@ -45,8 +48,6 @@ export function registerAuthWrapperRoutes(
     async (request, reply) => {
       // Per-account limit as well as per-IP, so a guessing run spread across IPs is still capped.
       if (!(await limits.loginEmail(request, reply))) return;
-      const auditLog = createAuditLogRepository(deps.db);
-
       let response: Response;
       try {
         response = await authCall(() =>
@@ -59,7 +60,7 @@ export function registerAuthWrapperRoutes(
         const email =
           typeof request.body?.email === 'string' ? normaliseEmail(request.body.email) : null;
         const userId = email === null ? null : await findUserIdByEmail(deps.db, email);
-        await auditLog.recordGlobal({
+        await deps.audit.afterCommitPlatform({
           actorType: 'user',
           action: 'login_failed',
           targetType: 'auth',
@@ -69,7 +70,7 @@ export function registerAuthWrapperRoutes(
         throw error;
       }
 
-      await auditLog.recordGlobal({
+      await deps.audit.afterCommitPlatform({
         actorType: 'user',
         action: 'login_succeeded',
         targetType: 'auth',

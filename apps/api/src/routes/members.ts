@@ -1,6 +1,5 @@
 import { fromNodeHeaders } from 'better-auth/node';
 import type { FastifyInstance } from 'fastify';
-import { createAuditLogRepository } from '@truepath/db';
 import { resolveMembership } from '@truepath/auth';
 import { can, RoleSchema } from '@truepath/shared';
 import { requireOrgScope, type TenantScopeDeps } from '../tenantScope.js';
@@ -49,7 +48,7 @@ export function registerMemberRoutes(app: FastifyInstance, deps: TenantScopeDeps
             headers: fromNodeHeaders(request.headers),
           }),
         );
-        await createAuditLogRepository(deps.db).record(scope, {
+        await deps.audit.afterCommit(scope, {
           organizationId: scope.organizationId,
           actorUserId: scope.userId,
           actorType: 'user',
@@ -112,7 +111,7 @@ export function registerMemberRoutes(app: FastifyInstance, deps: TenantScopeDeps
                 headers: fromNodeHeaders(request.headers),
               }),
             );
-        await createAuditLogRepository(deps.db).record(scope, {
+        await deps.audit.afterCommit(scope, {
           organizationId: scope.organizationId,
           actorUserId: scope.userId,
           actorType: 'user',

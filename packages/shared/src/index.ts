@@ -9,3 +9,4 @@ export * from './auth.js';
 export * from './keys.js';
 export * from './identityKeys.js';
 export * from './constants.js';
+export * from './audit.js';

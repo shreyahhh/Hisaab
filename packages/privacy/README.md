@@ -96,3 +96,15 @@ import it. Everything else uses the tenant HMAC.
   The rule (8+ sequential digits, SPEC v0.3) wins; fixtures use other numbers.
 - No logger or Sentry client is wired to `redactLogValue` yet — they arrive with the services that
   use them. Until then the API's tests scan captured console/stdout output for PII.
+
+## Audit writer contract
+
+`AuditLogger` (`write(scope, entry)` for an organization, `writePlatform(entry)` for the platform-wide
+actions) and `validateAuditMetadata`. The catalogue, the per-action metadata schemas and the entry
+types are in `packages/shared/src/audit.ts`: metadata is a strict, flat object of strings, numbers and
+booleans whose shape depends on the action (`login_failed` takes `{target_user_id}` or
+`{unknown_account: true}`, never an email or a hash of one). The schema is the check; a scan for
+emails, phones, hashes and sensitive key names over string values is only a backstop for the two
+free-form maps. `AuditMetadataError` names the action and the offending paths, never the values.
+The Postgres implementation is `createAuditLogRepository` in `@truepath/db`, which the collector
+(no Postgres connection) never imports.

@@ -39,3 +39,20 @@ and rethrows. Anything else that is thrown (a database outage, a bug) is not con
 
 Failed sign-up, login and logout now answer `{ "error": "<code>" }` like every other route, instead of
 forwarding Better Auth's own `{ "code", "message" }` body.
+
+## Audit log (M0-6)
+
+Every audited action goes through `deps.audit` (`src/audit.ts`), never straight to the table.
+
+- **After a Better Auth commit** (`member_invited`, `member_invite_accepted`, `member_role_changed`,
+  `member_removed`, `login_succeeded`, `login_failed`): `afterCommit` / `afterCommitPlatform` write the
+  row, retry once, and on a second failure return the real response anyway and report an
+  `audit_write_failed` line (with the full intended entry) for the alert. Better Auth's organization
+  hooks don't run inside a transaction, so atomic rows aren't possible; see ADR-0021.
+- **Our own reads** (`audit_log_viewed`): written before the response; if it fails, so does the request.
+- `GET /v1/orgs/:id/audit-log` takes `from`, `to`, `action` (must be in the catalogue), `limit`
+  (1–200, default 50) and an opaque `cursor`, and returns `{ items, next_cursor }` newest first. A bad
+  parameter is `400 invalid_query` with the offending names; another organization's id is a 404 before
+  any validation. Only the first page is audited.
+- `AUDIT_ACTION_OWNERS` (`packages/shared`) names the ticket that emits each catalogue action, and
+  `src/auditCoverage.test.ts` fails when an emitter or its evidence test goes missing (SPEC §5.10 test 8).
