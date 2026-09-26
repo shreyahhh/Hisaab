@@ -6,3 +6,24 @@
 export * as schema from './schema/index.js';
 export { createDb } from './client.js';
 export type { Db } from './client.js';
+export { resolveStoreOrganization } from './scopeResolution.js';
+export { createSystemScope, type CreateSystemScopeOptions } from './systemScope.js';
+export {
+  createStoreRepository,
+  type StoreRepository,
+  type StoreRow,
+} from './repositories/storeRepository.js';
+export {
+  createAuditLogRepository,
+  type AuditLogRepository,
+  type AuditLogRow,
+  type RecordAuditEntryInput,
+  type RecordGlobalAuditEntryInput,
+  type ListAuditLogOptions,
+} from './repositories/auditLogRepository.js';
+export {
+  repositoryRegistry,
+  type RepositoryDescriptor,
+  type RepositoryMethodDescriptor,
+  type ScopeKind,
+} from './repositories/registry.js';

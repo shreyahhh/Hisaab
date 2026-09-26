@@ -1,5 +1,16 @@
 {
   "$schema": "https://turbo.build/schema.json",
+  "globalPassThroughEnv": [
+    "NODE_ENV",
+    "LOG_LEVEL",
+    "DATABASE_URL",
+    "CLICKHOUSE_URL",
+    "CLICKHOUSE_USER",
+    "CLICKHOUSE_PASSWORD",
+    "CLICKHOUSE_DB",
+    "REDIS_DURABLE_URL",
+    "REDIS_CACHE_URL"
+  ],
   "tasks": {
     "build": {
       "dependsOn": ["^build"],

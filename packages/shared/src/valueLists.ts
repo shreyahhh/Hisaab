@@ -121,3 +121,9 @@ export const DsrStatus = z.enum(DSR_STATUSES);
 
 export const CAPI_DISPATCH_STATUSES = ['queued', 'sent', 'skipped', 'failed'] as const; // meta-integration.md §4.7
 export const CapiDispatchStatus = z.enum(CAPI_DISPATCH_STATUSES);
+
+// Better Auth's organization plugin owns invites.status (auth-tenancy.md §3); this list is its
+// value set, confirmed against @better-auth/organization@1.7.6's own crud-invites route source
+// (not guessed) — 'pending' | 'accepted' | 'rejected' | 'canceled'.
+export const INVITE_STATUSES = ['pending', 'accepted', 'rejected', 'canceled'] as const;
+export const InviteStatus = z.enum(INVITE_STATUSES);

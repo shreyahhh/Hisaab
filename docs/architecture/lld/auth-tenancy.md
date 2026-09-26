@@ -32,7 +32,7 @@
 | `GET /v1/orgs`, `POST /v1/orgs` | session | organization plugin `createOrganization`; the creator becomes `owner` |
 | `GET /v1/orgs/:id/stores` | member | our table `stores` (created by the Shopify connect flow) |
 | `POST /v1/orgs/:id/invites` | owner, admin | `{email, role}` → plugin `createInvitation`; `sendInvitationEmail` via SES; admins can't invite owners |
-| `POST /v1/invites/:token/accept` | session (the invitee) | plugin `acceptInvitation` (the invitee must be logged in with the invited email) |
+| `POST /v1/invites/:token/accept` | session (the invitee) | plugin `acceptInvitation`, after two checks of ours: the logged-in email equals the invited email (`403 invite_email_mismatch`), and the **inviter still has standing** — still a member with `team.manage` and a rank ≥ the invited role (`403 invite_no_longer_valid`). Better Auth checks pending/expiry/recipient but never the inviter, so without this a pending invite outlives a demotion or removal. Rate-limited per IP (§5) |
 | `PUT /v1/orgs/:id/members/:userId` | owner (admins for analyst/viewer) | `{role}` → plugin `updateMemberRole`; last-owner guard |
 | `DELETE /v1/orgs/:id/members/:userId` | owner (admins for analyst/viewer), or self | plugin `removeMember`; last-owner guard |
 | `POST /v1/orgs/:id/dpa/accept` | owner | `dpa_acceptances` (privacy-dpdp §4.10) |
@@ -50,6 +50,11 @@ export const auth = betterAuth({
     ipAddress: { ipAddressHeaders: ['x-forwarded-for'] },  // behind one ALB hop; used for rate limiting
     useSecureCookies: true,
     crossSubDomainCookies: { enabled: true, domain: '<registrable domain>' },   // app.<d> and api.<d>
+    // Explicit, not left to Better Auth's own default: it silently disables this check whenever
+    // NODE_ENV reads "test" (isTest(), @better-auth/core), which is exactly Vitest's default and
+    // is cached at module load, so it can't be toggled per-instance — trustedOrigins matters too
+    // much to depend on an env-detection heuristic (M0-4 review; betterAuth.ts).
+    disableOriginCheck: false,
   },
   trustedOrigins: ['https://app.<domain>'],
   emailAndPassword: {
@@ -59,7 +64,7 @@ export const auth = betterAuth({
   emailVerification: { sendVerificationEmail: sesSend('verify') },
   socialProviders: { google: { clientId, clientSecret, scope: ['openid', 'email', 'profile'] } },
   session: { modelName: 'sessions', expiresIn: 60 * 60 * 24 * 14, updateAge: 60 * 60 * 24 },   // 14-day sliding
-  rateLimit: { enabled: true, window: 60, max: 10, storage: 'secondary-storage' },  // on the cache Redis, prefix ba:
+  rateLimit: { enabled: true, window: 60, max: 10, storage: 'secondary-storage' },  // durable Redis, prefix ba: (ADR-0019)
   user:         { modelName: 'users' },
   account:      { modelName: 'auth_accounts' },
   verification: { modelName: 'auth_tokens' },
@@ -142,7 +147,7 @@ Notes:
 ## 4. Processing flow
 
 ### 4.1 Sessions
-- Better Auth session cookie: `Secure`, `HttpOnly`, `SameSite=Lax`, shared across `app.<d>` and `api.<d>` (`crossSubDomainCookies`).
+- Better Auth session cookie: `Secure`, `HttpOnly`, `SameSite=Lax`, shared across `app.<d>` and `api.<d>` (`crossSubDomainCookies`). `Secure` is the **default** (`createAuth`'s `allowInsecureCookies` is an explicit local-dev opt-out, and throws under `NODE_ENV=production`), so forgetting production wiring fails closed.
 - 14-day sliding expiry, refreshed daily.
 - `trustedOrigins` limits the origins allowed to call auth routes. Our own state-changing routes also require `Content-Type: application/json` and an `Origin` equal to the dashboard origin (CSRF).
 - Password change and reset revoke other sessions (Better Auth `revokeOtherSessions` on change). Logout deletes the session row.
@@ -220,8 +225,8 @@ sequenceDiagram
 
 | Failure | Behaviour |
 |---|---|
-| Brute-force login | Better Auth rate limit (10 per 60 s per IP on auth routes, counters in cache Redis `ba:`) → `429`; audit `login_failed` with only an HMAC of the email in metadata |
-| Cache Redis down | Better Auth rate limiting falls back as configured (**fail closed** on auth routes: `503`), so logins pause rather than going unthrottled |
+| Brute-force login | Better Auth rate limit (10 per 60 s per IP on its own `/v1/auth/*` routes, counters in durable Redis `ba:` — ADR-0019) → `429`. **Our own** `POST /v1/auth/signup|login` and `POST /v1/invites/:token/accept` call `auth.api.*`, which skips that limiter, so `apps/api` limits them itself (`@fastify/rate-limit`, durable Redis `rl:`): 10 per 60 s per IP, plus login **5 per 60 s per email** (case-insensitive) so a run spread over many IPs is still capped. Keys hold an HMAC of the IP/email, never the raw value; a Redis outage errors the request rather than skipping the limit. Audit `login_failed` (interim: no identifier at all until M0-5's HMAC helper) |
+| Durable Redis down | Better Auth rate limiting falls back as configured (**fail closed** on auth routes: `503`), so logins pause rather than going unthrottled — the same outage HLD Q2/Q14 already treat as collector- and worker-wide, so auth failing closed too is consistent, not a new failure mode |
 | Session lookup failure (Postgres) | `503`; never treated as unauthenticated-but-allowed |
 | Membership removed mid-session | the next request → `404` for that org |
 | Invite for an email different from the logged-in user | `403 invite_email_mismatch` |

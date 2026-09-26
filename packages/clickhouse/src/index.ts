@@ -4,3 +4,12 @@
 
 export { createClickHouseClient, type ClickHouseEnv } from './client.js';
 export { parseClickHouseBigInt, parseClickHouseInt64, parseInt64Fields } from './parseInt64.js';
+export {
+  ch,
+  CLICKHOUSE_TABLES,
+  type ClickHouseTableName,
+  type ClickHouseParamType,
+  type WhereCondition,
+  type ScopedSelectOptions,
+  type ScopedClickHouse,
+} from './queryBuilder.js';

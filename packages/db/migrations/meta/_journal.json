@@ -29,6 +29,20 @@
       "when": 1790334736136,
       "tag": "0003_audit_log_no_actor_fk",
       "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1790336248113,
+      "tag": "0004_spooky_toxin",
+      "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1790337664331,
+      "tag": "0005_aromatic_otto_octavius",
+      "breakpoints": true
     }
   ]
 }
