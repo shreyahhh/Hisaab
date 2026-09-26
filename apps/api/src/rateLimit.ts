@@ -25,21 +25,28 @@ interface Limit {
 }
 
 // Better Auth's own auth-route limit is 10 per 60 s per IP (auth-tenancy.md §7); login also gets a
-// tighter per-account limit so a distributed guessing run against one account is capped too.
+// tighter per-account limits (a 5/min burst window and a 20/hour slow-guessing window) so a
+// distributed guessing run against one account is capped too. Per-account limits allow a targeted
+// lockout of a known email; ADR-0019 accepts that trade-off.
 export const LIMITS = {
   signup: { ip: { max: 10, timeWindow: '1 minute' } },
   login: {
     ip: { max: 10, timeWindow: '1 minute' },
     email: { max: 5, timeWindow: '1 minute' },
+    emailHourly: { max: 20, timeWindow: '1 hour' },
   },
   inviteAccept: { ip: { max: 10, timeWindow: '1 minute' } },
 } as const satisfies Record<string, Record<string, Limit>>;
 
-function pseudonym(secret: string, label: string, value: string): string {
+export function pseudonym(secret: string, label: string, value: string): string {
   return createHmac('sha256', secret)
     .update(`rl-key-v1:${label}:${value}`)
     .digest('hex')
     .slice(0, 32);
+}
+
+export function normaliseEmailForLimit(email: unknown): string {
+  return typeof email === 'string' ? email.trim().toLowerCase() : '';
 }
 
 function rateLimitedBody(ttlMs: number) {
@@ -71,33 +78,45 @@ export function ipLimit(deps: RateLimitDeps, name: string, limit: Limit) {
   };
 }
 
+export interface EmailWindow {
+  /** Distinct per window: it is part of the Redis key. */
+  readonly name: string;
+  readonly limit: Limit;
+}
+
 /**
- * Login's per-account limiter. Needs the parsed body, so it is called from the handler rather than
- * an `onRequest` hook. Returns true if the request may proceed; otherwise it has already replied 429.
+ * Login's per-account limiter, one counter per window. Needs the parsed body, so it is called from
+ * the handler rather than an `onRequest` hook. Windows are checked in order and the first one
+ * exceeded replies 429 (so an attempt blocked by an earlier window doesn't count against later
+ * ones). Returns true if the request may proceed; otherwise it has already replied 429.
  */
 export function createEmailLimiter(
   app: FastifyInstance,
   deps: RateLimitDeps,
-  name: string,
-  limit: Limit,
+  windows: readonly EmailWindow[],
 ) {
-  const check = app.createRateLimit({
-    max: limit.max,
-    timeWindow: limit.timeWindow,
-    keyGenerator: (request: FastifyRequest) => {
-      const email = (request.body as { email?: unknown } | undefined)?.email;
-      const normalised = typeof email === 'string' ? email.trim().toLowerCase() : '';
-      return `${name}:email:${pseudonym(deps.keySecret, 'email', normalised)}`;
-    },
-  });
+  const checks = windows.map(({ name, limit }) =>
+    app.createRateLimit({
+      max: limit.max,
+      timeWindow: limit.timeWindow,
+      keyGenerator: (request: FastifyRequest) => {
+        const email = normaliseEmailForLimit(
+          (request.body as { email?: unknown } | undefined)?.email,
+        );
+        return `${name}:email:${pseudonym(deps.keySecret, 'email', email)}`;
+      },
+    }),
+  );
   return async (request: FastifyRequest, reply: FastifyReply): Promise<boolean> => {
-    const result = await check(request);
-    if (!result.isAllowed && result.isExceeded) {
-      await reply
-        .code(429)
-        .header('retry-after', String(result.ttlInSeconds))
-        .send(rateLimitedBody(result.ttl));
-      return false;
+    for (const check of checks) {
+      const result = await check(request);
+      if (!result.isAllowed && result.isExceeded) {
+        await reply
+          .code(429)
+          .header('retry-after', String(result.ttlInSeconds))
+          .send(rateLimitedBody(result.ttl));
+        return false;
+      }
     }
     return true;
   };

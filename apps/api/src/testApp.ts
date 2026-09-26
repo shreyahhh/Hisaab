@@ -31,12 +31,14 @@ export const testRedis = new Redis('redis://localhost:6379', {
   connectTimeout: 500,
 });
 
+export const TEST_KEY_SECRET = 'test-rate-limit-key-secret';
+
 export function buildTestApp(overrides: Partial<AppDeps> = {}) {
   return buildApp({
     db: testDb,
     auth: testAuth,
     trustedOrigin: 'http://localhost:5173',
-    rateLimit: { redis: testRedis, keySecret: 'test-rate-limit-key-secret' },
+    rateLimit: { redis: testRedis, keySecret: TEST_KEY_SECRET },
     ...overrides,
   });
 }

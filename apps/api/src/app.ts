@@ -87,7 +87,10 @@ export function buildApp(deps: AppDeps): FastifyInstance {
       signupIp: ipLimit(deps.rateLimit, 'signup', LIMITS.signup.ip),
       loginIp: ipLimit(deps.rateLimit, 'login', LIMITS.login.ip),
       inviteAcceptIp: ipLimit(deps.rateLimit, 'invite-accept', LIMITS.inviteAccept.ip),
-      loginEmail: createEmailLimiter(scope, deps.rateLimit, 'login', LIMITS.login.email),
+      loginEmail: createEmailLimiter(scope, deps.rateLimit, [
+        { name: 'login', limit: LIMITS.login.email },
+        { name: 'login-hourly', limit: LIMITS.login.emailHourly },
+      ]),
     };
     registerAuthWrapperRoutes(scope, deps, limits);
     registerMeRoutes(scope, deps);

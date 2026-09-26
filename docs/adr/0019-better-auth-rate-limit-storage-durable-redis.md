@@ -38,7 +38,7 @@ not an assumption:
   `maxmemory-policy noeviction` explicitly — ElastiCache's default is `volatile-lru`, which *can*
   evict TTL'd keys (every `ba:` counter and our own `rl:` counters carry a TTL) under memory
   pressure. Verify with `CONFIG GET maxmemory-policy` after provisioning.
-- **Failure mode is closed, by design:** under `noeviction`, a full instance rejects writes instead
+- **Failure mode is closed, by design (see Accepted trade-offs):** under `noeviction`, a full instance rejects writes instead
   of dropping counters, so rate-limited routes error rather than silently going unthrottled. Memory
   on this instance therefore needs an alert well below `maxmemory` (it also carries the event
   stream and BullMQ queues, HLD §4).
@@ -49,8 +49,24 @@ Better Auth's limiter only wraps its HTTP handler; `auth.api.*` server calls ski
 `POST /v1/invites/:token/accept` call `auth.api.*` directly, so `apps/api` rate-limits them itself
 with `@fastify/rate-limit` on this same durable Redis (prefix `rl:`; keys hold an HMAC of the IP —
 and of the email for login — never the raw value). Limits: 10/min per IP on each route, plus 5/min
-per email on login. Known gap we don't control: Better Auth's own `ba:<ip>|<path>` counters (for
-its `/v1/auth/*` handler routes) embed the raw IP for the length of the window.
+per email on login, plus a second per-email window of 20/hour (a slow guesser that waits out the
+minute still hits a ceiling). Known gap we don't control: Better Auth's own `ba:<ip>|<path>`
+counters (for its `/v1/auth/*` handler routes) embed the raw IP for the length of the window.
+
+## Accepted trade-offs
+- **The limiter fails closed, so the durable Redis is on the critical path for signup, login and
+  invite-accept.** `skipOnError` is `false` (and Better Auth's limiter behaves the same way): if
+  the durable Redis is unreachable or full, those routes error instead of going unthrottled. An
+  outage of that instance therefore also stops people signing up, logging in and accepting
+  invites, on top of the collector and worker impact HLD Q2/Q14 already accept. We prefer that to
+  an open brute-force window. Already-issued sessions keep working (session checks don't touch
+  the limiter).
+- **The per-email limits allow targeted lockout.** Anyone who knows an address can send 5 bad
+  logins a minute (or 20 an hour) and keep the real owner from logging in. The counter is keyed on
+  the email, not on the credentials' correctness, so we can't tell the owner from an attacker. We
+  accept this: the lockout lasts only as long as the attacker keeps sending, it doesn't disable the
+  account, and the alternative, no per-account cap, leaves distributed guessing across many IPs
+  unbounded. Revisit if it is abused (e.g. CAPTCHA or a per-IP+email pairing).
 
 ## Consequences
 - `packages/auth`'s `CreateAuthOptions.redisDurableUrl` replaces `redisCacheUrl`; callers

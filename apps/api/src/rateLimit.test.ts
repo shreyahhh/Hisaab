@@ -2,8 +2,8 @@ import { randomUUID } from 'node:crypto';
 import { and, eq, gte } from 'drizzle-orm';
 import { schema } from '@truepath/db';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { LIMITS } from './rateLimit.js';
-import { buildTestApp, testDb, testRedis } from './testApp.js';
+import { LIMITS, pseudonym } from './rateLimit.js';
+import { buildTestApp, TEST_KEY_SECRET, testDb, testRedis } from './testApp.js';
 
 // Our own routes call `auth.api.*` directly, which skips Better Auth's rate limiter (verified in
 // packages/auth: 15 direct signInEmail calls never returned 429) — so they carry their own,
@@ -113,6 +113,36 @@ describe('POST /v1/auth/login — per-IP and per-account limits', () => {
     );
     expect(codes.slice(0, max).every((c) => c !== 429)).toBe(true);
     expect(codes[max]).toBe(429);
+
+    const otherEmail = await post('/v1/auth/login', randomIp(), {
+      email: uniqueEmail(),
+      password: 'wrong-password-long-enough',
+    });
+    expect(otherEmail.statusCode).not.toBe(429);
+  });
+
+  it('also caps an email at 20/hour, even when the per-minute window keeps resetting', async () => {
+    const email = uniqueEmail();
+    const { max: perMinute } = LIMITS.login.email;
+    const { max: perHour } = LIMITS.login.emailHourly;
+    const minuteKeyPattern = `*login:email:${pseudonym(TEST_KEY_SECRET, 'email', email)}`;
+    const attempt = () =>
+      post('/v1/auth/login', randomIp(), { email, password: 'wrong-password-long-enough' });
+
+    // Stay under 5/min by clearing the minute counter between bursts (standing in for a slow
+    // attacker who waits out the minute); only the hourly counter accumulates across bursts.
+    for (let sent = 0; sent < perHour; sent += perMinute) {
+      const codes = await hammer(perMinute, attempt);
+      expect(codes.every((c) => c !== 429)).toBe(true);
+      const minuteKeys = await testRedis.keys(minuteKeyPattern);
+      expect(minuteKeys).toHaveLength(1);
+      await testRedis.del(...minuteKeys);
+    }
+
+    const blocked = await attempt();
+    expect(blocked.statusCode).toBe(429);
+    // The wait is measured in minutes, i.e. it came from the hourly window, not the minute one.
+    expect(blocked.json().retryAfterSeconds).toBeGreaterThan(60);
 
     const otherEmail = await post('/v1/auth/login', randomIp(), {
       email: uniqueEmail(),
