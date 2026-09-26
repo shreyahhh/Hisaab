@@ -72,3 +72,8 @@ audit it (catalogue action, schema, migration, `AUDIT_ACTION_OWNERS`), add it to
 
 The CSRF hook (`app.ts`) covers the `/v1/auth` wrappers too: they skip Better Auth's own origin check,
 so before this change a POST to login, signup or logout from another origin was processed.
+
+Every state-changing request (anything but GET, HEAD and OPTIONS) needs exactly the dashboard's
+`Origin`, or it is a 403 `invalid_origin`, a missing header included; we have no non-browser clients.
+POST, PUT and PATCH also need `Content-Type: application/json` (judged first). `app.test.ts` covers the
+methods, routes (unknown ones too) and Origin variants.

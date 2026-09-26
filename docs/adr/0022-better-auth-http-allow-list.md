@@ -33,7 +33,8 @@ that bug, which Google sign-in and password reset need, would have switched all 
    asserts that only allow-listed ones are reachable through the app, that every path is exposed or disabled, and
    that Better Auth's own router refuses each disabled one. A Better Auth upgrade or a new plugin that adds an
    endpoint fails it until someone decides.
-5. Our own routes (`/v1/auth/signup|login|logout`, `/v1/orgs/...`) call `auth.api.*` directly, which never goes
+5. **`exposeAllPathsForTests` is test-only, twice over.** The `createAuth` option that switches `disabledPaths` off throws when `NODE_ENV` is `production`, and an ESLint rule (`eslint.config.js`, tested in `apps/api/src/eslintBoundary.test.ts`) lets only test files (`*.test.ts(x)`) and test helpers (`testing.ts`, `apps/api/src/testApp.ts`, `testAuthTenant.ts`) write the property. It is a syntax rule, so it can't see the option arriving through a spread or a computed key.
+6. Our own routes (`/v1/auth/signup|login|logout`, `/v1/orgs/...`) call `auth.api.*` directly, which never goes
    through the HTTP router, so neither list affects them.
 
 ## Consequences

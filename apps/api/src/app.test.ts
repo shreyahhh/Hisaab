@@ -139,3 +139,102 @@ describe('buildApp — CSRF check on our own state-changing routes (auth-tenancy
     }
   });
 });
+
+// We have no non-browser clients, so the rule is flat: every state-changing request (anything but
+// GET, HEAD and OPTIONS) must carry exactly the dashboard's Origin, or it is a 403 — a missing
+// Origin included. JSON is sent throughout so that it is the Origin being judged, not the content type.
+describe('buildApp — every state-changing request needs the dashboard Origin (403 otherwise)', () => {
+  const TRUSTED = 'http://localhost:5173';
+  const ID = '3f0c9a1e-77aa-4d1b-9c0e-0a1b2c3d4e5f';
+  const requests = [
+    ['POST', '/v1/auth/login'],
+    ['POST', '/v1/auth/signup'],
+    ['POST', '/v1/auth/logout'],
+    ['POST', '/v1/orgs'],
+    ['POST', `/v1/orgs/${ID}/invites`],
+    ['POST', `/v1/invites/${ID}/accept`],
+    ['PUT', `/v1/orgs/${ID}/members/${ID}`],
+    ['DELETE', `/v1/orgs/${ID}/members/${ID}`],
+    ['PATCH', `/v1/orgs/${ID}`],
+    ['PUT', '/v1/no-such-route'],
+    ['DELETE', '/v1/no-such-route'],
+    ['POST', '/v1/auth/organization/delete'],
+  ] as const;
+  const badOrigins: Array<[string, string | undefined]> = [
+    ['no Origin header', undefined],
+    ['Origin: null', 'null'],
+    ['an empty Origin', ''],
+    ['another origin', 'http://evil.example'],
+    ['the dashboard origin with a trailing slash', `${TRUSTED}/`],
+    ['the dashboard origin over https', 'https://localhost:5173'],
+    ['a look-alike host', 'http://localhost:5173.evil.example'],
+  ];
+
+  const send = (
+    app: ReturnType<typeof buildTestApp>,
+    method: string,
+    url: string,
+    origin?: string,
+  ) =>
+    app.inject({
+      method: method as 'POST',
+      url,
+      headers: { 'content-type': 'application/json', ...(origin === undefined ? {} : { origin }) },
+      remoteAddress: '10.96.1.1',
+      ...(method === 'DELETE' ? {} : { payload: {} }),
+    });
+
+  it.each(
+    requests.flatMap(([method, url]) =>
+      badOrigins.map(([label, origin]) => [method, url, label, origin] as const),
+    ),
+  )('%s %s with %s is a 403 invalid_origin', async (method, url, _label, origin) => {
+    const app = buildTestApp();
+    try {
+      const res = await send(app, method, url, origin);
+      expect(res.statusCode).toBe(403);
+      expect(res.json()).toEqual({ error: 'invalid_origin' });
+    } finally {
+      await app.close();
+    }
+  });
+
+  it.each(requests)(
+    '%s %s with the dashboard Origin is not stopped by the hook',
+    async (method, url) => {
+      const app = buildTestApp();
+      try {
+        const res = await send(app, method, url, TRUSTED);
+        expect(res.statusCode).not.toBe(403);
+      } finally {
+        await app.close();
+      }
+    },
+  );
+
+  it('with no Origin and no JSON content type it is still a 403 (the content type is judged first)', async () => {
+    const app = buildTestApp();
+    try {
+      const res = await app.inject({
+        method: 'POST',
+        url: '/v1/orgs',
+        payload: 'x',
+        headers: { 'content-type': 'text/plain' },
+      });
+      expect(res.statusCode).toBe(403);
+      expect(res.json()).toEqual({ error: 'invalid_content_type' });
+    } finally {
+      await app.close();
+    }
+  });
+
+  it.each(['GET', 'HEAD'] as const)('%s is never judged by the hook', async (method) => {
+    const app = buildTestApp();
+    try {
+      const res = await app.inject({ method, url: '/healthz' });
+      expect(res.statusCode).toBe(200);
+    } finally {
+      await app.close();
+    }
+  });
+});
