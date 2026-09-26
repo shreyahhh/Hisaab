@@ -31,7 +31,12 @@ describe('buildApp', () => {
     try {
       await app.ready();
       expect(app.routeRegistry.some((r) => r.url === '/healthz' && r.method === 'GET')).toBe(true);
-      expect(app.routeRegistry.some((r) => r.url === '/v1/auth/*')).toBe(true);
+      expect(
+        app.routeRegistry.some((r) => r.url === '/v1/auth/get-session' && r.method === 'GET'),
+      ).toBe(true);
+      expect(
+        app.routeRegistry.some((r) => r.url.includes('*') && r.url.startsWith('/v1/auth')),
+      ).toBe(false);
     } finally {
       await app.close();
     }

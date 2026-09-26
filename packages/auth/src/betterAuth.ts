@@ -7,6 +7,7 @@ import { schema, type Db } from '@truepath/db';
 import type { AuthEnv } from '@truepath/shared';
 import { ac, adminRole, analystRole, ownerRole, viewerRole } from './accessControl.js';
 import { noopEmailSender, type AuthEmailSender } from './email.js';
+import { AUTH_BASE_PATH, DISABLED_AUTH_PATHS } from './exposure.js';
 import { nullGoogleTokensAfterCreate, truncateIp } from './hooks.js';
 
 export type { AuthEnv };
@@ -43,6 +44,12 @@ export interface CreateAuthOptions {
    * is the only reason to set it, and `createAuth` refuses to when NODE_ENV is "production".
    */
   readonly allowInsecureCookies?: boolean;
+  /**
+   * Turns Better Auth's `disabledPaths` off so a test can drive its HTTP handler (origin check, rate
+   * limiter) through paths the API doesn't expose (ADR-0022). Test-only: like `allowInsecureCookies`,
+   * `createAuth` refuses it when NODE_ENV is "production".
+   */
+  readonly exposeAllPathsForTests?: boolean;
   /** Set only once a real registrable domain exists, to enable crossSubDomainCookies (app.<d>/api.<d>). */
   readonly cookieDomain?: string;
   /** SES wiring lands in a later ticket; defaults to a logging no-op (email.ts). */
@@ -57,12 +64,20 @@ export function createAuth(options: CreateAuthOptions) {
       'createAuth: allowInsecureCookies is local-dev only and cannot be set in production',
     );
   }
+  if (options.exposeAllPathsForTests && process.env.NODE_ENV === 'production') {
+    throw new Error(
+      'createAuth: exposeAllPathsForTests is test-only and cannot be set in production',
+    );
+  }
   const emailSender = options.emailSender ?? noopEmailSender;
   const redis = new Redis(options.redisDurableUrl);
 
   return betterAuth({
     database: drizzleAdapter(db, { provider: 'pg', schema: authDrizzleSchema }),
-    basePath: '/v1/auth',
+    basePath: AUTH_BASE_PATH,
+    // Defence in depth behind the bridge's allow-list (exposure.ts, ADR-0022). Only affects Better
+    // Auth's HTTP router: the `auth.api.*` calls our own routes make are unaffected.
+    disabledPaths: options.exposeAllPathsForTests ? [] : [...DISABLED_AUTH_PATHS],
     baseURL: env.BETTER_AUTH_URL,
     secret: env.BETTER_AUTH_SECRET,
     advanced: {
@@ -146,6 +161,9 @@ export function createAuth(options: CreateAuthOptions) {
             organizationName: data.organization.name,
           }),
         allowUserToCreateOrganization: true,
+        // Deleting an organization is our own audited, 7-day-grace flow (DELETE /v1/orgs/:id, issue #8),
+        // never Better Auth's immediate one.
+        disableOrganizationDeletion: true,
       }),
     ],
   });

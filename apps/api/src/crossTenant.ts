@@ -1,3 +1,4 @@
+import { AUTH_BASE_PATH, EXPOSED_AUTH_ROUTES } from '@truepath/auth';
 import { isTenantScopedRoute, type HttpMethod, type RouteRegistryEntry } from './routeRegistry.js';
 
 // Route-side half of the generated cross-tenant check (SPEC §5.10 test 7; auth-tenancy.md §8).
@@ -83,12 +84,16 @@ export const EXEMPT_ROUTES: readonly RouteExemption[] = [
     url: '/healthz',
     reason: 'Fastify-generated HEAD mirror of GET /healthz.',
   },
-  {
-    method: '*',
-    url: '/v1/auth/*',
-    reason:
-      "Better Auth's own routes (sign-up/in/out, OAuth callback, verify-email, reset-password, session, ...) are session-bound, not org/store-id-in-path resources, and Better Auth enforces its own authorization on them.",
-  },
+  // The Better Auth routes we bridge, one entry each (ADR-0022): the reason comes from the allow-list
+  // itself, so a route can't be exposed without saying why it needs no tenant scope.
+  ...EXPOSED_AUTH_ROUTES.flatMap((route): RouteExemption[] => [
+    { method: route.method, url: `${AUTH_BASE_PATH}${route.path}`, reason: route.reason },
+    {
+      method: 'HEAD',
+      url: `${AUTH_BASE_PATH}${route.path}`,
+      reason: `Fastify-generated HEAD mirror of GET ${AUTH_BASE_PATH}${route.path}.`,
+    },
+  ]),
   {
     method: 'OPTIONS',
     url: '*',

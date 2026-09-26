@@ -121,7 +121,9 @@ describe('signOut (POST /v1/auth/logout) — returns a 4xx Response', () => {
     const res = await app.inject({
       method: 'POST',
       url: '/v1/auth/logout',
-      headers: asHeaders(user),
+      // The CSRF hook wants a JSON content type on every state-changing POST, logout included.
+      headers: { ...asHeaders(user), 'content-type': 'application/json' },
+      payload: {},
     });
     expect(res.statusCode).toBe(400);
     expect(res.json()).toEqual({ error: 'FAILED_TO_GET_SESSION' });

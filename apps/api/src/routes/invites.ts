@@ -27,10 +27,13 @@ export function registerInviteRoutes(
     async (request, reply) => {
       const scope = request.scope!;
       const role = RoleSchema.parse(request.body.role);
-      // Nobody can invite at a role above their own — auth-tenancy.md §2.1's "admins can't invite
-      // owners" is the only case this hierarchy produces today (admin inviting admin is same-rank,
-      // allowed). Better Auth's own creatorRole check only blocks *changing* an existing member's
-      // role, not inviting a new one at a given role, so this has no equivalent upstream.
+      // Nobody can invite at a role above their own (auth-tenancy.md §2.1). Better Auth's
+      // createInvitation already refuses one case of this: a member who isn't the creator role
+      // (owner) inviting someone *as* the creator role, with YOU_ARE_NOT_ALLOWED_TO_INVITE_USER_WITH_THIS_ROLE
+      // (403). With today's four roles that is the only violation the hierarchy can produce (admin
+      // inviting admin is same-rank, allowed), so the two checks coincide. This one states the general
+      // rule, doesn't depend on that option staying set, and answers in our `forbidden_role` shape
+      // before any Better Auth work happens.
       if (scope.role !== 'job' && !isAtOrBelowOwnRank(scope.role, role)) {
         await reply.code(403).send({ error: 'forbidden_role' });
         return;

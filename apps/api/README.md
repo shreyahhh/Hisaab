@@ -56,3 +56,19 @@ Every audited action goes through `deps.audit` (`src/audit.ts`), never straight 
   any validation. Only the first page is audited.
 - `AUDIT_ACTION_OWNERS` (`packages/shared`) names the ticket that emits each catalogue action, and
   `src/auditCoverage.test.ts` fails when an emitter or its evidence test goes missing (SPEC §5.10 test 8).
+
+## Better Auth's HTTP routes are an allow-list (ADR-0022)
+
+Only `GET /v1/auth/get-session`, `/ok` and `/error` reach Better Auth. Everything else it ships
+(52 paths in all) is a `404` twice over: Fastify registers only the allow-list
+(`EXPOSED_AUTH_ROUTES` in `packages/auth/src/exposure.ts`, no wildcard), and Better Auth's own
+`disabledPaths` (`DISABLED_AUTH_PATHS`) refuses the rest; organization deletion is disabled in
+Better Auth. Our `/v1/auth/signup|login|logout` and `/v1/orgs/...` routes call `auth.api.*` directly
+and are unaffected. **A route joins the allow-list only in the same change that audits it.**
+`src/authBridge.test.ts` enumerates every path Better Auth has and fails when a new one is neither
+exposed nor disabled, so an upgrade or a new plugin can't add a route silently. To expose a route:
+audit it (catalogue action, schema, migration, `AUDIT_ACTION_OWNERS`), add it to
+`EXPOSED_AUTH_ROUTES` with its reason, and take it out of `DISABLED_AUTH_PATHS`.
+
+The CSRF hook (`app.ts`) covers the `/v1/auth` wrappers too: they skip Better Auth's own origin check,
+so before this change a POST to login, signup or logout from another origin was processed.
