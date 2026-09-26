@@ -12,6 +12,7 @@ export { truncateIp, nullGoogleTokensAfterCreate } from './hooks.js';
 export {
   resolveMembership,
   resolveMembershipsForUser,
+  findUserIdByEmail,
   getInvitation,
   type InvitationInfo,
   type MembershipInfo,

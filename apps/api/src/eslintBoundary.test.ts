@@ -86,3 +86,64 @@ describe('the DB-client boundary (same rule block) is intact', () => {
     }
   });
 });
+
+describe('@truepath/privacy/meta-capi (plain SHA-256 for Meta) is importable only by the Meta integration', () => {
+  const NAMED = `import { sha256ForMetaCapi } from '@truepath/privacy/meta-capi';\nvoid sha256ForMetaCapi;\n`;
+  const mentionsIt = (messages: string[]) => messages.some((m) => m.includes('meta-capi'));
+
+  it.each([
+    ['the Meta integration', 'packages/integrations/meta/probe.ts'],
+    ['the Meta integration under src/', 'packages/integrations/src/meta/probe.ts'],
+  ])('is allowed in %s', async (_label, relPath) => {
+    expect(mentionsIt(await restrictedImports(NAMED, relPath))).toBe(false);
+  });
+
+  it.each([
+    ['apps/api', 'apps/api/src/routes/probe.ts'],
+    ['apps/api tests', 'apps/api/src/probe.test.ts'],
+    ['apps/workers', 'apps/workers/src/probe.ts'],
+    ['apps/collector', 'apps/collector/src/probe.ts'],
+    ['another integration', 'packages/integrations/google-ads/probe.ts'],
+    ['the integrations package root', 'packages/integrations/src/probe.ts'],
+    ['packages/privacy itself', 'packages/privacy/src/probe.ts'],
+    ['packages/auth', 'packages/auth/src/probe.ts'],
+    ['packages/db', 'packages/db/src/probe.ts'],
+    ['the tenant-scope preHandler', 'apps/api/src/tenantScope.ts'],
+  ])('is blocked in %s', async (_label, relPath) => {
+    expect(mentionsIt(await restrictedImports(NAMED, relPath))).toBe(true);
+  });
+
+  it.each([
+    [
+      'an aliased import',
+      `import { sha256ForMetaCapi as h } from '@truepath/privacy/meta-capi';\nvoid h;\n`,
+    ],
+    ['a namespace import', `import * as meta from '@truepath/privacy/meta-capi';\nvoid meta;\n`],
+    ['a re-export', `export { hashContactForMetaCapi } from '@truepath/privacy/meta-capi';\n`],
+    ['a side-effect import', `import '@truepath/privacy/meta-capi';\n`],
+  ])('cannot be sidestepped with %s', async (_label, code) => {
+    expect(mentionsIt(await restrictedImports(code, 'apps/api/src/routes/probe.ts'))).toBe(true);
+  });
+
+  it('does not over-block the rest of @truepath/privacy', async () => {
+    const code = `import { createIdentityHasher } from '@truepath/privacy';\nimport { createTestIdentityHasher } from '@truepath/privacy/testing';\nvoid createIdentityHasher;\nvoid createTestIdentityHasher;\n`;
+    for (const relPath of ['apps/api/src/routes/probe.ts', 'apps/workers/src/probe.ts']) {
+      expect(await restrictedImports(code, relPath)).toEqual([]);
+    }
+  });
+
+  it('keeps the Meta integration bound by the DB-client and scope-resolution rules', async () => {
+    const raw = `import { Pool } from 'pg';\nvoid Pool;\n`;
+    expect(
+      (await restrictedImports(raw, 'packages/integrations/meta/probe.ts')).some((m) =>
+        m.includes('pg'),
+      ),
+    ).toBe(true);
+    const scope = `import { resolveStoreOrganization } from '@truepath/db';\nvoid resolveStoreOrganization;\n`;
+    expect(
+      (await restrictedImports(scope, 'packages/integrations/meta/probe.ts')).some((m) =>
+        m.includes('resolveStoreOrganization'),
+      ),
+    ).toBe(true);
+  });
+});

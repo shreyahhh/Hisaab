@@ -86,3 +86,17 @@ export async function getInvitation(db: Db, invitationId: string): Promise<Invit
       }
     : null;
 }
+
+/**
+ * The id of the user whose (already lowercased) email is `email`, or null. Same allowed exception
+ * as `resolveMembership`: it reads Better Auth's own `users` table. Used only to say *which
+ * account* a failed login targeted in the audit trail, so the trail never needs the email itself.
+ */
+export async function findUserIdByEmail(db: Db, email: string): Promise<string | null> {
+  const rows = await db
+    .select({ id: schema.users.id })
+    .from(schema.users)
+    .where(eq(schema.users.email, email))
+    .limit(1);
+  return rows[0]?.id ?? null;
+}
