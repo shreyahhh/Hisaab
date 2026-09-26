@@ -16,7 +16,8 @@
     "test": "turbo run test",
     "format": "prettier --write .",
     "db:generate": "turbo run db:generate",
-    "db:migrate": "turbo run db:migrate"
+    "db:migrate": "turbo run db:migrate",
+    "gen:identity-key": "tsx scripts/gen-identity-key.ts"
   },
   "devDependencies": {
     "@eslint/js": "^9.12.0",

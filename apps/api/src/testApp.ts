@@ -1,6 +1,7 @@
 import { Redis } from 'ioredis';
 import { createAuth, type Auth } from '@truepath/auth';
 import { createDb, type Db } from '@truepath/db';
+import { createTestIdentityHasher } from '@truepath/privacy/testing';
 import { loadDotEnvIfPresent, loadEnv, postgresEnvSchema } from '@truepath/shared';
 import { buildApp, type AppDeps } from './app.js';
 
@@ -31,14 +32,15 @@ export const testRedis = new Redis('redis://localhost:6379', {
   connectTimeout: 500,
 });
 
-export const TEST_KEY_SECRET = 'test-rate-limit-key-secret';
+// Random keys, per test process, never written anywhere.
+export const testHasher = createTestIdentityHasher();
 
 export function buildTestApp(overrides: Partial<AppDeps> = {}) {
   return buildApp({
     db: testDb,
     auth: testAuth,
     trustedOrigin: 'http://localhost:5173',
-    rateLimit: { redis: testRedis, keySecret: TEST_KEY_SECRET },
+    rateLimit: { redis: testRedis, hasher: testHasher },
     ...overrides,
   });
 }

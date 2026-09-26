@@ -1,9 +1,10 @@
 import { randomUUID } from 'node:crypto';
 import { and, eq, gte } from 'drizzle-orm';
 import { schema } from '@truepath/db';
+import { purposeContext } from '@truepath/privacy';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { LIMITS, pseudonym } from './rateLimit.js';
-import { buildTestApp, TEST_KEY_SECRET, testDb, testRedis } from './testApp.js';
+import { LIMITS } from './rateLimit.js';
+import { buildTestApp, testDb, testHasher, testRedis } from './testApp.js';
 
 // Our own routes call `auth.api.*` directly, which skips Better Auth's rate limiter (verified in
 // packages/auth: 15 direct signInEmail calls never returned 429) — so they carry their own,
@@ -125,7 +126,8 @@ describe('POST /v1/auth/login — per-IP and per-account limits', () => {
     const email = uniqueEmail();
     const { max: perMinute } = LIMITS.login.email;
     const { max: perHour } = LIMITS.login.emailHourly;
-    const minuteKeyPattern = `*login:email:${pseudonym(TEST_KEY_SECRET, 'email', email)}`;
+    const emailHmac = testHasher.hashEmail(purposeContext('rate_limit_email'), email);
+    const minuteKeyPattern = `*login:email:${emailHmac}`;
     const attempt = () =>
       post('/v1/auth/login', randomIp(), { email, password: 'wrong-password-long-enough' });
 
@@ -149,6 +151,40 @@ describe('POST /v1/auth/login — per-IP and per-account limits', () => {
       password: 'wrong-password-long-enough',
     });
     expect(otherEmail.statusCode).not.toBe(429);
+  });
+});
+
+describe('login rate limiting by hashed email', () => {
+  it('shares one counter between spellings of the same address (one normaliser)', async () => {
+    const email = uniqueEmail();
+    const context = purposeContext('rate_limit_email');
+    const expected = testHasher.hashEmail(context, email);
+    expect(expected).not.toBeNull();
+    expect(testHasher.hashEmail(context, `  ${email.toUpperCase()} `)).toBe(expected);
+
+    await post('/v1/auth/login', randomIp(), {
+      email: `  ${email.toUpperCase()} `,
+      password: 'wrong-password-long-enough',
+    });
+    expect(await testRedis.keys(`*login:email:${expected}`)).toHaveLength(1);
+  });
+
+  it('puts every unusable email in one shared bucket instead of a key per value', async () => {
+    const pattern = '*:email:invalid';
+    const stale = await testRedis.keys(pattern);
+    if (stale.length > 0) await testRedis.del(...stale);
+
+    const { max } = LIMITS.login.email;
+    const codes = await hammer(max + 1, (i) =>
+      post('/v1/auth/login', randomIp(), {
+        email: i % 2 === 0 ? `not-an-email-${randomUUID()}` : { nested: i },
+        password: 'wrong-password-long-enough',
+      }),
+    );
+    expect(codes.slice(0, max).every((c) => c !== 429)).toBe(true);
+    expect(codes[max]).toBe(429);
+    expect((await testRedis.keys(pattern)).length).toBeGreaterThan(0);
+    await testRedis.del(...(await testRedis.keys(pattern)));
   });
 });
 

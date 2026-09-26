@@ -1,11 +1,10 @@
 import { fromNodeHeaders } from 'better-auth/node';
-import { APIError } from 'better-auth/api';
 import type { FastifyInstance } from 'fastify';
 import { createAuditLogRepository } from '@truepath/db';
 import { resolveMembership } from '@truepath/auth';
 import { can, RoleSchema } from '@truepath/shared';
 import { requireOrgScope, type TenantScopeDeps } from '../tenantScope.js';
-import { sendAuthApiError } from '../errors.js';
+import { AuthApiError, authCall } from '../authCall.js';
 
 // Better Auth uses a different code for updateMemberRole (demoting the last owner) than for
 // removeMember (removing the last owner) — confirmed by exercising both against a real instance.
@@ -44,10 +43,12 @@ export function registerMemberRoutes(app: FastifyInstance, deps: TenantScopeDeps
 
       const newRole = RoleSchema.parse(request.body.role);
       try {
-        const result = await deps.auth.api.updateMemberRole({
-          body: { memberId: target.id, role: newRole, organizationId: scope.organizationId },
-          headers: fromNodeHeaders(request.headers),
-        });
+        const result = await authCall(() =>
+          deps.auth.api.updateMemberRole({
+            body: { memberId: target.id, role: newRole, organizationId: scope.organizationId },
+            headers: fromNodeHeaders(request.headers),
+          }),
+        );
         await createAuditLogRepository(deps.db).record(scope, {
           organizationId: scope.organizationId,
           actorUserId: scope.userId,
@@ -59,15 +60,11 @@ export function registerMemberRoutes(app: FastifyInstance, deps: TenantScopeDeps
         });
         await reply.send(result);
       } catch (error) {
-        if (
-          error instanceof APIError &&
-          error.body?.code &&
-          LAST_OWNER_CODES.has(error.body.code)
-        ) {
+        if (error instanceof AuthApiError && LAST_OWNER_CODES.has(error.code)) {
           await reply.code(409).send({ error: 'last_owner' });
           return;
         }
-        await sendAuthApiError(reply, error);
+        throw error;
       }
     },
   );
@@ -103,14 +100,18 @@ export function registerMemberRoutes(app: FastifyInstance, deps: TenantScopeDeps
         // analyst have none, so it would reject even a self-removal. /organization/leave is the
         // dedicated, permission-free (besides the last-owner guard) self-removal endpoint.
         const result = isSelf
-          ? await deps.auth.api.leaveOrganization({
-              body: { organizationId: scope.organizationId },
-              headers: fromNodeHeaders(request.headers),
-            })
-          : await deps.auth.api.removeMember({
-              body: { memberIdOrEmail: target.id, organizationId: scope.organizationId },
-              headers: fromNodeHeaders(request.headers),
-            });
+          ? await authCall(() =>
+              deps.auth.api.leaveOrganization({
+                body: { organizationId: scope.organizationId },
+                headers: fromNodeHeaders(request.headers),
+              }),
+            )
+          : await authCall(() =>
+              deps.auth.api.removeMember({
+                body: { memberIdOrEmail: target.id, organizationId: scope.organizationId },
+                headers: fromNodeHeaders(request.headers),
+              }),
+            );
         await createAuditLogRepository(deps.db).record(scope, {
           organizationId: scope.organizationId,
           actorUserId: scope.userId,
@@ -122,15 +123,11 @@ export function registerMemberRoutes(app: FastifyInstance, deps: TenantScopeDeps
         });
         await reply.send(result);
       } catch (error) {
-        if (
-          error instanceof APIError &&
-          error.body?.code &&
-          LAST_OWNER_CODES.has(error.body.code)
-        ) {
+        if (error instanceof AuthApiError && LAST_OWNER_CODES.has(error.code)) {
           await reply.code(409).send({ error: 'last_owner' });
           return;
         }
-        await sendAuthApiError(reply, error);
+        throw error;
       }
     },
   );

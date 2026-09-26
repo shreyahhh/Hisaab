@@ -17,11 +17,19 @@ const DB_CLIENT_ALLOWED = ['packages/db', 'packages/clickhouse', 'packages/auth'
 // preHandler.
 const SCOPE_RESOLUTION_ALLOWED = ['apps/api/src/tenantScope.ts'];
 
-// no-restricted-imports "paths" for a file, built from which of the two restrictions apply to it.
+// Plain (unsalted) SHA-256 of a shopper's phone/email exists only for Meta's Conversions API, where
+// Meta requires it (ADR-0007). It is brute-forceable for a 10-digit mobile, so it must never be
+// computed anywhere it could be stored or joined on: only the Meta integration may import it. It
+// lives behind its own entry point (`@truepath/privacy/meta-capi`, not the package index), and the
+// package's `exports` map blocks deep imports of its files. Everything else uses the tenant HMAC.
+const META_CAPI_ENTRY = '@truepath/privacy/meta-capi';
+const META_CAPI_ALLOWED = ['packages/integrations/meta', 'packages/integrations/src/meta'];
+
+// no-restricted-imports options for a file, built from which of the three restrictions apply to it.
 // Flat config doesn't merge two matching blocks' options for the same rule (the later block simply
 // wins), so each file must match exactly ONE block below, and each block asks for exactly the
 // restrictions that file needs — this one function keeps the blocks from drifting apart.
-function boundaryPaths({ dbClients, scopeResolution }) {
+function boundaryRule({ dbClients, scopeResolution, metaCapi }) {
   const paths = [];
   if (dbClients) {
     for (const name of DB_CLIENT_PATTERNS) {
@@ -38,7 +46,15 @@ function boundaryPaths({ dbClients, scopeResolution }) {
       message: `resolveStoreOrganization is the ADR-0016 bootstrap primitive for building a TenantScope from a :storeId — only ${SCOPE_RESOLUTION_ALLOWED.join(', ')} may call it.`,
     });
   }
-  return paths;
+  const patterns = metaCapi
+    ? [
+        {
+          group: [META_CAPI_ENTRY],
+          message: `${META_CAPI_ENTRY} (plain SHA-256 of phone/email, for Meta CAPI only) may only be imported from ${META_CAPI_ALLOWED.join(', ')}. Use the tenant HMAC from @truepath/privacy for anything else (ADR-0007).`,
+        },
+      ]
+    : [];
+  return { paths, patterns };
 }
 
 export default tseslint.config(
@@ -67,11 +83,15 @@ export default tseslint.config(
   {
     // Everyone else: no raw DB clients, and no resolveStoreOrganization.
     files: ['**/*.{ts,tsx}'],
-    ignores: [...DB_CLIENT_ALLOWED.map((p) => `${p}/**`), ...SCOPE_RESOLUTION_ALLOWED],
+    ignores: [
+      ...DB_CLIENT_ALLOWED.map((p) => `${p}/**`),
+      ...SCOPE_RESOLUTION_ALLOWED,
+      ...META_CAPI_ALLOWED.map((p) => `${p}/**`),
+    ],
     rules: {
       'no-restricted-imports': [
         'error',
-        { paths: boundaryPaths({ dbClients: true, scopeResolution: true }) },
+        boundaryRule({ dbClients: true, scopeResolution: true, metaCapi: true }),
       ],
     },
   },
@@ -82,7 +102,7 @@ export default tseslint.config(
     rules: {
       'no-restricted-imports': [
         'error',
-        { paths: boundaryPaths({ dbClients: true, scopeResolution: false }) },
+        boundaryRule({ dbClients: true, scopeResolution: false, metaCapi: true }),
       ],
     },
   },
@@ -94,7 +114,17 @@ export default tseslint.config(
     rules: {
       'no-restricted-imports': [
         'error',
-        { paths: boundaryPaths({ dbClients: false, scopeResolution: true }) },
+        boundaryRule({ dbClients: false, scopeResolution: true, metaCapi: true }),
+      ],
+    },
+  },
+  {
+    // The Meta integration: the one place allowed to hash for CAPI. Still bound by the other two.
+    files: META_CAPI_ALLOWED.map((p) => `${p}/**/*.{ts,tsx}`),
+    rules: {
+      'no-restricted-imports': [
+        'error',
+        boundaryRule({ dbClients: true, scopeResolution: true, metaCapi: false }),
       ],
     },
   },

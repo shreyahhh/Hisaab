@@ -3,6 +3,7 @@ import fastifyCors from '@fastify/cors';
 import type { Auth } from '@truepath/auth';
 import type { Db } from '@truepath/db';
 import { bridgeToBetterAuth } from './authBridge.js';
+import { registerAuthErrorHandler } from './errors.js';
 import {
   createEmailLimiter,
   ipLimit,
@@ -40,6 +41,7 @@ export function buildApp(deps: AppDeps): FastifyInstance {
   const app = Fastify({ logger: false, trustProxy: deps.trustProxy ?? false });
 
   registerRouteRegistry(app);
+  registerAuthErrorHandler(app);
 
   void app.register(fastifyCors, { origin: deps.trustedOrigin, credentials: true });
 

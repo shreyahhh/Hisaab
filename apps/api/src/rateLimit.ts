@@ -1,7 +1,7 @@
-import { createHmac } from 'node:crypto';
 import fastifyRateLimit from '@fastify/rate-limit';
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import type { Redis } from 'ioredis';
+import { purposeContext, type IdentityHasher } from '@truepath/privacy';
 
 // Rate limiting for our own routes. Better Auth's limiter only wraps its HTTP handler, and our
 // routes call `auth.api.*` directly, which skips it — so signup, login and invite-accept were
@@ -11,12 +11,18 @@ import type { Redis } from 'ioredis';
 // No raw identifier is stored: keys carry an HMAC of the IP (and of the login email), never the
 // value itself (CLAUDE.md: no raw phone/email/IP at rest). Better Auth's own `ba:` keys for its
 // handler routes do embed the IP; that is upstream behaviour we don't control.
+//
+// The HMACs come from packages/privacy's hasher, under platform purposes (`rate_limit_ip`,
+// `rate_limit_email`) that are deliberately unlinkable to any store's identity hashes. Only the
+// hasher's WRITE version is used (`hmac`, never `hmacAll`): a counter is a short-lived window, not
+// a record to look up across key versions. After a key rotation the new version starts fresh
+// counters, i.e. a client's window resets once — bounded by the window (at most an hour).
 
 export interface RateLimitDeps {
   /** ioredis client on the DURABLE Redis. Build it with a low `maxRetriesPerRequest`/`connectTimeout` so an outage errors fast. */
   readonly redis: Redis;
-  /** Keys the HMAC that pseudonymises IPs/emails in Redis keys. */
-  readonly keySecret: string;
+  /** Pseudonymises IPs/emails in Redis keys (write version only). */
+  readonly hasher: IdentityHasher;
 }
 
 interface Limit {
@@ -38,16 +44,8 @@ export const LIMITS = {
   inviteAccept: { ip: { max: 10, timeWindow: '1 minute' } },
 } as const satisfies Record<string, Record<string, Limit>>;
 
-export function pseudonym(secret: string, label: string, value: string): string {
-  return createHmac('sha256', secret)
-    .update(`rl-key-v1:${label}:${value}`)
-    .digest('hex')
-    .slice(0, 32);
-}
-
-export function normaliseEmailForLimit(email: unknown): string {
-  return typeof email === 'string' ? email.trim().toLowerCase() : '';
-}
+const IP_CONTEXT = purposeContext('rate_limit_ip');
+const EMAIL_CONTEXT = purposeContext('rate_limit_email');
 
 function rateLimitedBody(ttlMs: number) {
   return { statusCode: 429, error: 'rate_limited', retryAfterSeconds: Math.ceil(ttlMs / 1000) };
@@ -73,7 +71,7 @@ export function ipLimit(deps: RateLimitDeps, name: string, limit: Limit) {
       max: limit.max,
       timeWindow: limit.timeWindow,
       keyGenerator: (request: FastifyRequest) =>
-        `${name}:ip:${pseudonym(deps.keySecret, 'ip', fastifyRateLimit.normalizeIP(request.ip))}`,
+        `${name}:ip:${deps.hasher.hmac(IP_CONTEXT, fastifyRateLimit.normalizeIP(request.ip))}`,
     },
   };
 }
@@ -100,10 +98,12 @@ export function createEmailLimiter(
       max: limit.max,
       timeWindow: limit.timeWindow,
       keyGenerator: (request: FastifyRequest) => {
-        const email = normaliseEmailForLimit(
-          (request.body as { email?: unknown } | undefined)?.email,
-        );
-        return `${name}:email:${pseudonym(deps.keySecret, 'email', email)}`;
+        const email = (request.body as { email?: unknown } | undefined)?.email;
+        // Anything that isn't a usable address can't log in anyway; it shares one bucket instead of
+        // minting a Redis key per garbage value.
+        const hashed =
+          typeof email === 'string' ? deps.hasher.hashEmail(EMAIL_CONTEXT, email) : null;
+        return `${name}:email:${hashed ?? 'invalid'}`;
       },
     }),
   );

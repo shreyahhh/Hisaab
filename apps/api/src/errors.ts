@@ -1,13 +1,16 @@
-import { APIError } from 'better-auth/api';
-import type { FastifyReply } from 'fastify';
+import type { FastifyInstance, FastifyReply } from 'fastify';
+import { AuthApiError } from './authCall.js';
 
-/** Translates a Better Auth APIError into a Fastify response instead of a bare 500. */
-export async function sendAuthApiError(reply: FastifyReply, error: unknown): Promise<void> {
-  if (error instanceof APIError) {
-    await reply.code(error.statusCode).send({ error: error.body?.code ?? 'auth_error' });
-    return;
-  }
-  throw error;
+/** Maps an uncaught AuthApiError to Better Auth's status with the `{ error: <code> }` body. */
+export function registerAuthErrorHandler(app: FastifyInstance): void {
+  app.setErrorHandler(async (error, _request, reply) => {
+    if (error instanceof AuthApiError) {
+      await reply.code(error.statusCode).send({ error: error.code });
+      return;
+    }
+    // Not ours: hand it back to Fastify's default handling.
+    throw error;
+  });
 }
 
 /** Copies a Fetch API Response (status, headers incl. Set-Cookie, body) onto a Fastify reply. */
