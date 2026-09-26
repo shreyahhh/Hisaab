@@ -35,14 +35,20 @@ export function normalisePhone(raw: string, defaultCountry: 'IN' = 'IN'): string
 export function normaliseEmail(raw: string): string | null;                               // trim + lowercase
 
 // Hashing
-export function sha256Hex(normalised: string): string;                                    // unsalted, for Meta CAPI only
+// Unsalted SHA-256 for Meta CAPI is `sha256ForMetaCapi(field, raw)` in the separate entry point `@truepath/privacy/meta-capi`
+// (Meta's normalisation; only packages/integrations/meta may import it — eslint.config.js, ADR-0020 / M0-5).
 export type KeyVersion = `k${number}`;
 export type VersionedHmac = `${KeyVersion}:${string}`;                                     // e.g. "k1:3f9a…" (64 hex)
-export interface TenantHasher {
+// M0-5: a context picks the key — a store, or a platform purpose for hashes that belong to no tenant.
+export type HashContext = { kind: 'store'; storeId: StoreId } | { kind: 'purpose'; purpose: HashPurpose };
+export type HashPurpose = 'rate_limit_ip' | 'rate_limit_email';                            // closed list; add one per distinct use
+export interface IdentityHasher {                                                          // was TenantHasher
   readonly writeVersion: KeyVersion;                                                       // IDENTITY_KEY_WRITE
   readonly readVersions: readonly KeyVersion[];                                            // IDENTITY_KEY_READ, includes writeVersion
-  hmac(storeId: StoreId, value: string): VersionedHmac;                                    // under writeVersion — use for writes
-  hmacAll(storeId: StoreId, value: string): VersionedHmac[];                               // one per readVersion — use for lookups
+  hmac(context: HashContext, value: string): VersionedHmac;                                // under writeVersion — use for writes
+  hmacAll(context: HashContext, value: string): VersionedHmac[];                           // one per readVersion — use for lookups
+  hashEmail(context: HashContext, raw: string): VersionedHmac | null;                      // normalise, then hash; null if unusable
+  hashPhone(context: HashContext, raw: string): VersionedHmac | null;                      // (+ hashEmailAll / hashPhoneAll)
 }
 export type HashedIdentity = {
   phoneHmac?: VersionedHmac;
@@ -50,7 +56,7 @@ export type HashedIdentity = {
   identityHashHmac?: VersionedHmac;                                                        // phoneHmac ?? emailHmac (SPEC §7.3 rule 3)
   lookup: VersionedHmac[];                                                                 // phone+email under every read version
 };
-export function hashContact(h: TenantHasher, storeId: StoreId,
+export function hashContact(h: IdentityHasher, storeId: StoreId,
   contact: { phone?: string; email?: string }): HashedIdentity;                            // raw values never leave this call
 
 // Consent (P-7: pluggable so a Consent Manager can replace Shopify later)
@@ -89,7 +95,9 @@ export interface SuppressionClient {
 
 // Redaction
 export function sanitiseUrl(url: string): string;        // allowlisted query params, token paths masked (collector.md §4 step 9)
+export function sanitiseReferrer(url: string): string;  // origin + path only, same token masking (M0-5)
 export function redactLogValue(value: unknown): unknown; // used by the pino redaction hook and Sentry beforeSend
+export function findPii(text: string): { kind: 'email'|'phone'|'hash'|'secret'; index: number }[]; // log-scan tests (§5.10 test 4)
 
 // Audit
 export type AuditAction =
@@ -214,10 +222,10 @@ This LLD adds no tables, columns, keys or queues beyond HLD §8.
 ## 4. Processing flow
 
 ### 4.1 Hashing, the tenant key, and key rotation
-1. At boot, Collector, Core API and Workers load every master secret listed in `IDENTITY_KEY_READ` from Secrets Manager. Secrets are named `truepath/identity-master/k<N>` and KMS-encrypted. `IDENTITY_KEY_WRITE` must be one of them. A missing secret fails startup.
-2. Per-tenant key: `k_store,N = HKDF-SHA256(ikm = master_N, salt = "truepath-identity", info = "k<N>:" + store_id, L = 32)`, cached in process.
-3. `hmac(store, v) = "k<W>:" + hex(HMAC-SHA256(k_store,W, v))`, where W is the write version. `hmacAll` returns one value per read version. The same function hashes normalised phone, normalised email, and `visitor_id` (for `consent_records` and suppression). Every stored HMAC therefore carries its key version (HLD §8 HMAC value format).
-   - **Writes** use `hmac` only.
+1. At boot, Collector, Core API and Workers load every master secret listed in `IDENTITY_KEY_READ`. Secrets are named `truepath/identity-master/k<N>` in Secrets Manager (KMS-encrypted) and reach the process as env vars `IDENTITY_MASTER_K<N>` (base64, ≥ 32 bytes) injected by ECS — [ADR-0020](../../adr/0020-identity-master-keys-via-env.md). `IDENTITY_KEY_WRITE` must be one of them. A missing or malformed variable fails startup, with no default in any environment, and because the environment is read once, **rotation needs a task restart**.
+2. Per-context key: `k_ctx,N = HKDF-SHA256(ikm = master_N, salt = "truepath-identity", info = "k<N>:" + ctx, L = 32)`, cached in process, where `ctx` is `store:<store_id>` for a store or `purpose:<name>` for a hash that belongs to no tenant (rate-limit keys). The prefix names the kind and both payloads are closed alphabets without `:` (a UUID; a fixed list), so the encodings cannot collide. Store and purpose hashes are deliberately unlinkable.
+3. `hmac(ctx, v) = "k<W>:" + hex(HMAC-SHA256(k_ctx,W, v))`, where W is the write version. `hmacAll` returns one value per read version. The same function hashes normalised phone, normalised email, and `visitor_id` (for `consent_records` and suppression). Every stored HMAC therefore carries its key version (HLD §8 HMAC value format).
+   - **Writes** use `hmac` only. Short-lived keys (the rate limiter) also use only `hmac`: after a rotation their counters start fresh.
    - **Lookups** use `hmacAll` wherever the raw value is available: Collector suppression checks, Core API order webhooks, DSR resolution. They query with `IN (…all versions…)`, so data hashed under an older version is still found.
    - During a rotation window, writers that hold the raw value also write `identity_links` rows under the previous version, so cross-device stitching keeps working across the boundary.
 4. Phone normalisation: strip everything except digits and a leading `+`. `+91` followed by 10 digits → keep. 12 digits starting `91` → `+` prefix. 11 digits starting `0` → drop the `0`, add `+91`. 10 digits starting 6–9 → `+91` + digits. Other `+` numbers of 8–15 digits → keep. Anything else → `null`.
@@ -481,9 +489,10 @@ Where tracking is enabled by default, Shopify runs pixel callbacks until the sho
 - Indian mobile patterns `(?:\+?91[\s-]?)?[6-9]\d{9}`,
 - generic E.164 `\+\d{8,15}`,
 - emails `[^\s@]+@[^\s@]+\.[^\s@]+`,
-- and any 64-hex string (hashes)
+- and any 64-hex string (hashes),
+- and `IDENTITY_MASTER_*=…` / `IDENTITY_MASTER_*: …` assignments
 
-with `[redacted]`. Known false positives, such as 10-digit Shopify order numbers starting 6–9, are accepted.
+with `[redacted]`. Object keys are blanked by name (`IDENTITY_MASTER_*`, passwords, tokens, cookies, `email`, `phone`, `ip`, `user_agent`, `visitor_id`, …), whatever the value. Known false positives, such as 10-digit Shopify order numbers starting 6–9, are accepted.
 
 ## 7. Performance & limits
 
@@ -502,7 +511,7 @@ Scale note: per-store retention deletes are fine for MVP (tens of stores). Beyon
 ## 8. Test plan
 
 **Unit**
-- Normalisers: table-driven — `+91 98123 45678`, `098123 45678`, `919812345678`, `9812345678`, `+14155550123`, junk → `null`; email case and whitespace.
+- Normalisers: table-driven — `+91 97531 24680`, `097531 24680`, `919753124680`, `9753124680`, `+14155550123`, junk → `null`; email case and whitespace; dummy numbers → `null`. (The original fixture `98123 45678` contains the run `12345678` and is itself a dummy under §4.1 step 4.) The email normaliser must accept everything Better Auth's `z.email()` accepts.
 - HMAC: deterministic per store; different across stores. Property test: `hmac(a, v) ≠ hmac(b, v)` for `a ≠ b` (no cross-tenant joins, SPEC §7.3 rule 5).
 - `ConsentProvider`: every combination of analytics, marketing and child-directed.
 - `sanitiseUrl`: allowlist kept; `email=`/`phone=`/`q=` dropped; `/checkouts/<token>` masked.

@@ -25,7 +25,7 @@
 | Endpoint | Auth | Implementation |
 |---|---|---|
 | `POST /v1/auth/signup` | public | `{email, password (≥ 12), name}` → `auth.api.signUpEmail`; a verification email via SES; `requireEmailVerification: true` |
-| `POST /v1/auth/login` | public | `{email, password}` → `auth.api.signInEmail`; sets the session cookie. Audit `login_succeeded` / `login_failed` |
+| `POST /v1/auth/login` | public | `{email, password}` → `auth.api.signInEmail`; sets the session cookie. Audit `login_succeeded` / `login_failed`; `login_failed` metadata is `{target_user_id}` when the attempted email belongs to a user, else `{unknown_account: true}` — never the email or a hash of it |
 | `POST /v1/auth/logout` | session | `auth.api.signOut` |
 | `/v1/auth/*` (Better Auth handler) | varies | Better Auth's own routes, mounted as a Fastify catch-all under `/v1/auth/`: `sign-in/social` (Google), `callback/google`, `verify-email`, `request-password-reset`, `reset-password`, and so on. Only the routes of enabled features are exposed. |
 | `GET /v1/me` | session | `{user, memberships[{org, role}], breach_notices[]}` |

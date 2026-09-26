@@ -11,7 +11,7 @@ Phone and email are needed to stitch identities (SPEC §7.3), to match DSR reque
   - phone → E.164;
   - email → trim and lowercase (matches Meta's rule);
   - a **dummy-phone blocklist** (repeated digits, repeated two-digit blocks, ascending/descending runs, platform list) yields *no identifier*.
-- **Internal joins**: `HMAC-SHA256` with a **per-tenant key** derived by HKDF from a KMS-protected master secret. Stored as **`k<N>:<hex>`** so the master can be rotated; lookups check every active key version. The rotation procedure is in privacy-dpdp §4.1.
+- **Internal joins**: `HMAC-SHA256` with a **per-tenant key** derived by HKDF from a KMS-protected master secret. Stored as **`k<N>:<hex>`** so the master can be rotated; lookups check every active key version. The rotation procedure is in privacy-dpdp §4.1; how keys are loaded is [ADR-0020](0020-identity-master-keys-via-env.md).
 - **Meta CAPI**: plain SHA-256 is computed **in memory at send time** from a Shopify re-fetch of the order, and is **never stored**. If the fetch fails, the event is skipped.
 - Visitor ids stored outside the event tables (`consent_records`, suppression) are HMAC'd too.
 - Raw values exist only inside the hashing call; they are never logged (redaction hook plus log-scan test).
