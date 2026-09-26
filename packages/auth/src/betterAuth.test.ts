@@ -34,7 +34,7 @@ beforeAll(() => {
       GOOGLE_CLIENT_SECRET: 'test-google-client-secret',
     },
     redisDurableUrl: 'redis://localhost:6379',
-    useSecureCookies: false,
+    allowInsecureCookies: true,
     emailSender: testEmailSender,
   });
 });
@@ -185,46 +185,70 @@ describe('createAuth — organization plugin (auth-tenancy.md §4.2)', () => {
 });
 
 describe('createAuth — session cookie attributes (auth-tenancy.md §4.1)', () => {
-  it('sets httpOnly and sameSite=lax by default, and secure follows useSecureCookies', async () => {
-    const email = uniqueEmail('cookie-attrs');
+  const secureEnv = {
+    BETTER_AUTH_SECRET: 'a'.repeat(32),
+    BETTER_AUTH_URL: 'https://api.example.invalid',
+    DASHBOARD_URL: 'https://app.example.invalid',
+    GOOGLE_CLIENT_ID: 'test-google-client-id',
+    GOOGLE_CLIENT_SECRET: 'test-google-client-secret',
+  };
+
+  async function verifiedUser(label: string): Promise<string> {
+    const email = uniqueEmail(label);
     await auth.api.signUpEmail({
       body: { email, password: 'a-very-long-password-123', name: 'Cookie Test' },
     });
     const [user] = await db.select().from(schema.users).where(eq(schema.users.email, email));
     await db.update(schema.users).set({ emailVerified: true }).where(eq(schema.users.id, user!.id));
+    return email;
+  }
 
-    const insecureResponse = await auth.api.signInEmail({
-      body: { email, password: 'a-very-long-password-123' },
-      asResponse: true,
-    });
-    const insecureCookie = insecureResponse.headers.get('set-cookie')!;
-    expect(insecureCookie).toContain('HttpOnly');
-    expect(insecureCookie).toContain('SameSite=Lax');
-    // This instance is configured useSecureCookies: false (local dev/test, plain HTTP) — Secure
-    // must NOT be set, since a browser would then refuse to send the cookie back over HTTP at all.
-    expect(insecureCookie).not.toContain('Secure');
-
-    const secureAuth = createAuth({
+  it('is HttpOnly, SameSite=Lax and Secure by default — nothing to wire, nothing to forget', async () => {
+    const email = await verifiedUser('cookie-default');
+    const defaultAuth = createAuth({
       db,
-      env: {
-        BETTER_AUTH_SECRET: 'a'.repeat(32),
-        BETTER_AUTH_URL: 'https://api.example.invalid',
-        DASHBOARD_URL: 'https://app.example.invalid',
-        GOOGLE_CLIENT_ID: 'test-google-client-id',
-        GOOGLE_CLIENT_SECRET: 'test-google-client-secret',
-      },
+      env: secureEnv,
       redisDurableUrl: 'redis://localhost:6379',
-      useSecureCookies: true,
       emailSender: testEmailSender,
     });
-    const secureResponse = await secureAuth.api.signInEmail({
+    const response = await defaultAuth.api.signInEmail({
       body: { email, password: 'a-very-long-password-123' },
       asResponse: true,
     });
-    const secureCookie = secureResponse.headers.get('set-cookie')!;
-    expect(secureCookie).toContain('HttpOnly');
-    expect(secureCookie).toContain('SameSite=Lax');
-    expect(secureCookie).toContain('Secure');
+    const cookie = response.headers.get('set-cookie')!;
+    expect(cookie).toContain('HttpOnly');
+    expect(cookie).toContain('SameSite=Lax');
+    expect(cookie).toContain('Secure');
+  });
+
+  it('drops Secure only with the explicit local-dev opt-out (allowInsecureCookies)', async () => {
+    const email = await verifiedUser('cookie-optout');
+    const response = await auth.api.signInEmail({
+      body: { email, password: 'a-very-long-password-123' },
+      asResponse: true,
+    });
+    const cookie = response.headers.get('set-cookie')!;
+    expect(cookie).toContain('HttpOnly');
+    expect(cookie).toContain('SameSite=Lax');
+    // A browser refuses to send a Secure cookie back over plain HTTP, hence the opt-out.
+    expect(cookie).not.toContain('Secure');
+  });
+
+  it('refuses the local-dev opt-out under NODE_ENV=production', () => {
+    const previous = process.env.NODE_ENV;
+    process.env.NODE_ENV = 'production';
+    try {
+      expect(() =>
+        createAuth({
+          db,
+          env: secureEnv,
+          redisDurableUrl: 'redis://localhost:6379',
+          allowInsecureCookies: true,
+        }),
+      ).toThrow(/local-dev only/);
+    } finally {
+      process.env.NODE_ENV = previous;
+    }
   });
 });
 

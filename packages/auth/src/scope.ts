@@ -51,3 +51,38 @@ export async function resolveMembershipsForUser(
     .where(eq(schema.memberships.userId, userId));
   return rows;
 }
+
+export interface InvitationInfo {
+  readonly id: string;
+  readonly organizationId: string;
+  readonly email: string;
+  readonly role: Role;
+  readonly status: string;
+  readonly expiresAt: Date;
+  readonly inviterId: string;
+}
+
+/**
+ * Reads an invitation from Better Auth's own `invites` table (same allowed exception as
+ * `resolveMembership`). Used to re-validate an invitation *at acceptance* — Better Auth itself
+ * checks pending/expiry/recipient-email there, but never that the inviter still has standing.
+ */
+export async function getInvitation(db: Db, invitationId: string): Promise<InvitationInfo | null> {
+  const rows = await db
+    .select()
+    .from(schema.invites)
+    .where(eq(schema.invites.id, invitationId))
+    .limit(1);
+  const row = rows[0];
+  return row
+    ? {
+        id: row.id,
+        organizationId: row.organizationId,
+        email: row.email,
+        role: row.role,
+        status: row.status,
+        expiresAt: row.expiresAt,
+        inviterId: row.inviterId,
+      }
+    : null;
+}

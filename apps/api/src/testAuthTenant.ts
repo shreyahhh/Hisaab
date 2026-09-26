@@ -133,3 +133,43 @@ export async function cleanupRealMember(db: Db, member: RealTenant): Promise<voi
 export function randomStoreId(): string {
   return randomUUID();
 }
+
+/** A verified, signed-in user with no organization — e.g. an invitee before they accept. */
+export interface RealUser {
+  readonly userId: string;
+  readonly email: string;
+  readonly cookie: string;
+}
+
+/** Signs up, verifies and signs in a user. Pass `email` to be the recipient of an existing invite. */
+export async function seedRealUser(
+  auth: Auth,
+  db: Db,
+  label: string,
+  email?: string,
+): Promise<RealUser> {
+  const address =
+    email ??
+    `real-user-${label}-${Date.now()}-${Math.random().toString(36).slice(2)}@example.invalid`;
+  await auth.api.signUpEmail({
+    body: { email: address, password: PASSWORD, name: `User ${label}` },
+  });
+  const [user] = await db.select().from(schema.users).where(eq(schema.users.email, address));
+  if (!user) throw new Error('seedRealUser: signup did not create a user');
+  await db.update(schema.users).set({ emailVerified: true }).where(eq(schema.users.id, user.id));
+  const signIn = await auth.api.signInEmail({
+    body: { email: address, password: PASSWORD },
+    asResponse: true,
+  });
+  const cookie = signIn.headers.get('set-cookie');
+  if (!cookie) throw new Error('seedRealUser: sign-in did not return a session cookie');
+  return { userId: user.id, email: address, cookie };
+}
+
+export async function cleanupRealUser(db: Db, user: RealUser): Promise<void> {
+  await db.delete(schema.invites).where(eq(schema.invites.inviterId, user.userId));
+  await db.delete(schema.memberships).where(eq(schema.memberships.userId, user.userId));
+  await db.delete(schema.authAccounts).where(eq(schema.authAccounts.userId, user.userId));
+  await db.delete(schema.sessions).where(eq(schema.sessions.userId, user.userId));
+  await db.delete(schema.users).where(eq(schema.users.id, user.userId));
+}

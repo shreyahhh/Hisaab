@@ -17,15 +17,21 @@ const DB_CLIENT_ALLOWED = ['packages/db', 'packages/clickhouse', 'packages/auth'
 // preHandler.
 const SCOPE_RESOLUTION_ALLOWED = ['apps/api/src/tenantScope.ts'];
 
-// no-restricted-imports "paths" entries shared by both boundary rules below; `withScopeResolution`
-// adds the resolveStoreOrganization restriction for every file except SCOPE_RESOLUTION_ALLOWED —
-// kept as one function so the two blocks below can't drift out of sync with each other.
-function dbClientBoundaryPaths(withScopeResolution) {
-  const paths = DB_CLIENT_PATTERNS.map((name) => ({
-    name,
-    message: `${name} may only be imported from ${DB_CLIENT_ALLOWED.join(', ')} (ADR-0016).`,
-  }));
-  if (withScopeResolution) {
+// no-restricted-imports "paths" for a file, built from which of the two restrictions apply to it.
+// Flat config doesn't merge two matching blocks' options for the same rule (the later block simply
+// wins), so each file must match exactly ONE block below, and each block asks for exactly the
+// restrictions that file needs — this one function keeps the blocks from drifting apart.
+function boundaryPaths({ dbClients, scopeResolution }) {
+  const paths = [];
+  if (dbClients) {
+    for (const name of DB_CLIENT_PATTERNS) {
+      paths.push({
+        name,
+        message: `${name} may only be imported from ${DB_CLIENT_ALLOWED.join(', ')} (ADR-0016).`,
+      });
+    }
+  }
+  if (scopeResolution) {
     paths.push({
       name: '@truepath/db',
       importNames: ['resolveStoreOrganization'],
@@ -59,22 +65,37 @@ export default tseslint.config(
     },
   },
   {
-    // Data-access boundary rule (ADR-0016), plus the resolveStoreOrganization restriction for
-    // every file except the one allowed caller (kept as a separate block below, so the two
-    // `no-restricted-imports` configs never both match the same file — flat config doesn't merge
-    // two matching blocks' options for the same rule, the later one simply wins outright).
+    // Everyone else: no raw DB clients, and no resolveStoreOrganization.
     files: ['**/*.{ts,tsx}'],
     ignores: [...DB_CLIENT_ALLOWED.map((p) => `${p}/**`), ...SCOPE_RESOLUTION_ALLOWED],
     rules: {
-      'no-restricted-imports': ['error', { paths: dbClientBoundaryPaths(true) }],
+      'no-restricted-imports': [
+        'error',
+        { paths: boundaryPaths({ dbClients: true, scopeResolution: true }) },
+      ],
     },
   },
   {
-    // The tenant-scope preHandler: still bound by the DB-client boundary rule, but exempt from
-    // the resolveStoreOrganization restriction — it's the function's one sanctioned caller.
+    // The tenant-scope preHandler: still bound by the DB-client rule, but it is the one sanctioned
+    // caller of resolveStoreOrganization.
     files: SCOPE_RESOLUTION_ALLOWED,
     rules: {
-      'no-restricted-imports': ['error', { paths: dbClientBoundaryPaths(false) }],
+      'no-restricted-imports': [
+        'error',
+        { paths: boundaryPaths({ dbClients: true, scopeResolution: false }) },
+      ],
+    },
+  },
+  {
+    // packages/db, clickhouse and auth may use raw clients — but that does not entitle them to the
+    // bootstrap primitive: an "allowed" package importing it from '@truepath/db' would bypass the
+    // tenant-scope preHandler just as surely as an app would.
+    files: DB_CLIENT_ALLOWED.map((p) => `${p}/**/*.{ts,tsx}`),
+    rules: {
+      'no-restricted-imports': [
+        'error',
+        { paths: boundaryPaths({ dbClients: false, scopeResolution: true }) },
+      ],
     },
   },
 );

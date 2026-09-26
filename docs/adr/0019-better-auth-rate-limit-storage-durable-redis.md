@@ -27,6 +27,31 @@ counter's first write; `set()` via `SETEX` when a TTL is given) — confirmed by
 is bounded by the rate-limit window regardless of which instance holds it; `noeviction` only means
 it can't disappear *before* that TTL expires.
 
+## The durable instance must really be `noeviction`
+This decision is only as good as the instance's eviction policy, so it is stated as a requirement,
+not an assumption:
+- **Local:** `docker-compose.yml`'s `redis-durable` runs `--appendonly yes --maxmemory-policy
+  noeviction`; confirmed live with `CONFIG GET maxmemory-policy` → `noeviction` (the cache instance
+  reports `allkeys-lru`, as intended). `maxmemory` is unset locally, so the policy only bites once a
+  limit exists.
+- **AWS (deployment requirement):** the ElastiCache durable cluster's parameter group must set
+  `maxmemory-policy noeviction` explicitly — ElastiCache's default is `volatile-lru`, which *can*
+  evict TTL'd keys (every `ba:` counter and our own `rl:` counters carry a TTL) under memory
+  pressure. Verify with `CONFIG GET maxmemory-policy` after provisioning.
+- **Failure mode is closed, by design:** under `noeviction`, a full instance rejects writes instead
+  of dropping counters, so rate-limited routes error rather than silently going unthrottled. Memory
+  on this instance therefore needs an alert well below `maxmemory` (it also carries the event
+  stream and BullMQ queues, HLD §4).
+
+## Our own routes are rate-limited separately, on the same instance
+Better Auth's limiter only wraps its HTTP handler; `auth.api.*` server calls skip it (verified:
+15 direct `signInEmail` calls never returned 429). Our `POST /v1/auth/signup|login` and
+`POST /v1/invites/:token/accept` call `auth.api.*` directly, so `apps/api` rate-limits them itself
+with `@fastify/rate-limit` on this same durable Redis (prefix `rl:`; keys hold an HMAC of the IP —
+and of the email for login — never the raw value). Limits: 10/min per IP on each route, plus 5/min
+per email on login. Known gap we don't control: Better Auth's own `ba:<ip>|<path>` counters (for
+its `/v1/auth/*` handler routes) embed the raw IP for the length of the window.
+
 ## Consequences
 - `packages/auth`'s `CreateAuthOptions.redisDurableUrl` replaces `redisCacheUrl`; callers
   (`apps/api/src/testApp.ts`, `packages/auth/src/betterAuth.test.ts`) pass the durable Redis URL.

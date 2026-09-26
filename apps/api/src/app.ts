@@ -3,6 +3,14 @@ import fastifyCors from '@fastify/cors';
 import type { Auth } from '@truepath/auth';
 import type { Db } from '@truepath/db';
 import { bridgeToBetterAuth } from './authBridge.js';
+import {
+  createEmailLimiter,
+  ipLimit,
+  LIMITS,
+  registerRateLimit,
+  type RateLimitDeps,
+  type RouteLimits,
+} from './rateLimit.js';
 import { registerRouteRegistry } from './routeRegistry.js';
 import { registerAuthWrapperRoutes } from './routes/authWrappers.js';
 import { registerInviteRoutes } from './routes/invites.js';
@@ -15,13 +23,21 @@ export interface AppDeps {
   readonly auth: Auth;
   /** Dashboard origin allowed to call this API with credentials (auth-tenancy.md §4.1 CSRF check). */
   readonly trustedOrigin: string;
+  /** Durable-Redis limiter for our own routes (signup, login, invite-accept) — see rateLimit.ts. */
+  readonly rateLimit: RateLimitDeps;
+  /**
+   * Fastify `trustProxy`: which proxies (e.g. the ALB's VPC CIDR) to trust for `request.ip`. Left
+   * unset, every client behind the ALB shares the ALB's IP, so the per-IP limits fail closed for all
+   * of them; `true` would trust a spoofable X-Forwarded-For from anyone.
+   */
+  readonly trustProxy?: boolean | string | string[];
 }
 
 // Core API (SPEC §10, §4): auth, tenants, integrations, reports, DPDP endpoints, webhooks. Built as
 // a plain function (not started here) so tests can exercise it via `.inject()` without binding a
 // port.
 export function buildApp(deps: AppDeps): FastifyInstance {
-  const app = Fastify({ logger: false });
+  const app = Fastify({ logger: false, trustProxy: deps.trustProxy ?? false });
 
   registerRouteRegistry(app);
 
@@ -63,11 +79,22 @@ export function buildApp(deps: AppDeps): FastifyInstance {
     handler: (request, reply) => bridgeToBetterAuth(deps.auth, request, reply),
   });
 
-  registerAuthWrapperRoutes(app, deps);
-  registerMeRoutes(app, deps);
-  registerOrgRoutes(app, deps);
-  registerInviteRoutes(app, deps);
-  registerMemberRoutes(app, deps);
+  // Routes register inside a plugin that loads *after* the rate-limit plugin, because the plugin
+  // only sees routes added once it is loaded (Fastify plugins load asynchronously, in order).
+  void registerRateLimit(app, deps.rateLimit);
+  void app.register(async (scope) => {
+    const limits: RouteLimits = {
+      signupIp: ipLimit(deps.rateLimit, 'signup', LIMITS.signup.ip),
+      loginIp: ipLimit(deps.rateLimit, 'login', LIMITS.login.ip),
+      inviteAcceptIp: ipLimit(deps.rateLimit, 'invite-accept', LIMITS.inviteAccept.ip),
+      loginEmail: createEmailLimiter(scope, deps.rateLimit, 'login', LIMITS.login.email),
+    };
+    registerAuthWrapperRoutes(scope, deps, limits);
+    registerMeRoutes(scope, deps);
+    registerOrgRoutes(scope, deps);
+    registerInviteRoutes(scope, deps, limits);
+    registerMemberRoutes(scope, deps);
+  });
 
   app.decorate('appDeps', deps);
 

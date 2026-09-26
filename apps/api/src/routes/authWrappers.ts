@@ -2,6 +2,7 @@ import { fromNodeHeaders } from 'better-auth/node';
 import type { FastifyInstance } from 'fastify';
 import { createAuditLogRepository } from '@truepath/db';
 import { forwardResponse, sendAuthApiError } from '../errors.js';
+import type { RouteLimits } from '../rateLimit.js';
 import { requireSession, type TenantScopeDeps } from '../tenantScope.js';
 
 /**
@@ -14,9 +15,14 @@ import { requireSession, type TenantScopeDeps } from '../tenantScope.js';
  * needs packages/privacy's HMAC helper, which lands in M0-5, and "no identifier" is the safe
  * interim over storing one in the wrong (unhashed) shape.
  */
-export function registerAuthWrapperRoutes(app: FastifyInstance, deps: TenantScopeDeps): void {
+export function registerAuthWrapperRoutes(
+  app: FastifyInstance,
+  deps: TenantScopeDeps,
+  limits: RouteLimits,
+): void {
   app.post<{ Body: { email: string; password: string; name: string } }>(
     '/v1/auth/signup',
+    { config: limits.signupIp },
     async (request, reply) => {
       try {
         const response = await deps.auth.api.signUpEmail({
@@ -32,7 +38,10 @@ export function registerAuthWrapperRoutes(app: FastifyInstance, deps: TenantScop
 
   app.post<{ Body: { email: string; password: string } }>(
     '/v1/auth/login',
+    { config: limits.loginIp },
     async (request, reply) => {
+      // Per-account limit as well as per-IP, so a guessing run spread across IPs is still capped.
+      if (!(await limits.loginEmail(request, reply))) return;
       const auditLog = createAuditLogRepository(deps.db);
       try {
         const response = await deps.auth.api.signInEmail({ body: request.body, asResponse: true });

@@ -96,7 +96,12 @@ export type Scope = TenantScope | SystemScope;
  */
 export function can(scope: TenantScope, permission: Permission): boolean {
   if (scope.role === 'job') return true;
-  return PERMISSION_MATRIX[scope.role].has(permission);
+  return roleCan(scope.role, permission);
+}
+
+/** Whether a role — not a whole scope — holds a permission (e.g. an inviter's role at invite-accept time). */
+export function roleCan(role: Role, permission: Permission): boolean {
+  return PERMISSION_MATRIX[role].has(permission);
 }
 
 // Thrown by the scoped repository layer (packages/db) and the ClickHouse query builder

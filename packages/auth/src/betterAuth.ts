@@ -37,8 +37,12 @@ export interface CreateAuthOptions {
    * (`EXPIRE`/`SETEX`), which still bounds its lifetime to the rate-limit window.
    */
   readonly redisDurableUrl: string;
-  /** false in local dev/test (plain HTTP); true in every deployed environment. */
-  readonly useSecureCookies: boolean;
+  /**
+   * Session cookies are `Secure` unless this is set — so a deployment that forgets to wire
+   * anything fails closed (cookies over HTTPS only) rather than open. Local dev over plain HTTP
+   * is the only reason to set it, and `createAuth` refuses to when NODE_ENV is "production".
+   */
+  readonly allowInsecureCookies?: boolean;
   /** Set only once a real registrable domain exists, to enable crossSubDomainCookies (app.<d>/api.<d>). */
   readonly cookieDomain?: string;
   /** SES wiring lands in a later ticket; defaults to a logging no-op (email.ts). */
@@ -48,6 +52,11 @@ export interface CreateAuthOptions {
 /** Builds the Better Auth instance (ADR-0012, auth-tenancy.md §2.2). */
 export function createAuth(options: CreateAuthOptions) {
   const { db, env } = options;
+  if (options.allowInsecureCookies && process.env.NODE_ENV === 'production') {
+    throw new Error(
+      'createAuth: allowInsecureCookies is local-dev only and cannot be set in production',
+    );
+  }
   const emailSender = options.emailSender ?? noopEmailSender;
   const redis = new Redis(options.redisDurableUrl);
 
@@ -60,7 +69,7 @@ export function createAuth(options: CreateAuthOptions) {
       database: { generateId: 'uuid' },
       // Behind one ALB hop (HLD §7); used only for Better Auth's own rate limiting.
       ipAddress: { ipAddressHeaders: ['x-forwarded-for'] },
-      useSecureCookies: options.useSecureCookies,
+      useSecureCookies: !options.allowInsecureCookies,
       // Better Auth otherwise disables its own origin/CSRF check whenever it detects a test
       // environment (`isTest()`: NODE_ENV==='test' — @better-auth/core's env-impl.ts, cached at
       // module load, so it can't be toggled per-instance at runtime). trustedOrigins is a real

@@ -1,3 +1,4 @@
+import { Redis } from 'ioredis';
 import { createAuth, type Auth } from '@truepath/auth';
 import { createDb, type Db } from '@truepath/db';
 import { loadDotEnvIfPresent, loadEnv, postgresEnvSchema } from '@truepath/shared';
@@ -21,7 +22,13 @@ export const testAuth: Auth = createAuth({
     GOOGLE_CLIENT_SECRET: 'test-google-client-secret',
   },
   redisDurableUrl: 'redis://localhost:6379',
-  useSecureCookies: false,
+  allowInsecureCookies: true, // plain-HTTP inject() in tests
+});
+
+// Durable Redis, with low retry/timeout so an outage errors fast instead of hanging a request.
+export const testRedis = new Redis('redis://localhost:6379', {
+  maxRetriesPerRequest: 1,
+  connectTimeout: 500,
 });
 
 export function buildTestApp(overrides: Partial<AppDeps> = {}) {
@@ -29,6 +36,7 @@ export function buildTestApp(overrides: Partial<AppDeps> = {}) {
     db: testDb,
     auth: testAuth,
     trustedOrigin: 'http://localhost:5173',
+    rateLimit: { redis: testRedis, keySecret: 'test-rate-limit-key-secret' },
     ...overrides,
   });
 }
