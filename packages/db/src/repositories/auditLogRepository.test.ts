@@ -276,6 +276,50 @@ describe('AuditLogRepository.list: filters, ordering and cursor pagination', () 
     });
   });
 
+  it("takes the organization from the scope only: another organization's cursor reads the caller's own log", async () => {
+    const tenantA = await seedTestTenant('audit-cursor-a');
+    const tenantB = await seedTestTenant('audit-cursor-b');
+    try {
+      await seedRows(tenantA);
+      const repo = createAuditLogRepository(db);
+      const fromA = await repo.list(ownerScope(tenantA), tenantA.organizationId, { limit: 2 });
+      expect(fromA.nextCursor).not.toBeNull();
+
+      // A's first page ends at 03.123456: B's rows newer than that must not appear.
+      const bRows = [
+        ['2026-01-01T00:00:04.000000Z', 'newer'],
+        ['2026-01-01T00:00:03.450000Z', 'newer-too'],
+        ['2026-01-01T00:00:03.000000Z', 'b1'],
+        ['2026-01-01T00:00:02.500000Z', 'b2'],
+      ] as const;
+      for (const [stamp, targetId] of bRows) {
+        await db.insert(auditLog).values({
+          organizationId: tenantB.organizationId,
+          actorType: 'user',
+          action: 'audit_log_viewed',
+          targetType: 'organization',
+          targetId,
+          metadata: {},
+          createdAt: sql`${stamp}::timestamptz`,
+        });
+      }
+
+      const replay = await repo.list(ownerScope(tenantB), tenantB.organizationId, {
+        cursor: fromA.nextCursor!,
+      });
+      expect(replay.items.every((r) => r.organizationId === tenantB.organizationId)).toBe(true);
+      expect(replay.items.map((r) => r.targetId)).toEqual(['b1', 'b2']);
+
+      // And the scope still decides: B's scope can't read A even holding A's cursor.
+      await expect(
+        repo.list(ownerScope(tenantB), tenantA.organizationId, { cursor: fromA.nextCursor! }),
+      ).rejects.toThrow(TenantScopeViolationError);
+    } finally {
+      await cleanupTestTenant(tenantA);
+      await cleanupTestTenant(tenantB);
+    }
+  });
+
   it('gives an opaque cursor that reveals no position or id in the clear', async () => {
     await withTenant('audit-cursor', async (tenant) => {
       await seedRows(tenant);

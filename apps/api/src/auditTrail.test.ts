@@ -672,6 +672,121 @@ describe('GET /v1/orgs/:id/audit-log', () => {
     ).toEqual([]);
   });
 
+  // The organization a query reads comes from the authenticated scope alone. A cursor holds only a
+  // position (a timestamp and a row id), so replaying one organization's cursor against another's
+  // endpoint can at most move the window within the *caller's own* log.
+  describe('a cursor never changes which organization is read', () => {
+    async function seedOther(organizationId: string, stamps: string[]) {
+      const ids: string[] = [];
+      for (const [i, stamp] of stamps.entries()) {
+        const [row] = await testDb
+          .insert(schema.auditLog)
+          .values({
+            organizationId,
+            actorType: 'user',
+            action: 'member_role_changed',
+            targetType: 'user',
+            targetId: `other-${i}`,
+            metadata: { from: 'viewer', to: 'analyst' },
+            createdAt: sql`${stamp}::timestamptz`,
+          })
+          .returning({ id: schema.auditLog.id });
+        ids.push(row!.id);
+      }
+      return ids;
+    }
+
+    async function setup() {
+      const a = await tenant('cursor-a');
+      const b = await tenant('cursor-b');
+      await seedRows(a.organizationId);
+      // B's rows straddle the position of A's cursor (A's first page ends at 03.500000).
+      const bIds = await seedOther(b.organizationId, [
+        '2026-01-01T00:00:04.000000Z', // newer than the cursor: must not appear
+        '2026-01-01T00:00:03.450000Z',
+        '2026-01-01T00:00:02.500000Z',
+        '2026-01-01T00:00:01.500000Z',
+      ]);
+      const first = await get(a, '?limit=2');
+      const cursor: string = first.json().next_cursor;
+      expect(cursor).toEqual(expect.any(String));
+      const aIds: string[] = (
+        await testDb
+          .select({ id: schema.auditLog.id })
+          .from(schema.auditLog)
+          .where(eq(schema.auditLog.organizationId, a.organizationId))
+      ).map((r) => r.id);
+      return { a, b, bIds, aIds, cursor };
+    }
+
+    const idsOf = (res: { json: () => { items: Array<{ id: string }> } }) =>
+      res.json().items.map((i) => i.id);
+
+    it("returns only the caller's rows when B replays A's cursor", async () => {
+      const { b, bIds, aIds, cursor } = await setup();
+      const res = await get(b, `?cursor=${encodeURIComponent(cursor)}`);
+      expect(res.statusCode).toBe(200);
+      const ids = idsOf(res);
+      expect(ids.filter((id) => aIds.includes(id))).toEqual([]);
+      // Exactly B's rows older than the cursor position, newest first (bIds[0] is newer and excluded).
+      expect(ids.filter((id) => bIds.includes(id))).toEqual([bIds[1], bIds[2], bIds[3]]);
+    });
+
+    it('ignores an organization id smuggled into the cursor', async () => {
+      const { a, b, bIds, aIds, cursor } = await setup();
+      const decoded = JSON.parse(Buffer.from(cursor, 'base64url').toString('utf8'));
+      const forged = Buffer.from(
+        JSON.stringify({
+          ...decoded,
+          o: a.organizationId,
+          org: a.organizationId,
+          organizationId: a.organizationId,
+        }),
+      ).toString('base64url');
+      const res = await get(b, `?cursor=${encodeURIComponent(forged)}`);
+      // Either refused, or answered from B's own log only.
+      expect([200, 400]).toContain(res.statusCode);
+      if (res.statusCode === 200) {
+        const ids = idsOf(res);
+        expect(ids.filter((id) => aIds.includes(id))).toEqual([]);
+        expect(ids.filter((id) => bIds.includes(id))).toEqual([bIds[1], bIds[2], bIds[3]]);
+      }
+    });
+
+    it('does not let a cursor smuggle in SQL: only a well-formed position is accepted', async () => {
+      const { b } = await setup();
+      for (const payload of [
+        { v: 1, t: "2026-01-01T00:00:03.500000Z'; select 1; --", i: randomUUID() },
+        { v: 1, t: '2026-01-01T00:00:03.500000Z', i: "' or true --" },
+        { v: 1, t: '2026-01-01T00:00:03.500000Z', i: randomUUID(), extra: 'x' },
+      ]) {
+        const cursor = Buffer.from(JSON.stringify(payload)).toString('base64url');
+        const res = await get(b, `?cursor=${encodeURIComponent(cursor)}`);
+        expect([200, 400]).toContain(res.statusCode);
+        if (res.statusCode === 200) {
+          expect(
+            res
+              .json()
+              .items.every(
+                (i: { target_id: string }) =>
+                  i.target_id.startsWith('other-') || i.target_id === b.organizationId,
+              ),
+          ).toBe(true);
+        }
+      }
+    });
+
+    it("still answers 404 when a member of B replays A's cursor against A's endpoint", async () => {
+      const { a, b, cursor } = await setup();
+      const res = await app.inject({
+        method: 'GET',
+        url: `/v1/orgs/${a.organizationId}/audit-log?cursor=${encodeURIComponent(cursor)}`,
+        headers: asHeaders(b),
+      });
+      expect(res.statusCode).toBe(404);
+    });
+  });
+
   it('is still discovered by the generated cross-tenant harness', async () => {
     const harnessApp = buildTestApp();
     await harnessApp.ready();

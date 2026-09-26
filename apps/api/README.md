@@ -23,7 +23,7 @@ from `@truepath/privacy`; nothing here implements its own hashing.
 `unknown_account: true` — never the email, and no hash of it.
 
 Tests run files one at a time (`vitest.config.ts`): they share one Postgres and one durable Redis
-and assert on global state.
+and assert on global state. `turbo.json` also runs a package's tests after its dependencies' (`test` depends on `^test`), so the db, auth and api suites take turns on the one Postgres instead of racing.
 
 ## Calling Better Auth: `authCall`
 

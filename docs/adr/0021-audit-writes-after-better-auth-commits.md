@@ -50,11 +50,30 @@ views must not be returned unaudited, so `audit_log_viewed` is written before th
 failure fails the request. Writes we perform ourselves (settings changes, DSRs, exports) will use
 `createAuditLogRepository(tx)` in the same transaction as the change.
 
+## The trade-off, plainly
+**A Better Auth action can succeed without an audit row.** The action and its audit row are two
+separate commits, and we accept that the second can fail after the first has happened. The client is
+told the truth (the action worked); the audit trail is what may be missing.
+
+- If the audit write fails twice, the row is **not** in `audit_log`. The only record is the
+  `audit_write_failed` log line, which carries the complete intended entry. **Recovery is manual, from that
+  log line**: insert the row by hand from the `entry` field.
+- If the process dies between Better Auth's commit and the audit write, there is **no log line either**.
+  The only evidence is Better Auth's own tables (the new invitation, the changed membership role, the
+  removed membership, the new session), and the row can only be reconstructed from those.
+- The first case is only noticed if the `audit_write_failed` alert exists and fires (deploy prerequisite, #15).
+  The second is not detected at all.
+
+We accept this for the MVP because the alternatives are worse for users: failing the request would report
+an error for a change that happened, and Better Auth offers no way to make the two atomic. The durable fix
+is a transactional outbox, tracked in #13. Until then this is a known gap against S-4 and should be raised
+with counsel alongside the audit design.
+
 ## Consequences
 - A crash between Better Auth's commit and the audit insert, or an audit outage longer than the retry,
-  loses that row from `audit_log`; the reported entry (or the logs) is the recovery path. This is
-  accepted as a known gap of a few rows at worst, made visible by the alert rather than silent.
-- A transactional outbox would close it (write the intended entry to durable storage before calling
-  Better Auth, and reconcile). Tracked in #13; not built for the MVP.
+  loses that row from `audit_log`. Recovery is from the `audit_write_failed` log line where one exists
+  (#15 alerts on it), and from Better Auth's own tables where none does. Accepted for the MVP: see
+  "The trade-off, plainly".
+- The outbox that would close the gap is #13 (not built for the MVP).
 - `AUDIT_ACTION_OWNERS` and its coverage test keep this table honest as actions move from pending to
   implemented.
