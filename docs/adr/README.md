@@ -24,6 +24,7 @@ Michael Nygard format (Title, Status, Context, Decision, Consequences). **Accept
 | [0018](0018-vitest-for-testing.md) | Vitest as the unit test runner | Accepted | SPEC §15 (open decision, M0-1) |
 | [0019](0019-better-auth-rate-limit-storage-durable-redis.md) | Better Auth rate-limit storage: durable Redis, not cache Redis | Accepted, supersedes ADR-0012's placement | M0-4 review |
 | [0020](0020-identity-master-keys-via-env.md) | Identity master keys injected as env vars from Secrets Manager | Accepted, refines ADR-0007 | M0-5 review |
+| [0021](0021-audit-writes-after-better-auth-commits.md) | Audit writes for Better Auth actions: after the commit, retried once, reported on failure | Accepted | M0-6 review |
 
 **Decisions made during the review that are recorded in HLD §8 / SPEC v0.5 rather than as separate ADRs** (candidates to promote if they are ever revisited):
 - query-time delivered revenue via `order_status`;

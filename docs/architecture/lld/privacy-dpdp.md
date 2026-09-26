@@ -111,17 +111,20 @@ export type AuditAction =
   | 'report_exported' | 'order_journey_viewed' | 'audit_log_viewed'
   | 'retention_run' | 'system_scope_used' | 'suppression_rebuilt'
   | 'breach_created' | 'breach_confirmed' | 'breach_notified' | 'breach_closed';
+// M0-6. The catalogue, the per-action metadata schemas (zod, strict, flat scalars only) and the entry
+// types live in packages/shared/src/audit.ts; the interface and metadata check are in packages/privacy;
+// the Postgres implementation (createAuditLogRepository) is in packages/db, the only code that writes audit_log.
 export interface AuditLogger {
-  write(scope: TenantScope | SystemScope, e: {
-    organizationId: string | null;        // null only for platform-wide system events
-    actorUserId: string | null;
-    actorType: 'user' | 'system' | 'shopify_webhook';
-    action: AuditAction;
-    targetType: string;                   // 'store' | 'dsr_request' | 'order' | 'integration' | ...
-    targetId: string;
-    metadata: Record<string, string | number | boolean>;  // ids and counts only, never identifiers or hashes
-  }): Promise<void>;
+  // Organization entries. `scope` must cover entry.organizationId; `action` is any non-platform action,
+  // and `metadata` has the shape AUDIT_METADATA_SCHEMAS[action] requires (required only where non-empty).
+  write(scope: Scope, entry: OrganizationAuditEntry): Promise<void>;
+  // Platform-wide entries (organization_id null): only PLATFORM_AUDIT_ACTIONS — login_succeeded, login_failed,
+  // retention_run, suppression_rebuilt, breach_* — enforced by the type and at runtime. No scope needed.
+  writePlatform(entry: PlatformAuditEntry): Promise<void>;
 }
+// Every entry is validated before insert: the action's schema is the real check (an unexpected key, an
+// email or a hash fails); findPii over string values and a sensitive-key-name scan are a backstop for the
+// free-form maps (retention_run, system_scope_used). Errors name paths and codes, never values.
 ```
 
 `TenantScope` and `SystemScope` come from the scoped data-access layer ([ADR-0016](../../adr/0016-tenant-isolation-strategy.md), [auth-tenancy.md](auth-tenancy.md)).
@@ -145,7 +148,7 @@ export interface AuditLogger {
 | `GET /v1/stores/:id/privacy-settings` | owner, admin, analyst | — | `PrivacySettings` | — |
 | `PUT /v1/stores/:id/privacy-settings` | owner, admin | `PrivacySettings` | `200 PrivacySettings` | `privacy_settings_changed` (changed field names only) |
 | `POST /v1/orgs/:id/dpa/accept` | owner | `{ dpa_version }` | `201` | `dpa_accepted` |
-| `GET /v1/orgs/:id/audit-log` | owner, admin | `?from&to&action&cursor` | `{ items, next_cursor }` | `audit_log_viewed` |
+| `GET /v1/orgs/:id/audit-log` | owner, admin | `?from&to&action&cursor&limit` (ISO datetimes; `action` must be in the catalogue; `limit` 1–200, default 50; `cursor` is opaque; unknown parameters and `from` > `to` are `400 invalid_query`) | `{ items: [{id, action, actor_type, actor_user_id, target_type, target_id, metadata, created_at}], next_cursor }`, newest first | `audit_log_viewed`, on the first page only (no `cursor`), written before the response is sent |
 
 Error codes: `400 invalid_identifier` (neither phone nor email normalises), `403 forbidden_role`, `404 not_found` (includes cross-tenant ids — §5.10 test 7), `409 dpa_version_mismatch`, `422 retention_out_of_range`.
 
@@ -504,7 +507,7 @@ with `[redacted]`. Object keys are blanked by name (`IDENTITY_MASTER_*`, passwor
 | Retention run | all stores complete within 01:00–05:00 IST; one delete statement per table per store per night |
 | Suppression rebuild | < 2 min for 100k entries (pipelined `ZADD`, pages of 10,000) |
 | Suppression lookup | one pipelined Redis round-trip, < 2 ms p99 in-VPC |
-| Audit writes | synchronous in the request/job transaction; < 5 ms |
+| Audit writes | our own writes: synchronous in the request/job transaction (`createAuditLogRepository` takes a transaction); < 5 ms. Better Auth actions can't share its transaction, so they are written right after it commits, retried once, and reported on failure — [ADR-0021](../../adr/0021-audit-writes-after-better-auth-commits.md) |
 
 Scale note: per-store retention deletes are fine for MVP (tens of stores). Beyond ~500 stores, group stores that share a retention value into one statement (Open question 7).
 

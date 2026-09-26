@@ -59,3 +59,13 @@ pnpm --filter @truepath/db db:migrate    # applies migrations/*.sql to DATABASE_
 Two migrations: `0000_clean_sleeper.sql` (M0-3, applied — never edit it) and a second one from the
 M0-3 fix-up (enum→text+CHECK, new unique constraints, composite indexes, `audit_log`'s FK). CI
 (`db-migrations` job) applies both against real Postgres/ClickHouse containers on every PR.
+
+## Audit log repository
+
+`createAuditLogRepository(db | tx)` is the only code that reads or writes `audit_log`. It offers
+`write(scope, entry)`, `writePlatform(entry)` and `list(scope, organizationId, {from, to, action,
+cursor, limit})` — no update, no delete. Every insert (including `createSystemScope`'s) is validated
+against the action's metadata schema first. `list` is newest first with an opaque keyset cursor on
+`(created_at, id)` at full microsecond precision, so rows that share a millisecond are neither skipped
+nor repeated; the page size is clamped to 200. Pass a transaction as the executor to commit an audit
+row with the change it records. Database-level immutability (a trigger and/or role split) is #12.

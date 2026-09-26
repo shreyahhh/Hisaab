@@ -1,6 +1,5 @@
 import { fromNodeHeaders } from 'better-auth/node';
 import type { FastifyInstance } from 'fastify';
-import { createAuditLogRepository } from '@truepath/db';
 import { getInvitation, resolveMembership } from '@truepath/auth';
 import { isAtOrBelowOwnRank, RoleSchema, roleCan } from '@truepath/shared';
 import { authCall } from '../authCall.js';
@@ -44,7 +43,7 @@ export function registerInviteRoutes(
         }),
       );
 
-      await createAuditLogRepository(deps.db).record(scope, {
+      await deps.audit.afterCommit(scope, {
         organizationId: scope.organizationId,
         actorUserId: scope.userId,
         actorType: 'user',
@@ -99,7 +98,7 @@ export function registerInviteRoutes(
       );
 
       if (result?.invitation) {
-        await createAuditLogRepository(deps.db).record(
+        await deps.audit.afterCommit(
           {
             kind: 'tenant',
             userId: session.user.id,

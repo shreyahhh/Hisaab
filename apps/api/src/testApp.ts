@@ -1,8 +1,9 @@
 import { Redis } from 'ioredis';
 import { createAuth, type Auth } from '@truepath/auth';
-import { createDb, type Db } from '@truepath/db';
+import { createAuditLogRepository, createDb, type Db } from '@truepath/db';
 import { createTestIdentityHasher } from '@truepath/privacy/testing';
 import { loadDotEnvIfPresent, loadEnv, postgresEnvSchema } from '@truepath/shared';
+import { createAuditService } from './audit.js';
 import { buildApp, type AppDeps } from './app.js';
 
 // Shared real-Postgres/real-Redis test wiring for this app's own tests (CLAUDE.md: tenancy-touching
@@ -31,6 +32,8 @@ export const testRedis = new Redis('redis://localhost:6379', {
   maxRetriesPerRequest: 1,
   connectTimeout: 500,
 });
+
+export const testAudit = createAuditService(createAuditLogRepository(testDb));
 
 // Random keys, per test process, never written anywhere.
 export const testHasher = createTestIdentityHasher();

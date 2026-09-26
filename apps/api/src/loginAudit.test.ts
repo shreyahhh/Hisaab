@@ -30,7 +30,7 @@ beforeAll(async () => {
 });
 
 afterAll(async () => {
-  await resetInvalidEmailBucket();
+  await resetEmailBuckets();
   await app.close();
   if (seenRowIds.length > 0) {
     await testDb.delete(schema.auditLog).where(inArray(schema.auditLog.id, seenRowIds));
@@ -43,15 +43,16 @@ function randomIp(): string {
   return `10.${o()}.${o()}.${o()}`;
 }
 
-// Every unusable email shares one rate-limit bucket (5/min, 20/h) that outlives a test run, so clear
-// it before each attempt; files run one at a time (vitest.config.ts), so nothing else is counting.
-async function resetInvalidEmailBucket() {
-  const keys = await testRedis.keys('rl:*:email:invalid');
+// Per-email login limits (5/min, 20/h) outlive a test run, and every unusable email shares one bucket,
+// so clear all of them before each attempt; #11 tracks proper isolation. Files run one at a time, so
+// nothing else is counting.
+async function resetEmailBuckets() {
+  const keys = await testRedis.keys('rl:*:email:*');
   if (keys.length > 0) await testRedis.del(...keys);
 }
 
 async function login(payload: unknown) {
-  await resetInvalidEmailBucket();
+  await resetEmailBuckets();
   const before = new Date();
   const res = await app.inject({
     method: 'POST',
@@ -182,5 +183,54 @@ describe('no raw email and no hash in any audit_log row, and none in the logs', 
     const output = captured.join('\n');
     expect(findPii(output.replace(UUID, '<id>'))).toEqual([]);
     for (const email of attempted) expect(output.toLowerCase()).not.toContain(email.toLowerCase());
+  });
+});
+
+// Whether an email has an account must not be readable from the login response: a wrong password and
+// an unknown email answer with the same status, code, body and headers. (The audit rows differ, on
+// purpose — target_user_id vs unknown_account — but only platform staff can read those.)
+describe('POST /v1/auth/login: does not reveal whether an account exists', () => {
+  const comparable = (headers: Record<string, unknown>) =>
+    Object.fromEntries(Object.entries(headers).filter(([name]) => name !== 'date'));
+
+  it('answers an unknown email and a wrong password identically', async () => {
+    const wrongPassword = await login({ email: user.email, password: WRONG_PASSWORD });
+    const unknownEmail = await login({
+      email: `nobody-${randomUUID()}@example.invalid`,
+      password: WRONG_PASSWORD,
+    });
+
+    for (const { res } of [wrongPassword, unknownEmail]) {
+      expect(res.statusCode).toBe(401);
+      expect(res.json()).toEqual({ error: 'INVALID_EMAIL_OR_PASSWORD' });
+    }
+    expect(unknownEmail.res.statusCode).toBe(wrongPassword.res.statusCode);
+    expect(unknownEmail.res.body).toBe(wrongPassword.res.body);
+    expect(comparable(unknownEmail.res.headers)).toEqual(comparable(wrongPassword.res.headers));
+    expect(unknownEmail.res.headers['set-cookie']).toBeUndefined();
+  });
+
+  // Better Auth also rejects some inputs on their own — an over-long password, or an address with
+  // spaces around it, is a 400 whatever the account. So the comparison is like for like: the same
+  // password and the same spelling, once with an email that has an account and once with one that
+  // doesn't, must get exactly the same response.
+  it('holds for every spelling of the email and every kind of password', async () => {
+    const spellings: Array<[string, (email: string) => string]> = [
+      ['as is', (e) => e],
+      ['upper case', (e) => e.toUpperCase()],
+      ['padded with spaces', (e) => `  ${e} `],
+    ];
+    for (const password of [WRONG_PASSWORD, 'x', 'p'.repeat(200)]) {
+      for (const [name, spell] of spellings) {
+        const unknown = await login({
+          email: spell(`nobody-${randomUUID()}@example.invalid`),
+          password,
+        });
+        const known = await login({ email: spell(user.email), password });
+        const label = `${name} / ${password.length}-char password`;
+        expect(known.res.statusCode, label).toBe(unknown.res.statusCode);
+        expect(known.res.body, label).toBe(unknown.res.body);
+      }
+    }
   });
 });

@@ -3,6 +3,7 @@ import type { FastifyReply, FastifyRequest } from 'fastify';
 import { createStoreRepository, resolveStoreOrganization, type Db } from '@truepath/db';
 import { resolveMembership, type Auth } from '@truepath/auth';
 import { can, type Permission, type TenantScope } from '@truepath/shared';
+import type { AuditService } from './audit.js';
 import { authCall } from './authCall.js';
 
 declare module 'fastify' {
@@ -15,6 +16,7 @@ declare module 'fastify' {
 export interface TenantScopeDeps {
   readonly auth: Auth;
   readonly db: Db;
+  readonly audit: AuditService;
 }
 
 export type Session = NonNullable<Awaited<ReturnType<Auth['api']['getSession']>>>;

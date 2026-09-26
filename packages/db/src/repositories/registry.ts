@@ -48,19 +48,19 @@ export const repositoryRegistry: readonly RepositoryDescriptor[] = [
     name: 'AuditLogRepository',
     methods: [
       {
-        name: 'listByOrganization',
+        name: 'list',
         scopeKind: 'organization',
         invoke: (db, scope, organizationId) =>
-          createAuditLogRepository(db).listByOrganization(scope, organizationId),
+          createAuditLogRepository(db).list(scope, organizationId),
       },
       {
-        name: 'record',
+        name: 'write',
         scopeKind: 'organization',
         invoke: (db, scope, organizationId) =>
-          createAuditLogRepository(db).record(scope, {
+          createAuditLogRepository(db).write(scope, {
             organizationId,
             actorType: 'system',
-            action: 'system_scope_used',
+            action: 'audit_log_viewed',
             targetType: 'cross_tenant_test',
             targetId: 'cross_tenant_test',
           }),

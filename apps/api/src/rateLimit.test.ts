@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { and, eq, gte } from 'drizzle-orm';
+import { and, eq, gte, sql } from 'drizzle-orm';
 import { schema } from '@truepath/db';
 import { purposeContext } from '@truepath/privacy';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
@@ -22,11 +22,14 @@ beforeAll(async () => {
 afterAll(async () => {
   await app.close();
   // The login route audits every attempt (login_failed, org-less); drop what this run wrote.
-  await testDb
-    .delete(schema.auditLog)
-    .where(
-      and(eq(schema.auditLog.action, 'login_failed'), gte(schema.auditLog.createdAt, startedAt)),
-    );
+  await testDb.delete(schema.auditLog).where(
+    and(
+      eq(schema.auditLog.action, 'login_failed'),
+      gte(schema.auditLog.createdAt, startedAt),
+      // Only this file's own attempts (unknown emails), not rows other suites are writing.
+      sql`${schema.auditLog.metadata} @> '{"unknown_account": true}'::jsonb`,
+    ),
+  );
 });
 
 function randomIp(): string {
