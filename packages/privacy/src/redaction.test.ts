@@ -137,14 +137,46 @@ describe('redactLogValue: structures', () => {
     expect(out.cause.code).toBe('P0001');
   });
 
-  it('a long cause chain still stops at MAX_DEPTH and never loops on a self-referential cause', () => {
+  it('a long cause chain is capped on its own budget, independent of MAX_DEPTH', () => {
+    // 10 links is well past MAX_CAUSE_DEPTH (4) but nowhere near MAX_DEPTH (8) if the two budgets
+    // were counted separately — proves the cause-chain cap is what's actually stopping this, not
+    // the general nesting depth incidentally doing the same job.
     let deep = new Error('leaf');
     for (let i = 0; i < 10; i += 1) deep = new Error(`link ${i}`, { cause: deep });
-    expect(JSON.stringify(redactLogValue(deep))).toContain('[truncated]');
+    const json = JSON.stringify(redactLogValue(deep));
+    expect(json).toContain('cause chain too deep');
+    expect(json).not.toContain('"leaf"');
+  });
 
+  it('a self-referential cause is reported as circular, not walked forever', () => {
     const cyclic: Error & { cause?: unknown } = new Error('cyclic');
     cyclic.cause = cyclic;
     expect(redactLogValue(cyclic)).toMatchObject({ name: 'Error', cause: '[circular]' });
+  });
+
+  it('redacts every link the cap allows, and replaces exactly what is past it with the marker', () => {
+    // MAX_CAUSE_DEPTH is 4: hops 0-3 succeed (5 Error objects: E0..E4, each still redacted), and the
+    // 5th hop (E4 -> E5) is where it gives up — E5 (and anything further) never appears at all, not
+    // even redacted, not even its name.
+    let chain = new Error('E5 leaf, should never appear: a@example.com');
+    for (let i = 4; i >= 0; i -= 1) chain = new Error(`E${i} with a@example.com`, { cause: chain });
+
+    let node: unknown = redactLogValue(chain);
+    for (let i = 0; i < 5; i += 1) {
+      expect(node).toMatchObject({ message: `E${i} with ${REDACTED}` });
+      node = (node as { cause: unknown }).cause;
+    }
+    expect(node).toBe('[cause chain too deep]');
+    // E5 is never reached at all — not redacted, not even its name.
+    expect(JSON.stringify(redactLogValue(chain))).not.toContain('E5 leaf');
+  });
+
+  it("the general nesting depth (MAX_DEPTH) still applies to an Error's own message/stack context, unaffected by the cause-chain cap", () => {
+    // An ordinary deeply-nested object, unrelated to any Error, still truncates on MAX_DEPTH exactly
+    // as before — the new causeDepth parameter changes nothing about this existing behaviour.
+    let deep: unknown = 'leaf';
+    for (let i = 0; i < 20; i++) deep = { next: deep };
+    expect(JSON.stringify(redactLogValue(deep))).toContain('[truncated]');
   });
 
   it('never returns key bytes', () => {

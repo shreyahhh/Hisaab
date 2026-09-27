@@ -70,8 +70,13 @@ export function findPii(text: string): PiiFinding[] {
 }
 
 const MAX_DEPTH = 8;
+// A separate, smaller budget for how many `.cause` links are followed, independent of MAX_DEPTH (an
+// error nested a few levels deep inside an ordinary object should not eat into how much of its own
+// cause chain gets logged, and a chain built specifically to be long — accidentally or not — must
+// still bottom out quickly rather than ride on whatever depth budget happened to be left).
+const MAX_CAUSE_DEPTH = 4;
 
-function redactAny(value: unknown, depth: number, seen: WeakSet<object>): unknown {
+function redactAny(value: unknown, depth: number, seen: WeakSet<object>, causeDepth = 0): unknown {
   if (typeof value === 'string') return redactString(value);
   if (value === null || typeof value !== 'object') {
     return typeof value === 'function' || typeof value === 'symbol' ? undefined : value;
@@ -84,14 +89,20 @@ function redactAny(value: unknown, depth: number, seen: WeakSet<object>): unknow
     if (value instanceof Error) {
       // A driver wraps its own error before it reaches us — e.g. Drizzle's "Failed query: ..." text
       // for a Postgres failure carries the real detail (and, if any, the query's identifiers) only
-      // in `.cause`, not in `.message`. Following the chain (same depth/circular guards as anything
-      // else) is what makes redactLogValue's "full error, still redacted" promise true rather than
-      // just true of the outermost wrapper.
+      // in `.cause`, not in `.message`. Following the chain (same circular guard as anything else,
+      // plus its own depth cap below) is what makes redactLogValue's "full error, still redacted"
+      // promise true rather than just true of the outermost wrapper.
+      const hasCause = value.cause !== undefined;
+      const cause = hasCause
+        ? causeDepth >= MAX_CAUSE_DEPTH
+          ? '[cause chain too deep]'
+          : redactAny(value.cause, depth + 1, seen, causeDepth + 1)
+        : undefined;
       return {
         name: value.name,
         message: redactString(value.message),
         ...(value.stack ? { stack: redactString(value.stack) } : {}),
-        ...(value.cause !== undefined ? { cause: redactAny(value.cause, depth + 1, seen) } : {}),
+        ...(hasCause ? { cause } : {}),
       };
     }
     if (Array.isArray(value)) return value.map((item) => redactAny(item, depth + 1, seen));

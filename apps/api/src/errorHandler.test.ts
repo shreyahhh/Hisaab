@@ -303,4 +303,194 @@ describe('global error handler — request ids', () => {
       await app.close();
     }
   });
+
+  it("the handler's own request_id never comes from a client header, whatever request.id happens to be", async () => {
+    // registerAuthErrorHandler only ever reads request.id — it has no header-parsing logic of its
+    // own — so this proves that half of the property directly, independent of which genReqId
+    // strategy produced request.id. (That app.ts's own genReqId in particular can't be swayed by a
+    // header is the next test, against the real app.)
+    const probe = Fastify({ logger: false });
+    registerAuthErrorHandler(probe);
+    probe.get('/probe', async () => {
+      throw new Error('boom');
+    });
+    try {
+      const planted = 'attacker-chosen-00000000-0000-0000-0000-000000000000';
+      const a = await probe.inject({
+        method: 'GET',
+        url: '/probe',
+        headers: { 'x-request-id': planted },
+      });
+      const b = await probe.inject({
+        method: 'GET',
+        url: '/probe',
+        headers: { 'request-id': planted },
+      });
+      expect(a.json().request_id).not.toBe(planted);
+      expect(b.json().request_id).not.toBe(planted);
+      expect(a.json().request_id).not.toBe(b.json().request_id);
+    } finally {
+      await probe.close();
+    }
+  });
+
+  it("app.ts's Fastify instance never echoes a client-sent request id (genReqId ignores its argument)", async () => {
+    // The same property, exercised through the real app (app.ts's actual genReqId, not a copy of
+    // it) rather than a hand-rolled probe — this is what would actually catch a regression if
+    // app.ts's genReqId were ever changed to something that reads the incoming request.
+    const owner = await tenant('errh-reqid-header');
+    const { lines, report } = collectingReporter();
+    const app = buildTestApp({ errorReporter: report });
+    const id = randomUUID().replaceAll('-', '_');
+    const fn = `test_reqid_${id}`;
+    await testDb.execute(
+      sql.raw(`CREATE FUNCTION ${fn}() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN RAISE EXCEPTION 'boom'; END $$`),
+    );
+    await testDb.execute(
+      sql.raw(`CREATE TRIGGER ${fn} BEFORE INSERT ON audit_log FOR EACH ROW
+        WHEN (NEW.organization_id = '${owner.organizationId}')
+        EXECUTE FUNCTION ${fn}()`),
+    );
+    try {
+      const planted = 'attacker-chosen-00000000-0000-0000-0000-000000000000';
+      const res = await app.inject({
+        method: 'GET',
+        url: `/v1/orgs/${owner.organizationId}/audit-log`,
+        headers: { ...asHeaders(owner), 'x-request-id': planted },
+      });
+      expect(res.statusCode).toBe(500);
+      expect(res.json().request_id).not.toBe(planted);
+      // A UUID — app.ts's real genReqId, not Fastify's default counter — confirming this exercised
+      // the actual production wiring, not an accidental fallback.
+      expect(res.json().request_id).toMatch(
+        /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i,
+      );
+      expect(lines[0]?.request_id).toBe(res.json().request_id);
+    } finally {
+      await testDb.execute(sql.raw(`DROP TRIGGER IF EXISTS ${fn} ON audit_log`));
+      await testDb.execute(sql.raw(`DROP FUNCTION IF EXISTS ${fn}()`));
+      await app.close();
+    }
+  });
+});
+
+describe("global error handler — Fastify's own client errors keep their status and a generic code", () => {
+  // These are never database/application errors: Fastify itself rejects the request before any
+  // route handler runs, always with a FST_ERR_* code and a real 4xx statusCode (verified
+  // empirically). Before the review follow-up to #20, these were real `Error` instances and so fell
+  // into the same catch-all as a database failure, downgrading a client mistake (400/413/415) to a
+  // 500 — wrong status, and still an opportunity to leak Fastify's own message. Two are exercised
+  // through the real app (a route that reaches Fastify's body parser after our own CSRF/content-type
+  // hook lets the request through); the other two — unsupported content type and schema validation —
+  // are never reachable through this app's real routes (the CSRF hook rejects any non-JSON
+  // content-type itself, first, and no route uses Fastify's declarative `schema` option), so they're
+  // exercised on an isolated probe with only this handler registered, to prove the handler's own
+  // behaviour independent of what our routes happen to expose today.
+
+  it('a malformed JSON body is still 400, with a generic code, not the parser message', async () => {
+    const app = buildTestApp();
+    try {
+      const res = await app.inject({
+        method: 'POST',
+        url: '/v1/orgs',
+        headers: { origin: ORIGIN, 'content-type': 'application/json' },
+        payload: '{not valid json',
+      });
+      expect(res.statusCode).toBe(400);
+      expect(res.json()).toEqual({ error: 'bad_request' });
+      expect(res.body.toLowerCase()).not.toContain('json');
+      expect(res.body).not.toContain('FST_ERR');
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('a body over the size limit is still 413, with a generic code', async () => {
+    const app = buildTestApp();
+    try {
+      const res = await app.inject({
+        method: 'POST',
+        url: '/v1/orgs',
+        headers: { origin: ORIGIN, 'content-type': 'application/json' },
+        payload: JSON.stringify({ name: 'x'.repeat(2 * 1024 * 1024), slug: 'x' }),
+      });
+      expect(res.statusCode).toBe(413);
+      expect(res.json()).toEqual({ error: 'payload_too_large' });
+      expect(res.body).not.toContain('FST_ERR');
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("an unsupported content type is still 415, with a generic code, not Fastify's message", async () => {
+    const probe = Fastify({ logger: false });
+    registerAuthErrorHandler(probe);
+    probe.post('/probe', async () => ({ ok: true }));
+    try {
+      const res = await probe.inject({
+        method: 'POST',
+        url: '/probe',
+        headers: { 'content-type': 'application/xml' },
+        payload: '<x/>',
+      });
+      expect(res.statusCode).toBe(415);
+      expect(res.json()).toEqual({ error: 'unsupported_media_type' });
+      expect(res.body.toLowerCase()).not.toContain('unsupported media type');
+    } finally {
+      await probe.close();
+    }
+  });
+
+  it('a schema-validation failure is still 400, with a generic code, not the field-level message', async () => {
+    const probe = Fastify({ logger: false });
+    registerAuthErrorHandler(probe);
+    probe.post(
+      '/probe',
+      {
+        schema: {
+          body: {
+            type: 'object',
+            required: ['name'],
+            properties: { name: { type: 'string' } },
+          },
+        },
+      },
+      async () => ({ ok: true }),
+    );
+    try {
+      const res = await probe.inject({
+        method: 'POST',
+        url: '/probe',
+        headers: { 'content-type': 'application/json' },
+        payload: {},
+      });
+      expect(res.statusCode).toBe(400);
+      expect(res.json()).toEqual({ error: 'bad_request' });
+      expect(res.body).not.toContain('must have required property');
+    } finally {
+      await probe.close();
+    }
+  });
+
+  it('none of the four are logged as an unhandled error — they are ordinary client mistakes', async () => {
+    const { lines, report } = collectingReporter();
+    const probe = Fastify({ logger: false });
+    registerAuthErrorHandler(probe, { report });
+    probe.post('/probe', async () => ({ ok: true }));
+    await probe.inject({
+      method: 'POST',
+      url: '/probe',
+      headers: { 'content-type': 'application/json' },
+      payload: '{not valid json',
+    });
+    await probe.inject({
+      method: 'POST',
+      url: '/probe',
+      headers: { 'content-type': 'application/xml' },
+      payload: '<x/>',
+    });
+    expect(lines).toEqual([]);
+    await probe.close();
+  });
 });
