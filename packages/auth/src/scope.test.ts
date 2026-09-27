@@ -1,6 +1,10 @@
 import { cleanupTestTenant, db, seedTestTenant } from '@truepath/db/testing';
 import { describe, expect, it } from 'vitest';
-import { resolveMembership, resolveMembershipsForUser } from './scope.js';
+import {
+  resolveMembersForOrganization,
+  resolveMembership,
+  resolveMembershipsForUser,
+} from './scope.js';
 
 describe('resolveMembership (auth-tenancy.md §4.3 step 2a)', () => {
   it('resolves the id and role for a real membership', async () => {
@@ -23,6 +27,26 @@ describe('resolveMembership (auth-tenancy.md §4.3 step 2a)', () => {
       await cleanupTestTenant(tenantA);
       await cleanupTestTenant(tenantB);
     }
+  });
+});
+
+describe('resolveMembersForOrganization (GET /v1/orgs/:id/members)', () => {
+  it('lists every member with their role, email and name', async () => {
+    const tenant = await seedTestTenant('scope-members', 'owner');
+    try {
+      const members = await resolveMembersForOrganization(db, tenant.organizationId);
+      expect(members).toHaveLength(1);
+      expect(members[0]).toMatchObject({ userId: tenant.userId, role: 'owner' });
+      expect(members[0]?.email).toBeTruthy();
+      expect(members[0]?.name).toBeTruthy();
+    } finally {
+      await cleanupTestTenant(tenant);
+    }
+  });
+
+  it('returns an empty array for an organization with no members', async () => {
+    const members = await resolveMembersForOrganization(db, '00000000-0000-0000-0000-000000000000');
+    expect(members).toEqual([]);
   });
 });
 
