@@ -181,7 +181,7 @@ const implemented = (ticket: string, ...evidence: string[]): AuditActionOwner =>
 });
 
 export const AUDIT_ACTION_OWNERS = {
-  dpa_accepted: pending('deploy #7 (POST /v1/orgs/:id/dpa/accept)'),
+  dpa_accepted: implemented('M0 exit / #7', 'apps/api/src/dpaAccept.test.ts'),
   privacy_settings_changed: pending('M4-2'),
   attribution_settings_changed: pending('M3-3'),
   channel_rules_changed: pending('M3-3'),

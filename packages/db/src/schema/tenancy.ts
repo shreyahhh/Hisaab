@@ -6,6 +6,7 @@ import {
   pgTable,
   text,
   timestamp,
+  uniqueIndex,
   uuid,
 } from 'drizzle-orm/pg-core';
 import { STORE_PLATFORMS, STORE_STATUSES } from '@truepath/shared';
@@ -55,5 +56,11 @@ export const dpaAcceptances = pgTable(
   },
   (table) => ({
     orgIdx: index('dpa_acceptances_organization_id_idx').on(table.organizationId),
+    // One acceptance per organization per DPA version: re-accepting is a no-op, and two concurrent
+    // accepts cannot leave two rows (auth-tenancy.md §4.5).
+    orgVersionUniq: uniqueIndex('dpa_acceptances_org_version_uniq').on(
+      table.organizationId,
+      table.dpaVersion,
+    ),
   }),
 );

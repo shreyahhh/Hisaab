@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { DPA_VERSION_PATTERN } from './dpa.js';
 
 // Loads a local .env file into process.env, if present. No-op on Node versions without
 // process.loadEnvFile (falls back to whatever the environment already set) and never throws on a
@@ -62,6 +63,14 @@ export const authEnvSchema = z.object({
   GOOGLE_CLIENT_SECRET: z.string().min(1),
 });
 export type AuthEnv = z.infer<typeof authEnvSchema>;
+
+// The DPA version tenants must have accepted before tracking is enabled (privacy-dpdp.md §4.10). No
+// default on purpose: a silent default could ship a draft, unapproved DPA to production. The value
+// names a text in docs/dpdp/, set by whoever deploys once counsel has approved it.
+export const dpaEnvSchema = z.object({
+  DPA_VERSION: z.string().regex(DPA_VERSION_PATTERN, 'must be 1-32 chars of [A-Za-z0-9._-]'),
+});
+export type DpaEnv = z.infer<typeof dpaEnvSchema>;
 
 type WithCommon<Schema extends z.ZodTypeAny> = z.ZodIntersection<typeof commonEnvSchema, Schema>;
 

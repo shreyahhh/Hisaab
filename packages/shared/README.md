@@ -12,5 +12,13 @@ connects to. `loadEnv(schema)` validates `process.env` and exits with a readable
 `.env` via Node's built-in `process.loadEnvFile`, a no-op when the file/API isn't there (CI and
 containers set real env vars directly).
 
-Otherwise empty scaffold as of M0-1. Each module adds its own types here as it's built — see that
+`dpaEnvSchema` adds `DPA_VERSION`, required with no default (the DPA version tenants must accept before
+tracking; privacy-dpdp.md §4.10).
+
+## `dpa.ts`
+
+The DPA version format (`DPA_VERSION_PATTERN`), the strict request body for
+`POST /v1/orgs/:id/dpa/accept` (`DpaAcceptBodySchema`) and its response type.
+
+Otherwise an empty scaffold as of M0-1. Each module adds its own types here as it's built — see that
 module's LLD under `docs/architecture/lld/`.

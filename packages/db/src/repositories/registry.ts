@@ -1,6 +1,7 @@
 import type { Scope } from '@truepath/shared';
 import type { Db } from '../client.js';
 import { createAuditLogRepository } from './auditLogRepository.js';
+import { createDpaAcceptanceRepository } from './dpaAcceptanceRepository.js';
 import { createStoreRepository } from './storeRepository.js';
 
 export type ScopeKind = 'store' | 'organization';
@@ -41,6 +42,32 @@ export const repositoryRegistry: readonly RepositoryDescriptor[] = [
         name: 'getById',
         scopeKind: 'store',
         invoke: (db, scope, storeId) => createStoreRepository(db).getById(scope, storeId),
+      },
+    ],
+  },
+  {
+    name: 'DpaAcceptanceRepository',
+    methods: [
+      {
+        name: 'record',
+        scopeKind: 'organization',
+        invoke: (db, scope, organizationId) =>
+          createDpaAcceptanceRepository(db).record(scope, {
+            organizationId,
+            dpaVersion: 'cross-tenant-test',
+            acceptedByUserId: scope.kind === 'tenant' ? (scope.userId ?? '') : '',
+            ipTruncated: null,
+          }),
+      },
+      {
+        name: 'findForVersion',
+        scopeKind: 'organization',
+        invoke: (db, scope, organizationId) =>
+          createDpaAcceptanceRepository(db).findForVersion(
+            scope,
+            organizationId,
+            'cross-tenant-test',
+          ),
       },
     ],
   },
