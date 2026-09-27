@@ -14,6 +14,21 @@ function jobScope(organizationId: string, storeId: string): TenantScope {
 }
 
 describe('WebhookDeliveryRepository (shopify-integration.md §4.2/§4.3)', () => {
+  it('wasAlreadyDelivered is false before recording, true after', async () => {
+    const tenant = await seedTestTenant('webhook-delivery-repo-check');
+    try {
+      const repo = createWebhookDeliveryRepository(db);
+      const scope = jobScope(tenant.organizationId, tenant.storeId);
+      const key = { storeId: tenant.storeId, webhookId: 'wh-check' };
+
+      expect(await repo.wasAlreadyDelivered(scope, key)).toBe(false);
+      await repo.recordDelivery(scope, { ...key, topic: 'app/uninstalled' });
+      expect(await repo.wasAlreadyDelivered(scope, key)).toBe(true);
+    } finally {
+      await cleanupTestTenant(tenant);
+    }
+  });
+
   it('records a new delivery once', async () => {
     const tenant = await seedTestTenant('webhook-delivery-repo');
     try {

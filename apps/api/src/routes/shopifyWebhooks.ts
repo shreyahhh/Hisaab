@@ -183,16 +183,15 @@ export function registerShopifyWebhookRoutes(
           return;
         }
         const scope = jobScope(resolved.organizationId, resolved.id);
+        const deliveries = createWebhookDeliveryRepository(deps.db);
 
-        // Deduped on X-Shopify-Webhook-Id *before* any topic handler runs — uniformly across every
-        // topic, not just the compliance ones (CLAUDE.md "Webhooks: verify, dedupe"; ADR-0016: a
-        // Postgres table, not a Redis key, since it must survive Shopify's retries over hours).
-        const delivery = await createWebhookDeliveryRepository(deps.db).recordDelivery(scope, {
-          storeId: resolved.id,
-          webhookId,
-          topic: shopifyTopic,
-        });
-        if (!delivery.isNew) {
+        // Checked *before* dispatching to a handler — uniformly across every topic, not just the
+        // compliance ones (CLAUDE.md "Webhooks: verify, dedupe"). The matching write happens only
+        // *after* the handler below succeeds (see the comment there): recording the delivery here,
+        // before processing, would let a handler crash on attempt 1 permanently swallow the event —
+        // Shopify's retry of the same webhook id would then see it as already delivered and skip it
+        // forever, exactly the failure mode ADR-0017 rejected for the pixel event stream.
+        if (await deliveries.wasAlreadyDelivered(scope, { storeId: resolved.id, webhookId })) {
           await reply.code(200).send();
           return;
         }
@@ -215,6 +214,14 @@ export function registerShopifyWebhookRoutes(
         }
         // orders/*, order-hints/*, bulk_operations/finish: acknowledged only — tracked follow-up issue.
 
+        // Only reached once the handler above (if any) has completed without throwing — an error
+        // propagates past this point instead, so the delivery is never marked done and Shopify's
+        // retry re-runs the handler from scratch.
+        await deliveries.recordDelivery(scope, {
+          storeId: resolved.id,
+          webhookId,
+          topic: shopifyTopic,
+        });
         await reply.code(200).send();
       },
     );

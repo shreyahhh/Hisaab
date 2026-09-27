@@ -149,6 +149,15 @@ export const repositoryRegistry: readonly RepositoryDescriptor[] = [
     name: 'WebhookDeliveryRepository',
     methods: [
       {
+        name: 'wasAlreadyDelivered',
+        scopeKind: 'store',
+        invoke: (db, scope, storeId) =>
+          createWebhookDeliveryRepository(db).wasAlreadyDelivered(scope, {
+            storeId,
+            webhookId: `cross-tenant-test-${storeId}`,
+          }),
+      },
+      {
         name: 'recordDelivery',
         scopeKind: 'store',
         invoke: (db, scope, storeId) =>

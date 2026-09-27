@@ -1,9 +1,33 @@
 import { createHmac, randomUUID } from 'node:crypto';
 import { cleanupTestTenant, seedTestTenant, type TestTenant } from '@truepath/db/testing';
-import { createIntegrationRepository, jobScope, schema } from '@truepath/db';
+import { createIntegrationRepository, jobScope, schema, type Db } from '@truepath/db';
 import { eq } from 'drizzle-orm';
 import { afterEach, describe, expect, it } from 'vitest';
 import { buildTestApp, testCredentialsCipher, testDb } from '../testApp.js';
+
+/**
+ * Wraps `realDb` so its *first* `.update(...)` call throws instead of running — simulating a
+ * handler crash mid-request, without touching `.select`/`.insert` (so store resolution and the
+ * webhook-delivery dedup read/write are unaffected; only the handler's own effect fails). Every
+ * subsequent `.update(...)` call behaves normally, so a retry through the same wrapped app succeeds.
+ */
+function dbThatFailsFirstUpdate(realDb: Db): Db {
+  let updateCalls = 0;
+  return new Proxy(realDb, {
+    get(target, prop, receiver) {
+      const value = Reflect.get(target, prop, receiver);
+      if (prop === 'update') {
+        updateCalls += 1;
+        if (updateCalls === 1) {
+          return () => {
+            throw new Error('injected failure: simulated handler crash on first delivery');
+          };
+        }
+      }
+      return typeof value === 'function' ? value.bind(target) : value;
+    },
+  }) as Db;
+}
 
 // POST /webhooks/shopify/:topic (shopify-integration.md §2.2, §2.4, §4.2, §4.8). No session — HMAC
 // + shop domain is the whole authentication story, per ADR-0024/the CSRF-hook exemption.
@@ -280,6 +304,85 @@ describe('POST /webhooks/shopify/app — app/uninstalled', () => {
       .from(schema.shopifyWebhookDeliveries)
       .where(eq(schema.shopifyWebhookDeliveries.storeId, t.storeId));
     expect(deliveries).toHaveLength(1);
+  });
+
+  it('a handler failure on the first delivery does not mark it delivered — a retry with the same webhook id completes it', async () => {
+    const t = await tenant('webhook-uninstall-handler-fails-once');
+    const [store] = await testDb
+      .select()
+      .from(schema.stores)
+      .where(eq(schema.stores.id, t.storeId));
+    const integration = await createIntegrationRepository(testDb).upsertShopify(
+      jobScope(t.organizationId, t.storeId),
+      {
+        storeId: t.storeId,
+        externalAccountId: 'gid://shopify/Shop/handler-fails-once',
+        credentialsJson: '{}',
+        scopes: [],
+        cipher: testCredentialsCipher,
+      },
+    );
+
+    const flakyApp = buildTestApp({ db: dbThatFailsFirstUpdate(testDb) });
+    try {
+      const webhookId = randomUUID();
+      const payload = JSON.stringify({ id: 1 });
+      const send = () =>
+        flakyApp.inject({
+          method: 'POST',
+          url: '/webhooks/shopify/app',
+          payload,
+          headers: {
+            'content-type': 'application/json',
+            'x-shopify-hmac-sha256': sign(payload),
+            'x-shopify-shop-domain': store!.shopDomain,
+            'x-shopify-topic': 'app/uninstalled',
+            'x-shopify-webhook-id': webhookId,
+          },
+        });
+
+      // Attempt 1: the handler's own DB update throws — Shopify would see a 5xx and retry.
+      const first = await send();
+      expect(first.statusCode).toBe(500);
+
+      // Nothing was recorded as delivered, and the store must still be untouched by the failed attempt.
+      const [afterFailure] = await testDb
+        .select()
+        .from(schema.stores)
+        .where(eq(schema.stores.id, t.storeId));
+      expect(afterFailure?.status).not.toBe('uninstalled');
+      const deliveriesAfterFailure = await testDb
+        .select()
+        .from(schema.shopifyWebhookDeliveries)
+        .where(eq(schema.shopifyWebhookDeliveries.storeId, t.storeId));
+      expect(deliveriesAfterFailure).toHaveLength(0);
+
+      // Attempt 2 (Shopify's retry, same X-Shopify-Webhook-Id): the update no longer throws, so the
+      // handler completes and the delivery is finally recorded.
+      const retry = await send();
+      expect(retry.statusCode).toBe(200);
+
+      const [afterRetry] = await testDb
+        .select()
+        .from(schema.stores)
+        .where(eq(schema.stores.id, t.storeId));
+      expect(afterRetry?.status).toBe('uninstalled');
+
+      const [updatedIntegration] = await testDb
+        .select()
+        .from(schema.integrations)
+        .where(eq(schema.integrations.id, integration.id));
+      expect(updatedIntegration?.status).toBe('revoked');
+      expect(updatedIntegration?.encryptedCredentials).toBeNull();
+
+      const deliveriesAfterRetry = await testDb
+        .select()
+        .from(schema.shopifyWebhookDeliveries)
+        .where(eq(schema.shopifyWebhookDeliveries.storeId, t.storeId));
+      expect(deliveriesAfterRetry).toHaveLength(1);
+    } finally {
+      await flakyApp.close();
+    }
   });
 });
 

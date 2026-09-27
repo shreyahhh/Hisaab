@@ -35,6 +35,7 @@ export {
 export {
   createWebhookDeliveryRepository,
   type RecordWebhookDeliveryInput,
+  type WebhookDeliveryKey,
   type WebhookDeliveryRepository,
 } from './repositories/webhookDeliveryRepository.js';
 export {

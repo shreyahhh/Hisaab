@@ -1,18 +1,30 @@
+import { and, eq } from 'drizzle-orm';
 import { assertStoreInScope, type Scope } from '@truepath/shared';
 import type { Db } from '../client.js';
 import { shopifyWebhookDeliveries } from '../schema/index.js';
 
-export interface RecordWebhookDeliveryInput {
+export interface WebhookDeliveryKey {
   readonly storeId: string;
   readonly webhookId: string; // X-Shopify-Webhook-Id
+}
+
+export interface RecordWebhookDeliveryInput extends WebhookDeliveryKey {
   readonly topic: string; // X-Shopify-Topic
 }
 
 export interface WebhookDeliveryRepository {
   /**
-   * Records a Shopify webhook delivery exactly once per `(storeId, webhookId)`. Returns `isNew:
-   * false` for a replay (a Shopify retry, or a duplicate at-least-once delivery) — the caller must
-   * skip dispatching to any topic handler in that case (CLAUDE.md "Webhooks: verify, dedupe").
+   * True if this `(storeId, webhookId)` was already recorded as successfully processed. Checked
+   * *before* dispatching to a topic handler — a hit means "skip, this is a replay of a delivery we
+   * already finished."
+   */
+  wasAlreadyDelivered(scope: Scope, key: WebhookDeliveryKey): Promise<boolean>;
+  /**
+   * Records a Shopify webhook delivery as done. **Call only after the topic handler has completed
+   * successfully** — recording it first (or on a failure path) would let a handler crash on attempt
+   * 1 permanently swallow the event, since Shopify's retry of the same webhook id would then see it
+   * as already delivered and never run the handler again. Idempotent: a second call for the same key
+   * (e.g. a benign race between two concurrent identical deliveries) is a no-op.
    */
   recordDelivery(
     scope: Scope,
@@ -20,9 +32,24 @@ export interface WebhookDeliveryRepository {
   ): Promise<{ readonly isNew: boolean }>;
 }
 
-/** The only sanctioned way to write `shopify_webhook_deliveries` (ADR-0016). */
+/** The only sanctioned way to read/write `shopify_webhook_deliveries` (ADR-0016). */
 export function createWebhookDeliveryRepository(db: Db): WebhookDeliveryRepository {
   return {
+    async wasAlreadyDelivered(scope, key) {
+      assertStoreInScope(scope, key.storeId);
+      const rows = await db
+        .select({ id: shopifyWebhookDeliveries.id })
+        .from(shopifyWebhookDeliveries)
+        .where(
+          and(
+            eq(shopifyWebhookDeliveries.storeId, key.storeId),
+            eq(shopifyWebhookDeliveries.webhookId, key.webhookId),
+          ),
+        )
+        .limit(1);
+      return rows.length > 0;
+    },
+
     async recordDelivery(scope, input) {
       assertStoreInScope(scope, input.storeId);
       const inserted = await db
