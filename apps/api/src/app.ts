@@ -1,10 +1,11 @@
+import { randomUUID } from 'node:crypto';
 import Fastify, { type FastifyInstance } from 'fastify';
 import fastifyCors from '@fastify/cors';
 import type { Auth } from '@truepath/auth';
 import { createAuditLogRepository, type Db } from '@truepath/db';
 import { createAuditService, type AuditService } from './audit.js';
 import { registerAuthBridge } from './authBridge.js';
-import { registerAuthErrorHandler } from './errors.js';
+import { registerAuthErrorHandler, type ErrorReporter } from './errors.js';
 import {
   createEmailLimiter,
   ipLimit,
@@ -39,13 +40,23 @@ export interface AppDeps {
    * of them; `true` would trust a spoofable X-Forwarded-For from anyone.
    */
   readonly trustProxy?: boolean | string | string[];
+  /** Overrides how an unhandled error is logged (errors.ts); defaults to one stderr JSON line. */
+  readonly errorReporter?: ErrorReporter;
 }
 
 // Core API (SPEC §10, §4): auth, tenants, integrations, reports, DPDP endpoints, webhooks. Built as
 // a plain function (not started here) so tests can exercise it via `.inject()` without binding a
 // port.
 export function buildApp(deps: AppDeps): FastifyInstance {
-  const app = Fastify({ logger: false, trustProxy: deps.trustProxy ?? false });
+  const app = Fastify({
+    logger: false,
+    trustProxy: deps.trustProxy ?? false,
+    // A UUID, not Fastify's default per-process counter ("req-1", "req-2", ...): this id is
+    // returned to the client on an unhandled error (errors.ts) as the key to find its server-side
+    // log line, so it must stay unique across restarts and across the several API instances a real
+    // deployment runs, not just within one process.
+    genReqId: () => randomUUID(),
+  });
 
   registerRouteRegistry(app);
   const tenantDeps: TenantScopeDeps = {
@@ -53,7 +64,7 @@ export function buildApp(deps: AppDeps): FastifyInstance {
     db: deps.db,
     audit: deps.audit ?? createAuditService(createAuditLogRepository(deps.db)),
   };
-  registerAuthErrorHandler(app);
+  registerAuthErrorHandler(app, { report: deps.errorReporter });
 
   void app.register(fastifyCors, { origin: deps.trustedOrigin, credentials: true });
 
