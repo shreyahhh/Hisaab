@@ -121,6 +121,35 @@ describe('POST /webhooks/shopify/:topic — HMAC and shop resolution', () => {
     });
     expect(res.statusCode).toBe(200);
   });
+
+  it('records exactly one delivery for a replayed orders/* webhook, even though it is a no-op today', async () => {
+    const t = await tenant('webhook-orders-dedup');
+    const [store] = await testDb
+      .select()
+      .from(schema.stores)
+      .where(eq(schema.stores.id, t.storeId));
+    const webhookId = randomUUID();
+    const body = { id: 1 };
+    await sendWebhook({
+      topic: 'orders',
+      shopifyTopic: 'orders/create',
+      shopDomain: store!.shopDomain,
+      webhookId,
+      body,
+    });
+    await sendWebhook({
+      topic: 'orders',
+      shopifyTopic: 'orders/create',
+      shopDomain: store!.shopDomain,
+      webhookId,
+      body,
+    });
+    const deliveries = await testDb
+      .select()
+      .from(schema.shopifyWebhookDeliveries)
+      .where(eq(schema.shopifyWebhookDeliveries.storeId, t.storeId));
+    expect(deliveries).toHaveLength(1);
+  });
 });
 
 describe('POST /webhooks/shopify/app — app/uninstalled', () => {
@@ -203,6 +232,54 @@ describe('POST /webhooks/shopify/app — app/uninstalled', () => {
       .from(schema.auditLog)
       .where(eq(schema.auditLog.organizationId, t.organizationId));
     expect(auditRows.filter((r) => r.action === 'integration_disconnected')).toHaveLength(1);
+  });
+
+  it('a replayed X-Shopify-Webhook-Id is a true dedup no-op, not just state-based idempotency', async () => {
+    const t = await tenant('webhook-uninstall-dedup-not-state');
+    const [store] = await testDb
+      .select()
+      .from(schema.stores)
+      .where(eq(schema.stores.id, t.storeId));
+    const webhookId = randomUUID();
+    const body = { id: 1 };
+
+    const first = await sendWebhook({
+      topic: 'app',
+      shopifyTopic: 'app/uninstalled',
+      shopDomain: store!.shopDomain,
+      webhookId,
+      body,
+    });
+    expect(first.statusCode).toBe(200);
+
+    // Reactivate the store by hand — if the route only relied on state-based idempotency
+    // (delivery_status/status != 'uninstalled' guards), a replay would re-run the handler and
+    // re-uninstall it. It must not: the delivery record itself, not store state, is what stops it.
+    await testDb
+      .update(schema.stores)
+      .set({ status: 'active' })
+      .where(eq(schema.stores.id, t.storeId));
+
+    const replay = await sendWebhook({
+      topic: 'app',
+      shopifyTopic: 'app/uninstalled',
+      shopDomain: store!.shopDomain,
+      webhookId,
+      body,
+    });
+    expect(replay.statusCode).toBe(200);
+
+    const [afterReplay] = await testDb
+      .select()
+      .from(schema.stores)
+      .where(eq(schema.stores.id, t.storeId));
+    expect(afterReplay?.status).toBe('active'); // untouched by the replay
+
+    const deliveries = await testDb
+      .select()
+      .from(schema.shopifyWebhookDeliveries)
+      .where(eq(schema.shopifyWebhookDeliveries.storeId, t.storeId));
+    expect(deliveries).toHaveLength(1);
   });
 });
 

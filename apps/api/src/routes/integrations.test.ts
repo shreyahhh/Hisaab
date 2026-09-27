@@ -406,6 +406,37 @@ describe('GET /v1/integrations/shopify/callback', () => {
     }
   });
 
+  it('ignores an extra/tampered orgId query parameter — the organization comes only from the verified state token', async () => {
+    const app = appWith();
+    try {
+      const real = await tenant('callback-org-param-real');
+      const attackerOrg = await tenant('callback-org-param-attacker');
+      const shop = shopFor('callback-org-param');
+      const state = await issueState(real, shop);
+
+      // The route's Querystring type has no orgId/organizationId field at all — this proves an
+      // attacker-supplied one in the raw URL is never read, not merely overridden.
+      const res = await app.inject({
+        method: 'GET',
+        url: `/v1/integrations/shopify/callback?shop=${shop}&code=c&state=${encodeURIComponent(state)}&orgId=${attackerOrg.organizationId}&organizationId=${attackerOrg.organizationId}`,
+        headers: { cookie: real.cookie },
+      });
+      expect(res.statusCode).toBe(302);
+
+      const [store] = await testDb
+        .select()
+        .from(schema.stores)
+        .where(eq(schema.stores.shopDomain, shop));
+      expect(store?.organizationId).toBe(real.organizationId);
+      expect(store?.organizationId).not.toBe(attackerOrg.organizationId);
+
+      await testDb.delete(schema.integrations).where(eq(schema.integrations.storeId, store!.id));
+      await testDb.delete(schema.stores).where(eq(schema.stores.id, store!.id));
+    } finally {
+      await app.close();
+    }
+  });
+
   it('returns 409 shop_linked_elsewhere when the shop already belongs to a different organization', async () => {
     const app = appWith();
     try {

@@ -60,7 +60,11 @@ describe('apps/api boot environment', () => {
 
   it('refuses to start without the credentials envelope keys, in any NODE_ENV (ADR-0023)', () => {
     for (const NODE_ENV of ['development', 'test', 'production']) {
-      for (const name of ['CREDENTIALS_KEY_READ', 'CREDENTIALS_KEY_WRITE', 'CREDENTIALS_MASTER_K1']) {
+      for (const name of [
+        'CREDENTIALS_KEY_READ',
+        'CREDENTIALS_KEY_WRITE',
+        'CREDENTIALS_MASTER_K1',
+      ]) {
         const result = parseEnv(apiEnvSchema, env({ NODE_ENV, [name]: undefined }));
         expect(result.success, `${NODE_ENV} without ${name}`).toBe(false);
       }

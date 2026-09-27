@@ -57,6 +57,13 @@
       "when": 1790509582766,
       "tag": "0007_dsr_requests_identity_hash_nullable_and_source_ref_dedupe",
       "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "7",
+      "when": 1790512737595,
+      "tag": "0008_shopify_webhook_deliveries",
+      "breakpoints": true
     }
   ]
 }

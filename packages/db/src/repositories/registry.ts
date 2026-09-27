@@ -6,6 +6,7 @@ import { createDpaAcceptanceRepository } from './dpaAcceptanceRepository.js';
 import { createDsrRequestRepository } from './dsrRequestRepository.js';
 import { createIntegrationRepository } from './integrationRepository.js';
 import { createStoreRepository } from './storeRepository.js';
+import { createWebhookDeliveryRepository } from './webhookDeliveryRepository.js';
 
 // A resource id that never matches a real row, for scope-assertion-only harness invocations (the
 // assertion throws before the query would run, so which nonexistent id is passed is immaterial).
@@ -140,6 +141,21 @@ export const repositoryRegistry: readonly RepositoryDescriptor[] = [
             identityHash: null,
             dueAt: new Date(),
             sourceRef: `cross-tenant-test-${storeId}`,
+          }),
+      },
+    ],
+  },
+  {
+    name: 'WebhookDeliveryRepository',
+    methods: [
+      {
+        name: 'recordDelivery',
+        scopeKind: 'store',
+        invoke: (db, scope, storeId) =>
+          createWebhookDeliveryRepository(db).recordDelivery(scope, {
+            storeId,
+            webhookId: `cross-tenant-test-${storeId}`,
+            topic: 'app/uninstalled',
           }),
       },
     ],

@@ -212,6 +212,7 @@ row's *actual* id, which isn't known until the insert/update is about to happen.
 | `order_status_events` | insert | `source='shopify'`, `status` (`created`\|`updated`\|`cancelled`\|`refund`\|`fulfillment`), `occurred_at` (source timestamp), `raw_ref` = `X-Shopify-Webhook-Id` or `recon:<updatedAt>`; unique `(order_id, source, raw_ref)` |
 | ClickHouse `order_status` | insert (full-row projection, HLD §8) | SPEC v0.3 columns |
 | `dsr_requests` | insert (compliance webhooks) | via the privacy module |
+| `shopify_webhook_deliveries` (**M1-1**, new — not in SPEC §6.1, flagged here per HLD §8's process) | insert | `store_id`, `webhook_id` (`X-Shopify-Webhook-Id`), `topic`, `received_at`; unique `(store_id, webhook_id)`; cross-topic dedup gate (§4.3) |
 | Redis `collector:store:<store_key>` | publish | HLD §8 |
 | BullMQ `identity-stitch`, `shopify-sync` | enqueue | |
 
@@ -241,9 +242,16 @@ row's *actual* id, which isn't known until the insert/update is about to happen.
 5. Parse into a snapshot. Only mapped fields survive; **the payload is never persisted or logged**.
 
 ### 4.3 Idempotency
-- Order topics: `INSERT order_status_events (…, raw_ref = X-Shopify-Webhook-Id) ON CONFLICT (order_id, source, raw_ref) DO NOTHING RETURNING id`, in the same transaction as the order upsert. No row returned → duplicate → `200` with no apply.
-- Compliance: dedupe on `dsr_requests.result_summary.source_ref` (unique partial index on `(store_id, (result_summary->>'source_ref'))`).
-- `bulk_operations/finish`: `jobId`. `app/uninstalled`: naturally idempotent.
+- **M1-1: a store-scoped webhook-delivery dedup runs before any topic handler, for every topic.**
+  `shopify_webhook_deliveries` (unique on `(store_id, webhook_id)`) is written with
+  `ON CONFLICT DO NOTHING` immediately after the store is resolved; a conflict (a Shopify retry, or
+  any duplicate at-least-once delivery) short-circuits to `200` without dispatching to a handler at
+  all — this is what makes `app/uninstalled` (and future `orders/*`/`order-hints/*` handling) a true
+  dedup, not just idempotent-by-state. Old rows are cleaned up by a later retention job (not built
+  yet; nothing needs to remember a delivery past Shopify's 8x/4h retry window).
+- Order topics (**not yet implemented**, M1-2): `INSERT order_status_events (…, raw_ref = X-Shopify-Webhook-Id) ON CONFLICT (order_id, source, raw_ref) DO NOTHING RETURNING id`, in the same transaction as the order upsert — a second, order-scoped dedup layered on top of the delivery-level one above, since one order can legitimately receive several different webhook deliveries.
+- Compliance: dedupe on `dsr_requests.result_summary.source_ref` (unique partial index on `(store_id, (result_summary->>'source_ref'))`) — redundant with the delivery-level dedup above, kept as defense in depth for the DSR row specifically.
+- `bulk_operations/finish`: `jobId`. `app/uninstalled`: covered by the delivery-level dedup; also naturally idempotent by state as a backstop.
 
 ### 4.4 Order snapshot apply and out-of-order guard
 1. `ts` = snapshot `updated_at` / `updatedAt`.

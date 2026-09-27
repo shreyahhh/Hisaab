@@ -3,6 +3,7 @@ import {
   createDsrRequestRepository,
   createIntegrationRepository,
   createStoreRepository,
+  createWebhookDeliveryRepository,
   jobScope,
   resolveStoreByShopDomain,
 } from '@truepath/db';
@@ -182,6 +183,19 @@ export function registerShopifyWebhookRoutes(
           return;
         }
         const scope = jobScope(resolved.organizationId, resolved.id);
+
+        // Deduped on X-Shopify-Webhook-Id *before* any topic handler runs — uniformly across every
+        // topic, not just the compliance ones (CLAUDE.md "Webhooks: verify, dedupe"; ADR-0016: a
+        // Postgres table, not a Redis key, since it must survive Shopify's retries over hours).
+        const delivery = await createWebhookDeliveryRepository(deps.db).recordDelivery(scope, {
+          storeId: resolved.id,
+          webhookId,
+          topic: shopifyTopic,
+        });
+        if (!delivery.isNew) {
+          await reply.code(200).send();
+          return;
+        }
 
         if (shopifyTopic === 'app/uninstalled') {
           await handleAppUninstalled(deps, scope, resolved.id);

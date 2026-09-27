@@ -33,6 +33,11 @@ export {
   type DsrRequestRow,
 } from './repositories/dsrRequestRepository.js';
 export {
+  createWebhookDeliveryRepository,
+  type RecordWebhookDeliveryInput,
+  type WebhookDeliveryRepository,
+} from './repositories/webhookDeliveryRepository.js';
+export {
   createAuditLogRepository,
   DEFAULT_AUDIT_PAGE_SIZE,
   InvalidAuditCursorError,
