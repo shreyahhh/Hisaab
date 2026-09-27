@@ -82,10 +82,16 @@ function redactAny(value: unknown, depth: number, seen: WeakSet<object>): unknow
   seen.add(value);
   try {
     if (value instanceof Error) {
+      // A driver wraps its own error before it reaches us — e.g. Drizzle's "Failed query: ..." text
+      // for a Postgres failure carries the real detail (and, if any, the query's identifiers) only
+      // in `.cause`, not in `.message`. Following the chain (same depth/circular guards as anything
+      // else) is what makes redactLogValue's "full error, still redacted" promise true rather than
+      // just true of the outermost wrapper.
       return {
         name: value.name,
         message: redactString(value.message),
         ...(value.stack ? { stack: redactString(value.stack) } : {}),
+        ...(value.cause !== undefined ? { cause: redactAny(value.cause, depth + 1, seen) } : {}),
       };
     }
     if (Array.isArray(value)) return value.map((item) => redactAny(item, depth + 1, seen));

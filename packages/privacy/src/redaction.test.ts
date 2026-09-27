@@ -110,6 +110,43 @@ describe('redactLogValue: structures', () => {
     expect(out.stack ?? '').not.toContain('a@example.com');
   });
 
+  it("follows an Error's cause chain, redacting each link (a driver wrapper's real detail is in .cause, not .message)", () => {
+    const root = new Error('duplicate key for a@example.com');
+    const wrapper = new Error('Failed query: insert into orders ...', { cause: root });
+    const out = redactLogValue(wrapper) as {
+      name: string;
+      message: string;
+      cause?: { name: string; message: string };
+    };
+    expect(out.message).toBe('Failed query: insert into orders ...');
+    expect(out.cause?.name).toBe('Error');
+    expect(out.cause?.message).toBe(`duplicate key for ${REDACTED}`);
+  });
+
+  it('leaves out cause entirely when there is none (never adds a spurious "cause": undefined)', () => {
+    const out = redactLogValue(new Error('plain')) as Record<string, unknown>;
+    expect('cause' in out).toBe(false);
+  });
+
+  it("a non-Error cause (a driver's plain error object) is still walked and redacted", () => {
+    const wrapper = new Error('wrapped', {
+      cause: { detail: 'contact a@example.com', code: 'P0001' },
+    });
+    const out = redactLogValue(wrapper) as { cause: { detail: string; code: string } };
+    expect(out.cause.detail).toBe(`contact ${REDACTED}`);
+    expect(out.cause.code).toBe('P0001');
+  });
+
+  it('a long cause chain still stops at MAX_DEPTH and never loops on a self-referential cause', () => {
+    let deep = new Error('leaf');
+    for (let i = 0; i < 10; i += 1) deep = new Error(`link ${i}`, { cause: deep });
+    expect(JSON.stringify(redactLogValue(deep))).toContain('[truncated]');
+
+    const cyclic: Error & { cause?: unknown } = new Error('cyclic');
+    cyclic.cause = cyclic;
+    expect(redactLogValue(cyclic)).toMatchObject({ name: 'Error', cause: '[circular]' });
+  });
+
   it('never returns key bytes', () => {
     expect(redactLogValue({ blob: randomBytes(32) })).toEqual({ blob: '[redacted binary]' });
   });
