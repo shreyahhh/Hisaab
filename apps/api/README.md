@@ -77,3 +77,31 @@ Every state-changing request (anything but GET, HEAD and OPTIONS) needs exactly 
 `Origin`, or it is a 403 `invalid_origin`, a missing header included; we have no non-browser clients.
 POST, PUT and PATCH also need `Content-Type: application/json` (judged first). `app.test.ts` covers the
 methods, routes (unknown ones too) and Origin variants.
+
+## Global error handler (`errors.ts`, issue #20)
+
+Every route's *known* failures reply directly (`reply.code(...).send(...)`) and never throw. What
+reaches `setErrorHandler` is only what nobody anticipated — plus two things thrown on purpose:
+
+- an uncaught `AuthApiError` → `{ error: <code> }` with Better Auth's status (unchanged);
+- a hand-built response object thrown by our own trusted code (`@fastify/rate-limit`'s
+  `errorResponseBuilder`, `rateLimitedBody()` in `rateLimit.ts`) → sent back exactly as built, since
+  nothing but ids/enums/counts ever goes into one (unchanged, still 429 with its own body).
+
+Anything else — a database driver error, a bug, a Fastify-internal failure — used to fall through to
+Fastify's default handler, which put the raw `error.message` in the 500 body; for a Drizzle/pg
+failure that is the full SQL statement and its bound parameters. Now it is always a bare
+`{ "error": "internal_error", "request_id": "<uuid>" }`, and the real detail is logged server-side
+(one structured stderr line, `event: 'unhandled_error'`) under the same `request_id`, run through
+`redactLogValue` (`@truepath/privacy`) so an identifier in a query string or an error message is
+masked there too — the request URL is decoded first, since redaction's patterns match literal
+characters and a raw `request.url` is percent-encoded. `redactLogValue` also now follows an `Error`'s
+`.cause` chain, because a driver's own message is often just a wrapper ("Failed query: ...") with the
+real detail one level down.
+
+`request_id` comes from Fastify's own `request.id`; `app.ts` sets `genReqId: () => randomUUID()`
+instead of the default per-process counter, so it stays unique across restarts and across a real
+deployment's several API instances, not just within one process.
+
+Overridable in tests via `AppDeps.errorReporter`, the same DI pattern as `AuditService`'s `report`
+option.

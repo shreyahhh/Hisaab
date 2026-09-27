@@ -88,6 +88,14 @@ exported from the package index, and an ESLint rule (`eslint.config.js`, tested 
 `apps/api/src/eslintBoundary.test.ts`) lets only `packages/integrations/meta` (or `…/src/meta`)
 import it. Everything else uses the tenant HMAC.
 
+## Following an Error's cause chain
+
+A driver wraps its own error before it reaches application code — Drizzle's pg adapter turns a Postgres
+failure into `Failed query: ...`, with the database's own message (where an identifier is most likely
+to turn up) one level down in `.cause`. `redactLogValue` follows `.cause` recursively, redacting each
+link the same way, with the same depth limit and circular-reference guard as everything else. A cause
+that is not an `Error` (a driver's plain error object) is still walked field by field.
+
 ## Known limits
 
 - **Redaction false positives** are accepted (LLD §6): a 10-digit order number starting 6–9 is
