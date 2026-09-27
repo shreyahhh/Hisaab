@@ -37,6 +37,36 @@ LLDs define interfaces, data owned, failure modes and tests. Follow them; if rea
 - **Money** is integer paise. **Time** is UTC in Postgres, IST in the UI.
 - **Webhooks**: verify, dedupe, never persist or log raw payloads.
 
+## Standing rules
+
+**Plan first.** Before writing code for a ticket, post the plan: scope, what's deferred, the public
+API, call sites affected, and every conflict between the spec/ADRs/LLDs with a recommended
+resolution. Wait for confirmation. Working unattended: pick the more conservative option instead of
+waiting, and record it under "Decisions for review".
+
+**Security invariants**, every PR:
+- every new route is covered by the generated cross-tenant harness, or exempted with a reason;
+- every `auth.api.*` call goes through `authCall`;
+- a Better Auth route joins the allow-list only in the same change that audits it (ADR-0022);
+- audit rows go through the typed catalogue, with a per-action metadata schema, and never contain
+  raw identifiers or hashes;
+- an unexpected error never leaks its message, stack, SQL or parameters to the client — log the
+  redacted detail server-side instead.
+
+**Verification.** Build, lint, typecheck and the full test suite green locally *and* in CI before
+calling a ticket done. For each key new test: break the code it protects, confirm the test fails,
+then restore it.
+
+**Git.** One branch and one PR per ticket. Merge with merge commits; never force-push or rewrite
+history; never edit an already-merged migration. For stacked PRs, retarget the dependent PR to its
+new base *before* deleting the base PR's branch — deleting it first auto-closes the dependent PR.
+
+**Never**, without explicit approval: merge a PR, add a new dependency, touch a `.env` file or a
+protected path, create an account or an API key, provision or modify cloud resources, or call a paid
+external service.
+
+**Deferred work becomes a GitHub issue** — never just a note in a PR description or a code comment.
+
 ## Commands (placeholders until M0-1)
 ```sh
 pnpm install
