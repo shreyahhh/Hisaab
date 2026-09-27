@@ -86,9 +86,16 @@ reaches `setErrorHandler` is only what nobody anticipated — plus two things th
 - an uncaught `AuthApiError` → `{ error: <code> }` with Better Auth's status (unchanged);
 - a hand-built response object thrown by our own trusted code (`@fastify/rate-limit`'s
   `errorResponseBuilder`, `rateLimitedBody()` in `rateLimit.ts`) → sent back exactly as built, since
-  nothing but ids/enums/counts ever goes into one (unchanged, still 429 with its own body).
+  nothing but ids/enums/counts ever goes into one (unchanged, still 429 with its own body);
+- a genuine Fastify-internal **client** error — malformed JSON, a body over the size limit, an
+  unsupported content type, a schema-validation failure — identified by its `FST_ERR_*` code and a
+  real `statusCode` in 400-499 → the same status, but a generic code (`bad_request`,
+  `payload_too_large`, `unsupported_media_type`, ...), never Fastify's own message (which can echo a
+  fragment of the request, e.g. a JSON parse error's position). Not logged: these are ordinary client
+  mistakes, not something to alert on. A Fastify-internal error with `statusCode >= 500` (a plugin
+  bug) is not treated as a client mistake and falls through to the generic path below instead.
 
-Anything else — a database driver error, a bug, a Fastify-internal failure — used to fall through to
+Anything else — a database driver error, a bug, a Fastify-internal *server* failure — used to fall through to
 Fastify's default handler, which put the raw `error.message` in the 500 body; for a Drizzle/pg
 failure that is the full SQL statement and its bound parameters. Now it is always a bare
 `{ "error": "internal_error", "request_id": "<uuid>" }`, and the real detail is logged server-side
@@ -99,9 +106,12 @@ characters and a raw `request.url` is percent-encoded. `redactLogValue` also now
 `.cause` chain, because a driver's own message is often just a wrapper ("Failed query: ...") with the
 real detail one level down.
 
-`request_id` comes from Fastify's own `request.id`; `app.ts` sets `genReqId: () => randomUUID()`
-instead of the default per-process counter, so it stays unique across restarts and across a real
-deployment's several API instances, not just within one process.
+`request_id` comes from Fastify's own `request.id` and is generated **server-side only**: `app.ts`
+sets `genReqId: () => randomUUID()`, a function that takes no argument, so it cannot read any
+header — a client-sent `X-Request-Id` (or Fastify's own default `request-id` header) is always
+ignored, never echoed back. It replaces Fastify's default per-process counter for the same reason
+the response carries it at all: it must stay unique across restarts and across a real deployment's
+several API instances, not just within one process.
 
 Overridable in tests via `AppDeps.errorReporter`, the same DI pattern as `AuditService`'s `report`
 option.

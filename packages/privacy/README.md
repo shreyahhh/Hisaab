@@ -93,8 +93,14 @@ import it. Everything else uses the tenant HMAC.
 A driver wraps its own error before it reaches application code — Drizzle's pg adapter turns a Postgres
 failure into `Failed query: ...`, with the database's own message (where an identifier is most likely
 to turn up) one level down in `.cause`. `redactLogValue` follows `.cause` recursively, redacting each
-link the same way, with the same depth limit and circular-reference guard as everything else. A cause
-that is not an `Error` (a driver's plain error object) is still walked field by field.
+link the same way, with the same circular-reference guard as everything else. A cause that is not an
+`Error` (a driver's plain error object) is still walked field by field.
+
+The chain has its **own** depth cap, `MAX_CAUSE_DEPTH` (4) — separate from, and smaller than, the
+general object-nesting `MAX_DEPTH` (8) — so a long or adversarial cause chain can't ride on whatever
+depth budget an unrelated bit of nesting elsewhere in the logged value happened to leave. Past the
+cap, a link is replaced with the string `'[cause chain too deep]'` — never partially shown, never even
+its `name` — distinct from `'[truncated]'`, which is the general nesting cap.
 
 ## Known limits
 
