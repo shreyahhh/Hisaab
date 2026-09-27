@@ -70,9 +70,14 @@ describe('SPEC §5.10 test 7 — Fastify routes (via routeRegistry)', () => {
       });
 
       // Grows automatically as routes are registered — no edits needed here. As of this ticket
-      // that's GET /v1/orgs/:id/stores, GET /v1/orgs/:id/audit-log, POST /v1/orgs/:id/invites and
-      // PUT/DELETE /v1/orgs/:id/members/:userId.
+      // that's GET /v1/orgs/:id/stores, GET /v1/orgs/:id/audit-log, POST /v1/orgs/:id/invites,
+      // PUT/DELETE /v1/orgs/:id/members/:userId, and (M1-1, ADR-0024) GET
+      // /v1/orgs/:id/integrations/shopify/connect and DELETE /v1/orgs/:id/integrations/:integrationId
+      // — both discovered purely from their `:id` param, with no per-route override.
       expect(discovered.length).toBeGreaterThan(0);
+      const discoveredKeys = discovered.map((r) => `${r.method} ${r.url}`);
+      expect(discoveredKeys).toContain('GET /v1/orgs/:id/integrations/shopify/connect');
+      expect(discoveredKeys).toContain('DELETE /v1/orgs/:id/integrations/:integrationId');
       for (const route of discovered) {
         const needsBody = route.method === 'POST' || route.method === 'PUT';
         const res = await app.inject({

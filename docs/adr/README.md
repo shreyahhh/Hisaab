@@ -26,6 +26,9 @@ Michael Nygard format (Title, Status, Context, Decision, Consequences). **Accept
 | [0020](0020-identity-master-keys-via-env.md) | Identity master keys injected as env vars from Secrets Manager | Accepted, refines ADR-0007 | M0-5 review |
 | [0021](0021-audit-writes-after-better-auth-commits.md) | Audit writes for Better Auth actions: after the commit, retried once, reported on failure | Accepted | M0-6 review |
 | [0022](0022-better-auth-http-allow-list.md) | Better Auth's HTTP routes are an allow-list; a route joins only in the change that audits it | Accepted | M0-6 review |
+| [0023](0023-integration-credential-envelope-encryption.md) | Integration credentials: env-injected master key + local AES-256-GCM, not live KMS calls | Accepted, extends ADR-0020 | M1-1 review |
+| [0024](0024-shopify-integration-routes-nested-under-orgs.md) | Shopify connect/disconnect nested under `/v1/orgs/:id/integrations` | Accepted, narrows SPEC §10 | M1-1 review |
+| [0025](0025-shopify-oauth-state-token.md) | Shopify OAuth `state`: HMAC-signed token + single-use Redis nonce | Accepted | M1-1 review |
 
 **Decisions made during the review that are recorded in HLD §8 / SPEC v0.5 rather than as separate ADRs** (candidates to promote if they are ever revisited):
 - query-time delivered revenue via `order_status`;

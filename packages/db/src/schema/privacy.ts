@@ -1,3 +1,4 @@
+import { sql } from 'drizzle-orm';
 import { index, jsonb, pgTable, text, timestamp, uniqueIndex, uuid } from 'drizzle-orm/pg-core';
 import { AUDIT_ACTIONS, CONSENT_SOURCES, DSR_STATUSES, DSR_TYPES } from '@truepath/shared';
 import {
@@ -43,18 +44,26 @@ export const dsrRequests = pgTable(
       .notNull()
       .references(() => stores.id, { onDelete: 'cascade' }),
     type: text('type').notNull(), // @truepath/shared DSR_TYPES
-    identityHash: text('identity_hash').notNull(),
+    // Nullable: shopify-integration.md §4.3 / privacy-dpdp.md line 196 — `shop/redact` inserts
+    // type='store_erasure' with no shopper identity to hash (it is store-wide, not per-shopper).
+    identityHash: text('identity_hash'),
     status: text('status').notNull().default('pending'), // @truepath/shared DSR_STATUSES
     requestedByUserId: uuid('requested_by_user_id').references(() => users.id),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
     dueAt: timestamp('due_at', { withTimezone: true }).notNull(),
     completedAt: timestamp('completed_at', { withTimezone: true }),
-    resultSummary: jsonb('result_summary'), // { trigger: merchant|shopify_webhook|consent_withdrawn|consent_region_remediation, ... }
+    resultSummary: jsonb('result_summary'), // { trigger: merchant|shopify_webhook|consent_withdrawn|consent_region_remediation, source_ref?, ... }
   },
   (table) => ({
     storeIdx: index('dsr_requests_store_id_idx').on(table.storeId),
     // Backs GET /v1/stores/:id/privacy/requests?status&type&cursor (privacy-dpdp.md §2.2)
     storeStatusIdx: index('dsr_requests_store_id_status_idx').on(table.storeId, table.status),
+    // Idempotency for Shopify compliance webhooks (shopify-integration.md §4.3, CLAUDE.md
+    // "Webhooks: verify, dedupe"): one row per (store, source_ref); merchant-triggered requests
+    // never set source_ref, so the partial index doesn't constrain them.
+    sourceRefUniq: uniqueIndex('dsr_requests_store_id_source_ref_uniq')
+      .on(table.storeId, sql`(${table.resultSummary}->>'source_ref')`)
+      .where(sql`(${table.resultSummary}->>'source_ref') IS NOT NULL`),
     typeCheck: checkOneOf('dsr_requests_type_check', table.type, DSR_TYPES),
     statusCheck: checkOneOf('dsr_requests_status_check', table.status, DSR_STATUSES),
   }),

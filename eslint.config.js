@@ -10,12 +10,17 @@ import prettier from 'eslint-config-prettier';
 const DB_CLIENT_PATTERNS = ['pg', 'postgres', 'drizzle-orm/node-postgres', '@clickhouse/client'];
 const DB_CLIENT_ALLOWED = ['packages/db', 'packages/clickhouse', 'packages/auth'];
 
-// resolveStoreOrganization is the one bootstrap primitive outside the scoped repository layer
-// (ADR-0016, tenantScope.ts): it maps a :storeId to its organization *before* any TenantScope
-// exists, so a :storeId route's identical-404 guarantee (a non-existent store vs. a foreign one)
-// depends on nobody else calling it ad hoc. Its only sanctioned caller is the tenant-scope
-// preHandler.
-const SCOPE_RESOLUTION_ALLOWED = ['apps/api/src/tenantScope.ts'];
+// resolveStoreOrganization and resolveStoreByShopDomain are the bootstrap primitives outside the
+// scoped repository layer (ADR-0016, tenantScope.ts / ADR-0024): each maps a caller's one piece of
+// unauthenticated-session evidence (a :storeId path param; a Shopify-webhook-verified shop domain)
+// to a store/organization *before* any TenantScope exists. Restricting each to its one sanctioned
+// caller keeps the identical-404 / job-scope guarantees from depending on nobody else calling them
+// ad hoc.
+const SCOPE_RESOLUTION_ALLOWED = [
+  'apps/api/src/tenantScope.ts',
+  'apps/api/src/routes/shopifyWebhooks.ts',
+];
+const SCOPE_RESOLUTION_NAMES = ['resolveStoreOrganization', 'resolveStoreByShopDomain'];
 
 // Plain (unsalted) SHA-256 of a shopper's phone/email exists only for Meta's Conversions API, where
 // Meta requires it (ADR-0007). It is brute-forceable for a 10-digit mobile, so it must never be
@@ -56,8 +61,8 @@ function boundaryRule({ dbClients, scopeResolution, metaCapi }) {
   if (scopeResolution) {
     paths.push({
       name: '@truepath/db',
-      importNames: ['resolveStoreOrganization'],
-      message: `resolveStoreOrganization is the ADR-0016 bootstrap primitive for building a TenantScope from a :storeId — only ${SCOPE_RESOLUTION_ALLOWED.join(', ')} may call it.`,
+      importNames: SCOPE_RESOLUTION_NAMES,
+      message: `${SCOPE_RESOLUTION_NAMES.join(' / ')} are ADR-0016/ADR-0024 bootstrap primitives for building a scope before a TenantScope exists — only ${SCOPE_RESOLUTION_ALLOWED.join(', ')} may call them.`,
     });
   }
   const patterns = metaCapi

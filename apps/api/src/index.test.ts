@@ -17,7 +17,14 @@ function env(overrides: Record<string, string | undefined> = {}): NodeJS.Process
     IDENTITY_KEY_READ: 'k1',
     IDENTITY_KEY_WRITE: 'k1',
     IDENTITY_MASTER_K1: key(),
+    CREDENTIALS_KEY_READ: 'k1',
+    CREDENTIALS_KEY_WRITE: 'k1',
+    CREDENTIALS_MASTER_K1: key(),
     DPA_VERSION: '0.1-draft',
+    SHOPIFY_CLIENT_ID: 'client-id',
+    SHOPIFY_CLIENT_SECRET: 'client-secret',
+    SHOPIFY_APP_URL: 'https://api.example.com',
+    SHOPIFY_OAUTH_STATE_SECRET: 'a'.repeat(32),
     ...overrides,
   };
 }
@@ -45,6 +52,33 @@ describe('apps/api boot environment', () => {
   it('refuses to start without the identity hash keys, in any NODE_ENV', () => {
     for (const NODE_ENV of ['development', 'test', 'production']) {
       for (const name of ['IDENTITY_KEY_READ', 'IDENTITY_KEY_WRITE', 'IDENTITY_MASTER_K1']) {
+        const result = parseEnv(apiEnvSchema, env({ NODE_ENV, [name]: undefined }));
+        expect(result.success, `${NODE_ENV} without ${name}`).toBe(false);
+      }
+    }
+  });
+
+  it('refuses to start without the credentials envelope keys, in any NODE_ENV (ADR-0023)', () => {
+    for (const NODE_ENV of ['development', 'test', 'production']) {
+      for (const name of [
+        'CREDENTIALS_KEY_READ',
+        'CREDENTIALS_KEY_WRITE',
+        'CREDENTIALS_MASTER_K1',
+      ]) {
+        const result = parseEnv(apiEnvSchema, env({ NODE_ENV, [name]: undefined }));
+        expect(result.success, `${NODE_ENV} without ${name}`).toBe(false);
+      }
+    }
+  });
+
+  it('refuses to start without the Shopify OAuth config, in any NODE_ENV', () => {
+    for (const NODE_ENV of ['development', 'test', 'production']) {
+      for (const name of [
+        'SHOPIFY_CLIENT_ID',
+        'SHOPIFY_CLIENT_SECRET',
+        'SHOPIFY_APP_URL',
+        'SHOPIFY_OAUTH_STATE_SECRET',
+      ]) {
         const result = parseEnv(apiEnvSchema, env({ NODE_ENV, [name]: undefined }));
         expect(result.success, `${NODE_ENV} without ${name}`).toBe(false);
       }

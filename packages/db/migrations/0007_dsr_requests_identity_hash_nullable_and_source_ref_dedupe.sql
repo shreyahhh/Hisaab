@@ -1,0 +1,2 @@
+ALTER TABLE "dsr_requests" ALTER COLUMN "identity_hash" DROP NOT NULL;--> statement-breakpoint
+CREATE UNIQUE INDEX "dsr_requests_store_id_source_ref_uniq" ON "dsr_requests" USING btree ("store_id",("result_summary"->>'source_ref')) WHERE ("dsr_requests"."result_summary"->>'source_ref') IS NOT NULL;

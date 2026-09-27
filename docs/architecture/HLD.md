@@ -499,10 +499,11 @@ flowchart TB
 *v0.6 additions (final design decisions):*
 - ADR-0011 Drizzle, ADR-0013 ClickHouse Cloud ap-south-1 (conditional on the staging test), ADR-0014 our own collector domain — all Accepted.
 - `consent_granted` event name, now with a `trigger` (`interaction` | `initial_state` | `refresh`).
-- Redis keys `collector:store:<store_key>`, `stats:collector:<store_id>:<yyyymmdd>`, `session:<store_id>:<visitor_id>`, `checkout:<store_id>:<order_id>`; stream `stream:events-dead`; stream entry `suppression_hit`. All tenant keys are `store_id`-prefixed (ADR-0016), with three documented exceptions:
+- Redis keys `collector:store:<store_key>`, `stats:collector:<store_id>:<yyyymmdd>`, `session:<store_id>:<visitor_id>`, `checkout:<store_id>:<order_id>`; stream `stream:events-dead`; stream entry `suppression_hit`. All tenant keys are `store_id`-prefixed (ADR-0016), with four documented exceptions:
   - `collector:store:<store_key>` is a lookup index by the pixel's public key (the Collector doesn't know `store_id` yet; the value carries it);
   - `suppress:ready` is a global marker;
-  - `stream:events-raw` / `stream:events-dead` are global streams whose entries carry `store_id`.
+  - `stream:events-raw` / `stream:events-dead` are global streams whose entries carry `store_id`;
+  - `oauth:shopify:state:<nonce>` (**M1-1, ADR-0025**) is a lookup index by a random single-use nonce — there is no store yet at OAuth-connect time, only an `organizationId`. `EX 600`; value is `{userId, organizationId, shop}`, deleted atomically on first read (GET-then-DEL) so the token backing it can be consumed exactly once.
 - Channel slugs `referral`, `other_campaign`.
 - `dsr_requests.type = 'store_erasure'`.
 - `POST /v1/orgs/:id/deletion/cancel`.
