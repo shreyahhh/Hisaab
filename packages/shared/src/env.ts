@@ -64,6 +64,19 @@ export const authEnvSchema = z.object({
 });
 export type AuthEnv = z.infer<typeof authEnvSchema>;
 
+// Local-dev-only override, separate from authEnvSchema (auth-tenancy.md §2.2's documented shape):
+// Better Auth's session cookie is `Secure` by default and `createAuth` refuses this flag outright
+// when NODE_ENV is "production" (packages/auth/src/betterAuth.ts), so it can only ever relax the
+// cookie for a plain-http localhost dashboard, never in a deployed environment. Defaults to `false`
+// (secure cookies), so an environment that never sets it behaves exactly as documented.
+export const authCookieEnvSchema = z.object({
+  AUTH_ALLOW_INSECURE_COOKIES: z
+    .enum(['true', 'false'])
+    .default('false')
+    .transform((v) => v === 'true'),
+});
+export type AuthCookieEnv = z.infer<typeof authCookieEnvSchema>;
+
 // The DPA version tenants must have accepted before tracking is enabled (privacy-dpdp.md §4.10). No
 // default on purpose: a silent default could ship a draft, unapproved DPA to production. The value
 // names a text in docs/dpdp/, set by whoever deploys once counsel has approved it.
