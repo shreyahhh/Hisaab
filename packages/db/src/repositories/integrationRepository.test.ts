@@ -184,4 +184,37 @@ describe('IntegrationRepository (ADR-0016, ADR-0023, ADR-0024)', () => {
       await cleanupTestTenant(tenant);
     }
   });
+
+  it('listByStore returns every integration for the store, in or out of scope elsewhere', async () => {
+    const tenant = await seedTestTenant('integration-repo-list');
+    try {
+      const repo = createIntegrationRepository(db);
+      const scope = ownerScope(tenant.organizationId, tenant.storeId, tenant.userId);
+      await repo.upsertShopify(scope, {
+        storeId: tenant.storeId,
+        externalAccountId: 'gid://shopify/Shop/list',
+        credentialsJson: '{}',
+        scopes: ['read_orders'],
+        cipher: createTestCredentialsCipher(),
+      });
+
+      const rows = await repo.listByStore(scope, tenant.storeId);
+      expect(rows).toHaveLength(1);
+      expect(rows[0]?.provider).toBe('shopify');
+      expect(rows[0]?.status).toBe('active');
+    } finally {
+      await cleanupTestTenant(tenant);
+    }
+  });
+
+  it('listByStore returns an empty array for a store with no integrations', async () => {
+    const tenant = await seedTestTenant('integration-repo-list-empty');
+    try {
+      const repo = createIntegrationRepository(db);
+      const scope = ownerScope(tenant.organizationId, tenant.storeId, tenant.userId);
+      expect(await repo.listByStore(scope, tenant.storeId)).toEqual([]);
+    } finally {
+      await cleanupTestTenant(tenant);
+    }
+  });
 });

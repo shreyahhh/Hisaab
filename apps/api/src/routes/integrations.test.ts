@@ -611,3 +611,131 @@ describe('DELETE /v1/orgs/:id/integrations/:integrationId', () => {
     }
   });
 });
+
+describe('GET /v1/stores/:storeId/integrations', () => {
+  it('lists the store’s integrations without leaking encrypted credentials', async () => {
+    const app = appWith();
+    try {
+      const t = await tenant('list-ok');
+      const shop = shopFor('list-ok');
+      const state = await issueState(t, shop);
+      await app.inject({
+        method: 'GET',
+        url: `/v1/integrations/shopify/callback?shop=${shop}&code=c&state=${encodeURIComponent(state)}`,
+        headers: { cookie: t.cookie },
+      });
+      const [store] = await testDb
+        .select()
+        .from(schema.stores)
+        .where(eq(schema.stores.shopDomain, shop));
+
+      const res = await app.inject({
+        method: 'GET',
+        url: `/v1/stores/${store!.id}/integrations`,
+        headers: { cookie: t.cookie, origin: ORIGIN },
+      });
+      expect(res.statusCode).toBe(200);
+      const body = res.json() as { integrations: Array<Record<string, unknown>> };
+      expect(body.integrations).toHaveLength(1);
+      expect(body.integrations[0]).toMatchObject({ provider: 'shopify', status: 'active' });
+      expect(body.integrations[0]).not.toHaveProperty('encryptedCredentials');
+      expect(body.integrations[0]).not.toHaveProperty('encrypted_credentials');
+      expect(JSON.stringify(body)).not.toContain(DEFAULT_CREDENTIALS.accessToken);
+
+      const [integration] = await testDb
+        .select()
+        .from(schema.integrations)
+        .where(eq(schema.integrations.storeId, store!.id));
+      await testDb.delete(schema.integrations).where(eq(schema.integrations.id, integration!.id));
+      await testDb.delete(schema.stores).where(eq(schema.stores.id, store!.id));
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('denies a member without integrations.manage (viewer)', async () => {
+    const app = appWith();
+    try {
+      const owner = await tenant('list-viewer-owner');
+      const shop = shopFor('list-viewer');
+      const state = await issueState(owner, shop);
+      await app.inject({
+        method: 'GET',
+        url: `/v1/integrations/shopify/callback?shop=${shop}&code=c&state=${encodeURIComponent(state)}`,
+        headers: { cookie: owner.cookie },
+      });
+      const [store] = await testDb
+        .select()
+        .from(schema.stores)
+        .where(eq(schema.stores.shopDomain, shop));
+      const viewer = await addRealMember(testAuth, testDb, owner, 'list-viewer', 'viewer');
+      cleanups.push(() => cleanupRealMember(testDb, viewer));
+
+      const res = await app.inject({
+        method: 'GET',
+        url: `/v1/stores/${store!.id}/integrations`,
+        headers: { cookie: viewer.cookie, origin: ORIGIN },
+      });
+      expect(res.statusCode).toBe(403);
+
+      const [integration] = await testDb
+        .select()
+        .from(schema.integrations)
+        .where(eq(schema.integrations.storeId, store!.id));
+      await testDb.delete(schema.integrations).where(eq(schema.integrations.id, integration!.id));
+      await testDb.delete(schema.stores).where(eq(schema.stores.id, store!.id));
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('returns 404 for a nonexistent store id', async () => {
+    const app = appWith();
+    try {
+      const t = await tenant('list-not-found');
+      const res = await app.inject({
+        method: 'GET',
+        url: '/v1/stores/00000000-0000-0000-0000-000000000000/integrations',
+        headers: { cookie: t.cookie, origin: ORIGIN },
+      });
+      expect(res.statusCode).toBe(404);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("returns 404 for another organization's store (SPEC §5.10 test 7)", async () => {
+    const app = appWith();
+    try {
+      const tenantA = await tenant('list-foreign-a');
+      const tenantB = await tenant('list-foreign-b');
+      const shop = shopFor('list-foreign');
+      const state = await issueState(tenantB, shop);
+      await app.inject({
+        method: 'GET',
+        url: `/v1/integrations/shopify/callback?shop=${shop}&code=c&state=${encodeURIComponent(state)}`,
+        headers: { cookie: tenantB.cookie },
+      });
+      const [store] = await testDb
+        .select()
+        .from(schema.stores)
+        .where(eq(schema.stores.shopDomain, shop));
+
+      const res = await app.inject({
+        method: 'GET',
+        url: `/v1/stores/${store!.id}/integrations`,
+        headers: { cookie: tenantA.cookie, origin: ORIGIN },
+      });
+      expect(res.statusCode).toBe(404);
+
+      const [integration] = await testDb
+        .select()
+        .from(schema.integrations)
+        .where(eq(schema.integrations.storeId, store!.id));
+      await testDb.delete(schema.integrations).where(eq(schema.integrations.id, integration!.id));
+      await testDb.delete(schema.stores).where(eq(schema.stores.id, store!.id));
+    } finally {
+      await app.close();
+    }
+  });
+});
