@@ -7,7 +7,33 @@ export const PACKAGE_NAME = '@truepath/integrations';
 
 export {
   createShopifyAdapter,
+  ShopifyUnauthorizedError,
   type ShopifyAdapter,
   type ShopifyAdapterConfig,
 } from './shopify/adapter.js';
-export type { ShopifyCredentials, ShopifyHealthStatus, ShopifyShopInfo } from './shopify/types.js';
+export type {
+  ShopifyCredentials,
+  ShopifyHealthStatus,
+  ShopifyOrderSnapshot,
+  ShopifyShopInfo,
+} from './shopify/types.js';
+export {
+  DEFAULT_COD_MAPPING,
+  detectPaymentMethod,
+  exceedsMoneySanityBound,
+  filterNoteAttributes,
+  mapOrderSnapshot,
+  ORDER_MONEY_SANITY_BOUND_PAISE,
+  parseMoneyToPaise,
+  pincodePrefixFromZip,
+  type CodMapping,
+  type MappedOrderFields,
+  type NoteAttribute,
+} from './shopify/mapper.js';
+export {
+  ShopifyOrderHintWebhook,
+  ShopifyOrderWebhook,
+  snapshotFromOrderWebhook,
+  type ShopifyOrderHintPayload,
+  type ShopifyOrderWebhookPayload,
+} from './shopify/webhookSchemas.js';

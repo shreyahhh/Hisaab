@@ -49,9 +49,11 @@ export const orders = pgTable(
     noteAttributes: jsonb('note_attributes'),
     discountCodes: text('discount_codes').array(),
     isFirstOrder: boolean('is_first_order'),
-    attributionConfidence: attributionConfidenceEnum('attribution_confidence')
-      .notNull()
-      .default('high'),
+    // Nullable (M1-2): null means "identity-stitching hasn't run yet", distinct from either real
+    // value. Defaulting this to 'high' would assert a confidence level nothing has actually
+    // computed — identity-stitching (M1-7) is the only thing that ever sets 'high' or 'low', by
+    // resolving (or failing to resolve, and falling back to UTM) the order's visitor journey.
+    attributionConfidence: attributionConfidenceEnum('attribution_confidence'),
   },
   (table) => ({
     storeIdx: index('orders_store_id_idx').on(table.storeId),
@@ -97,6 +99,16 @@ export const orderStatusEvents = pgTable(
       table.orderId,
       table.source,
       table.occurredAt,
+    ),
+    // M1-2: the actual idempotency mechanism (shopify-integration.md §4.3) —
+    // `INSERT ... ON CONFLICT (order_id, source, raw_ref) DO NOTHING` is what decides duplicate vs.
+    // new at the database level; the webhook route's own delivery-dedup table is a fast-path only
+    // (issue #26). Plain (not NULLS NOT DISTINCT): every row this ticket inserts always sets
+    // raw_ref, but a future source without one shouldn't have its NULLs collide with each other.
+    orderSourceRawRefUnique: uniqueIndex('order_status_events_order_id_source_raw_ref_uniq').on(
+      table.orderId,
+      table.source,
+      table.rawRef,
     ),
     sourceCheck: checkOneOf('order_status_events_source_check', table.source, ORDER_STATUS_SOURCES),
   }),

@@ -254,37 +254,90 @@ row's *actual* id, which isn't known until the insert/update is about to happen.
 - `bulk_operations/finish`: `jobId`. `app/uninstalled`: covered by the delivery-level dedup; also naturally idempotent by state as a backstop.
 
 ### 4.4 Order snapshot apply and out-of-order guard
+
+**M1-2 implementation note**: the snapshot passed into this flow is always fully resolved *before*
+this section's transaction ever opens — straight from the REST payload for `orders/*`, or via a
+synchronous `fetchOrder` GraphQL call for `refunds/*`/`fulfillments/*` hints (§4.7). `orderRepository
+.applySnapshot` (`packages/db`) has no reference to the Shopify adapter at all, by construction, so
+it is structurally impossible for it to make a network call from inside its own transaction — this
+was a specific M1-2 review requirement, not an incidental design choice.
+
 1. `ts` = snapshot `updated_at` / `updatedAt`.
-2. One transaction: `SELECT … FOR UPDATE` on the order (insert if missing), then `last = max(occurred_at) FROM order_status_events WHERE order_id=? AND source='shopify'`.
-3. If `ts < last` → **stale**: record the event row only. If `ts ≥ last` → apply §4.5. Fields owned by other sources are never touched: `visitor_id`, `delivered_at`/`rto_at`, and the `in_transit`/`delivered`/`rto` statuses.
+2. One transaction, in this order (**not** the reverse — see the concurrency note below):
+   a. `INSERT ... ON CONFLICT (store_id, external_order_id) DO NOTHING`, using the snapshot's own
+      values. Guarantees the row exists without racing a bare "SELECT, then insert if missing."
+   b. `SELECT … FOR UPDATE` on the row — whichever of possibly several concurrent deliveries created
+      it, or found it already there. Every concurrent delivery for this order serializes here.
+   c. `last = max(occurred_at) FROM order_status_events WHERE order_id=? AND source='shopify'`.
+3. If `ts < last` → **stale**: record the event row only. If `ts ≥ last` → apply §4.5. Fields owned by
+   other sources are never touched: `visitor_id`, `delivered_at`/`rto_at`, and the
+   `in_transit`/`delivered`/`rto` statuses.
 4. HLD §8 precedence:
    - `cancelled_at` set **and** `delivery_status='pending'` → `cancelled`.
-   - `refunded_amount_paise` is set from `totalRefundedSet` (GraphQL snapshots) under the same guard and never changes `delivery_status`. Delivered revenue = `max(0, total − refunded)` when `delivered`.
-5. After commit, project the full current row to ClickHouse `order_status`, with `source_updated_at = max(order_status_events.occurred_at)` across all sources.
-6. A newly inserted order from `orders/create` → `IdentityStitchJob{attempt:0}`, plus a debounced `order_refresh` (for `customerJourneySummary`, and so that refunds are current). If the refresh finds `customerJourneySummary.ready = false`, it re-enqueues itself once with a 10 min delay. Backfilled orders get `attempt:2`.
-7. Webhooks only create orders with `created_at ≥ install_time − backfill days`.
+   - `refunded_amount_paise` is set from `totalRefundedSet` (GraphQL snapshots) under the same guard
+     and never changes `delivery_status`. Delivered revenue = `max(0, total − refunded)` when
+     `delivered`. A REST `orders/*` snapshot carries no `totalRefundedSet` at all — the repository
+     leaves the stored value untouched rather than resetting it to 0.
+5. **The actual idempotency decision** (issue #26) is `INSERT order_status_events (…, raw_ref)
+   ON CONFLICT (order_id, source, raw_ref) DO NOTHING` — a unique constraint added in M1-2 (it was
+   missing from the original schema; the webhook route's own delivery-dedup table, §4.3, is a
+   fast-path only and has an accepted race window under genuinely concurrent duplicate deliveries,
+   which this constraint closes). Two concurrent *first-ever* deliveries for the same new order are
+   both correct: step 2a's `ON CONFLICT DO NOTHING` means only one of them creates the row, and step
+   2b's lock serializes the rest.
+6. After commit, project the full current row to ClickHouse `order_status`, with
+   `source_updated_at = max(order_status_events.occurred_at)` across all sources — **not built in
+   M1-2** (no ClickHouse writer exists yet; tracked with the other M1-6 work).
+7. `IdentityStitchJob` enqueue on a new order — **not built in M1-2** (M1-7; no BullMQ queue exists
+   yet, issue #27). `is_first_order` and `note_attributes`' `customerJourneySummary`-based UTM
+   fallback are, for the same reason, **always** resolved via their documented fallback path in this
+   ticket (§4.5), not just when Shopify's own enrichment is unavailable. `attribution_confidence`
+   stays at its schema default (`NULL`, not `'high'`) until identity-stitching actually computes it —
+   setting it either way here would be asserting a confidence level nothing has computed (M1-7 must
+   backfill this column for orders M1-2 already created before it lands).
+8. Webhooks only create orders with `created_at ≥ install_time − backfill days` — **not enforced in
+   M1-2** (no install-time gating yet; every order webhook received is processed).
+
+**M1-2 implementation note**: this diagram shows the target end-state, including the ClickHouse
+projection and debounced-refresh queue neither of which M1-2 builds (§4.4 steps 6–7). What M1-2
+actually does for a hint webhook is call `fetchOrder` synchronously, inline in the request — no
+queue, no debounce, no delay — *before* opening any transaction, then applies the resulting full
+snapshot the same way an `orders/*` webhook would. See `apps/api/src/shopifyOrderCredentials.ts`
+(`fetchOrderWithTokenRefresh`) and `apps/api/src/routes/shopifyWebhooks.ts`
+(`handleOrderHintWebhook`). This keeps the response within Shopify's 5-second budget only because
+`fetchOrder` itself is capped at 2 attempts / a fixed 250 ms retry delay (§4.7) and fails fast
+(throws, relying on Shopify's own webhook retry) if Shopify's GraphQL API is still throttling past
+that — there is no BullMQ debounce to fall back on in M1-2, so a slow or throttled Shopify response
+is a webhook failure, not a deferred job. Issue #27 tracks adding the debounce once M1-6's queue
+infrastructure exists — it is more valuable there than as a delay in front of a call this ticket
+already makes synchronous.
 
 ```mermaid
 sequenceDiagram
   participant S as Shopify
   participant API as Core API /webhooks/shopify/:topic
+  participant SH as Shopify GraphQL (fetchOrder, hints only)
   participant PG as Postgres
   participant CH as ClickHouse order_status
   participant Q as shopify-sync / identity-stitch
   S->>API: orders/updated or refunds/create (HMAC, X-Shopify-Webhook-Id)
   API->>API: verify HMAC; parse; hash email/phone; drop raw
-  API->>PG: BEGIN; lock order; INSERT order_status_events(raw_ref) ON CONFLICT DO NOTHING
-  alt duplicate webhook id
+  opt partial hint (refunds/*, fulfillments/*)
+    API->>SH: fetchOrder (outside any transaction/lock; ≤2 attempts, 250ms delay, fails fast on sustained throttling)
+    SH-->>API: full ShopifyOrderSnapshot, or thrown error (Shopify retries the webhook)
+  end
+  API->>PG: BEGIN; INSERT order (ON CONFLICT DO NOTHING); SELECT ... FOR UPDATE; INSERT order_status_events(raw_ref) ON CONFLICT DO NOTHING
+  alt duplicate (order_id, source, raw_ref)
     API-->>S: 200 (no-op)
-  else full snapshot (orders/*) and T ≥ last shopify event
+  else T ≥ last shopify event
     API->>PG: apply mapping (+cancelled if pending); COMMIT
-    API->>CH: INSERT full row, source_updated_at = max over sources
+    API->>CH: INSERT full row, source_updated_at = max over sources — not built in M1-2 (M1-6)
     API-->>S: 200
-  else partial hint (refunds/*, fulfillments/*) or stale
+  else stale (T < last shopify event)
     API->>PG: keep event row only; COMMIT
-    API->>Q: order_refresh (jobId shopify-refresh:<store>:<order>, delay 30 s — debounced)
     API-->>S: 200
   end
+  Note over API,Q: order_refresh / IdentityStitchJob enqueue — not built in M1-2 (M1-7, issue #27)
 ```
 
 ### 4.5 Field mapping (`ShopifyOrderSnapshot` → `orders`)
@@ -293,9 +346,9 @@ sequenceDiagram
 |---|---|---|
 | `external_order_id` | `id` / GID numeric part | string |
 | `created_at_platform` | `created_at` | UTC |
-| `total_amount_paise` | `total_price` / `totalPriceSet.shopMoney.amount` | Decimal string → integer paise with **no float**: split on `.`, right-pad the fraction to 2 digits, `BigInt(int) * 100n + BigInt(frac)` |
-| `refunded_amount_paise` | `totalRefundedSet.shopMoney.amount` (GraphQL snapshots only) | same parser; unchanged by webhook snapshots |
-| `currency` | `currency` | expected `INR`; others stored and flagged on the health screen |
+| `total_amount_paise` | `total_price` / `totalPriceSet.shopMoney.amount` | Decimal string → integer paise with **no float**: `parseMoneyToPaise` (`packages/integrations/src/shopify/mapper.ts`) splits on `.`, right-pads/truncates the fraction to 2 digits, and combines whole+fraction with plain JS `number` arithmetic (`mode: 'number'` on the Drizzle bigint column — a safe integer, not a `BigInt`; SPEC money values never approach `Number.MAX_SAFE_INTEGER`). A parsed value ≥ `ORDER_MONEY_SANITY_BOUND_PAISE` (₹10,00,00,000, i.e. `1_000_000_000` paise) is stored as-is but logged (`order_id`, `store_id`, no amount) so a parser bug doesn't scale silently. |
+| `refunded_amount_paise` | `totalRefundedSet.shopMoney.amount` (GraphQL snapshots only) | same parser; a REST `orders/*` snapshot carries no field for this at all, so the repository leaves the previously stored value untouched rather than treating "absent" as "zero" |
+| `currency` | `currency` | **M1-2 decision (review item 5): non-`INR` orders are rejected, not stored.** No downstream code (attribution, reports, `store_delivery_rates`) is currency-aware, so a merchant with a non-INR ad account or a stray non-INR order would have silently wrong paise values compounding into every rollup — the same failure mode SPEC §2/§15 already rejects for non-INR *ad accounts*. The handler checks `store.currency === 'INR'` **before** any money parsing and, if it fails, records only the `order_status_events` row (topic, timestamp) and skips `applyOrderSnapshot` entirely: no `orders` row, no amount, for that delivery. Revisit only if a design partner actually needs multi-currency, as a new ticket + ADR, not silently. |
 | `payment_method` | gateways (§4.6) | `cod`\|`prepaid`\|`partial_cod` |
 | `financial_status` / `fulfilment_status` | `financial_status` / `display*` | lowercased; `null` fulfilment → `unfulfilled` |
 | `delivery_status` | `pending` on insert; §4.4 step 4 | Shiprocket owns the rest |
@@ -305,10 +358,18 @@ sequenceDiagram
 | `landing_site` | `landing_site`, else `customerJourneySummary.lastVisit.landingPage`, else `firstVisit.landingPage` | `sanitiseUrl` |
 | `referring_site` | `referring_site`, else `lastVisit.referrerUrl` | `sanitiseUrl`, origin + path |
 | `note_attributes` | `note_attributes` / `customAttributes`, plus `lastVisit.utmParameters` when the landing page has no UTMs | **allowlist**: keys `utm_source\|medium\|campaign\|content\|term`, `fbclid\|gclid\|gbraid\|wbraid` only; everything else dropped |
-| `discount_codes` | codes | as-is (Open question 2) |
-| `is_first_order` | `customerJourneySummary.customerOrderIndex` ("position of the current order within the customer's order history") | `= 1` → `true`. When unavailable (`ready = false` after the retry, or `null` for guests) → `true` unless an earlier order in `orders` has the same phone/email HMAC. Set from the first refresh after create; not recomputed later. |
+| `discount_codes` | codes | as-is (approved: codes can be personalized, e.g. `RAHUL10` — issue #25 now tracks that erasure must cover this column too) |
+| `is_first_order` | `customerJourneySummary.customerOrderIndex` ("position of the current order within the customer's order history") | `= 1` → `true`. **In M1-2** `customerJourneySummary` is never queried at all (`ORDER_QUERY` in `adapter.ts` omits it — no BullMQ refresh job exists yet to re-check `ready`), so this field always takes the fallback path: `true` unless an earlier order in `orders` has the same phone/email HMAC. Once M1-6/M1-7 land the refresh job, this becomes the primary path and the fallback stays for guests/`ready=false`. |
+| `attribution_confidence` | — | Left `NULL` (schema default; **not** `'high'`) by every M1-2 write path. Asserting a confidence level before identity-stitching (M1-7) has run would be asserting something nothing computed. M1-7 must backfill this column for every order M1-2 creates before it lands (tracked on the M1-7 issue). |
 
 **Erased identity at webhook time** (HLD §6b): if any computed HMAC (under every read key version) is in `suppress:<s>:erased:identity`, both hashes are stored `NULL`, no stitch job is enqueued, and the order counts toward revenue totals only.
+
+**Validation failures never log received values** (M1-2 review item 6): a payload that fails its zod
+schema (`webhookSchemas.ts`) is logged with only the issue's field `path` (e.g. `total_price`,
+`shipping_address.zip`) — never `.message` or the value itself, since a zod message can echo the
+input it rejected. `reportValidationFailure` / `zodIssuePaths` in `shopifyWebhooks.ts` enforce this;
+`shopifyWebhooks.test.ts` plants a distinctive "poison" string in an invalid field and asserts it
+never appears in the captured log output.
 
 ### 4.6 COD detection
 - Config `integrations.settings.cod_mapping = { cod: string[], partial_cod: string[], prepaid: string[] }`, as lowercase substrings, editable through `PUT /v1/integrations/:id/settings`.
@@ -339,7 +400,10 @@ sequenceDiagram
   - `ordersUpdatedSince(last_reconcile_at − 1 h)`, 250 per page, applied through §4.4. More than 10,000 changed orders → bulk instead.
   - Refreshes `shop_hosts` and republishes the collector config on change. Keeps the refresh token in use.
   - **Consent-region check** (SPEC v0.6, if the scope is approved): `consentPolicy(countryCode: IN) { consentRequired }` ([consentPolicy](https://shopify.dev/docs/api/admin-graphql/latest/queries/consentPolicy)). `consentRequired = false` → republish the collector config `inactive` (`consent_policy_not_required`), with a banner and email (privacy-dpdp §4.13). The query also runs at onboarding step 8. The required access scope isn't documented — **VERIFY** in a dev store (pending in HLD §8).
-- **`order_refresh`**: `fetchOrder` → §4.4 (debounced as in §2.6).
+- **`order_refresh`**: `fetchOrder` → §4.4 (debounced as in §2.6). **Not built in M1-2**: M1-2's
+  `refunds/*`/`fulfillments/*` handlers call `fetchOrder` synchronously inline instead (§4.4), since
+  no `shopify-sync` queue exists yet to debounce into. Issue #27 tracks adding this job and moving
+  hint-triggered refreshes onto it.
 - **Rate limits** ([GraphQL rate limits](https://shopify.dev/docs/apps/build/apis/graphql-admin/rate-limits)):
   - The calculated-cost leaky bucket restores 100 points/s (Standard), 200 (Advanced), 1,000 (Plus), 2,000 (Commerce Components).
   - A single query may not exceed 1,000 points.
@@ -376,10 +440,10 @@ sequenceDiagram
 | Protected data present (last 20 orders have any email/phone hash) | "Protected customer data not approved — attribution and CAPI limited" |
 | Pixel installed (`settings.pixel_id` exists via the `webPixel` query) | "Pixel missing — reinstall" |
 | **Consent region** (SPEC v0.6): India opt-in confirmed; `consentPolicy(IN).consentRequired` (if available); default-on signal (`consent_health`) | "Tracking disabled: confirm India requires opt-in" / "India isn't set to require consent" / "Many visitors tracked without banner interaction" |
-| **Pixel coverage** (last 7 days): orders with `attribution_confidence='high'` ÷ all orders (reporting-api §4.2) | < 50% warn, < 25% error: "Only 31% of orders matched a tracked visit — check your consent banner and that the pixel is installed" |
+| **Pixel coverage** (last 7 days): orders with `attribution_confidence='high'` ÷ all orders (reporting-api §4.2) | < 50% warn, < 25% error: "Only 31% of orders matched a tracked visit — check your consent banner and that the pixel is installed". `attribution_confidence` is `NULL` for every order until M1-7's identity-stitching sets it (§4.5), so this check reads 0% until M1-7 lands — expected, not an M1-2 bug. |
 | Last webhook < 24 h (if orders exist) | "No Shopify webhooks in 24 h" |
 | Unmapped gateways | list with COD / prepaid choice |
-| Currency ≠ INR | informational |
+| Currency ≠ INR | **M1-2 decision (§4.5): non-INR orders are rejected outright, not stored-and-flagged as this row previously said.** Shown as "Orders skipped: store currency isn't INR — N orders since <date> weren't recorded" once M2-4 builds this screen; M1-2 itself only logs the skip (`order_status_events` row only, no `orders` row). |
 
 ## 5. Failure modes
 

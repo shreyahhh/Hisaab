@@ -38,6 +38,8 @@ export interface IntegrationRepository {
   ): Promise<IntegrationRow | null>;
   /** `app/uninstalled` webhook (store-scoped — the caller has no organization id yet). */
   markUninstalled(scope: Scope, storeId: string): Promise<IntegrationRow | null>;
+  /** The store's active integration for a provider (job-scope-friendly — no organization id needed). */
+  getActiveByStore(scope: Scope, storeId: string, provider: string): Promise<IntegrationRow | null>;
 }
 
 /** The only sanctioned way to read/write `integrations` (ADR-0016) — every method requires a Scope. */
@@ -63,13 +65,14 @@ export function createIntegrationRepository(db: Db): IntegrationRepository {
     async upsertShopify(scope, input) {
       assertStoreInScope(scope, input.storeId);
       return db.transaction(async (tx) => {
-        // Serialises concurrent connect/re-auth attempts for the same store (shopify-integration.md
-        // §4.1 step 3 uses the same advisory-lock pattern for token refresh). Without it, two
-        // concurrent callbacks could both resolve "no existing row", pick different candidate ids,
-        // and encrypt against a candidate that Postgres's ON CONFLICT then discards — corrupting the
-        // AAD binding for whichever one loses the race.
+        // Serialises concurrent writers for the same store's Shopify integration row — connect,
+        // re-auth, and (M1-2) a token refresh triggered by an order-hint webhook all go through this
+        // same method. Without it, two concurrent writers could both resolve "no existing row" (or
+        // both read the same pre-refresh id), pick different candidate ids, and encrypt against a
+        // candidate that Postgres's ON CONFLICT then discards — corrupting the AAD binding for
+        // whichever one loses the race.
         await tx.execute(
-          sql`select pg_advisory_xact_lock(hashtext(${`shopify-connect:${input.storeId}`}))`,
+          sql`select pg_advisory_xact_lock(hashtext(${`shopify-integration:${input.storeId}`}))`,
         );
 
         const existingRows = await tx
@@ -134,6 +137,22 @@ export function createIntegrationRepository(db: Db): IntegrationRepository {
         .where(and(eq(integrations.storeId, storeId), eq(integrations.provider, 'shopify')))
         .returning();
       return row ?? null;
+    },
+
+    async getActiveByStore(scope, storeId, provider) {
+      assertStoreInScope(scope, storeId);
+      const rows = await db
+        .select()
+        .from(integrations)
+        .where(
+          and(
+            eq(integrations.storeId, storeId),
+            eq(integrations.provider, provider),
+            eq(integrations.status, 'active'),
+          ),
+        )
+        .limit(1);
+      return rows[0] ?? null;
     },
   };
 }

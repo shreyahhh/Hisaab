@@ -136,6 +136,7 @@ export function buildApp(deps: AppDeps): FastifyInstance {
     registerShopifyWebhookRoutes(scope, tenantDeps, {
       adapter: deps.shopify.adapter,
       hasher: deps.shopify.hasher,
+      cipher: deps.shopify.cipher,
     });
   });
 

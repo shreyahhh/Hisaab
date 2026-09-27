@@ -2,7 +2,11 @@ import { createHmac } from 'node:crypto';
 import { HttpResponse, http } from 'msw';
 import { setupServer } from 'msw/node';
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
-import { createShopifyAdapter, type ShopifyAdapterConfig } from './adapter.js';
+import {
+  createShopifyAdapter,
+  ShopifyUnauthorizedError,
+  type ShopifyAdapterConfig,
+} from './adapter.js';
 import type { ShopifyCredentials } from './types.js';
 
 const SHOP = 'test-shop.myshopify.com';
@@ -223,5 +227,208 @@ describe('createShopifyAdapter: verifyWebhook', () => {
   it('rejects an empty header', () => {
     const adapter = createShopifyAdapter(CONFIG);
     expect(adapter.verifyWebhook(Buffer.from('{}'), '')).toBe(false);
+  });
+});
+
+describe('createShopifyAdapter: fetchOrder', () => {
+  const creds: ShopifyCredentials = {
+    accessToken: 'shpat_abc123',
+    accessTokenExpiresAt: new Date().toISOString(),
+    refreshToken: 'shprt_def456',
+    refreshTokenExpiresAt: new Date().toISOString(),
+    scope: 'read_orders',
+  };
+
+  const ORDER_NODE = {
+    id: 'gid://shopify/Order/1001',
+    createdAt: '2026-09-01T10:00:00Z',
+    updatedAt: '2026-09-01T10:05:00Z',
+    cancelledAt: null,
+    email: 'shopper@example.com',
+    phone: '+919812345670',
+    totalPriceSet: { shopMoney: { amount: '1299.00', currencyCode: 'INR' } },
+    totalRefundedSet: { shopMoney: { amount: '0.00' } },
+    totalOutstandingSet: { shopMoney: { amount: '0.00' } },
+    paymentGatewayNames: ['razorpay'],
+    displayFinancialStatus: 'PAID',
+    displayFulfillmentStatus: 'UNFULFILLED',
+    discountCodes: ['RAHUL10'],
+    shippingAddress: { zip: '560034', phone: '+919812345670' },
+  };
+
+  it('fetches and maps a GraphQL order snapshot with the access token header', async () => {
+    let receivedToken: string | null = null;
+    let receivedVariables: unknown;
+    server.use(
+      http.post(`https://${SHOP}/admin/api/*/graphql.json`, async ({ request }) => {
+        receivedToken = request.headers.get('X-Shopify-Access-Token');
+        const body = (await request.json()) as { variables?: unknown };
+        receivedVariables = body.variables;
+        return HttpResponse.json({ data: { order: ORDER_NODE } });
+      }),
+    );
+    const adapter = createShopifyAdapter(CONFIG);
+    const snapshot = await adapter.fetchOrder(SHOP, creds, '1001');
+
+    expect(receivedToken).toBe('shpat_abc123');
+    expect(receivedVariables).toEqual({ id: 'gid://shopify/Order/1001' });
+    expect(snapshot).toEqual({
+      externalOrderId: '1001',
+      createdAtPlatform: '2026-09-01T10:00:00Z',
+      updatedAtPlatform: '2026-09-01T10:05:00Z',
+      cancelledAt: null,
+      currency: 'INR',
+      totalPrice: '1299.00',
+      totalRefunded: '0.00',
+      totalOutstanding: '0.00',
+      financialStatus: 'PAID',
+      fulfillmentStatus: 'UNFULFILLED',
+      paymentGatewayNames: ['razorpay'],
+      email: 'shopper@example.com',
+      phone: '+919812345670',
+      shippingAddressZip: '560034',
+      landingSite: null,
+      referringSite: null,
+      noteAttributes: [],
+      discountCodes: ['RAHUL10'],
+    });
+  });
+
+  it('returns null when Shopify has no such order (data.order: null)', async () => {
+    server.use(
+      http.post(`https://${SHOP}/admin/api/*/graphql.json`, () =>
+        HttpResponse.json({ data: { order: null } }),
+      ),
+    );
+    const adapter = createShopifyAdapter(CONFIG);
+    expect(await adapter.fetchOrder(SHOP, creds, '999999')).toBeNull();
+  });
+
+  it('falls back to shippingAddress.phone when the top-level phone is null', async () => {
+    server.use(
+      http.post(`https://${SHOP}/admin/api/*/graphql.json`, () =>
+        HttpResponse.json({ data: { order: { ...ORDER_NODE, phone: null } } }),
+      ),
+    );
+    const adapter = createShopifyAdapter(CONFIG);
+    const snapshot = await adapter.fetchOrder(SHOP, creds, '1001');
+    expect(snapshot?.phone).toBe('+919812345670');
+  });
+
+  it('throws immediately on a non-throttled, non-2xx response (no retry)', async () => {
+    let callCount = 0;
+    server.use(
+      http.post(`https://${SHOP}/admin/api/*/graphql.json`, () => {
+        callCount += 1;
+        return HttpResponse.json(
+          { errors: [{ message: 'Internal Server Error' }] },
+          { status: 500 },
+        );
+      }),
+    );
+    const adapter = createShopifyAdapter(CONFIG);
+    await expect(adapter.fetchOrder(SHOP, creds, '1001')).rejects.toThrow('500');
+    expect(callCount).toBe(1);
+  });
+
+  it('throws immediately on a non-throttled GraphQL error (no retry)', async () => {
+    let callCount = 0;
+    server.use(
+      http.post(`https://${SHOP}/admin/api/*/graphql.json`, () => {
+        callCount += 1;
+        return HttpResponse.json({
+          errors: [{ message: 'Field is protected' }],
+          data: { order: null },
+        });
+      }),
+    );
+    const adapter = createShopifyAdapter(CONFIG);
+    // A non-throttled error alongside usable `data.order: null` still parses fine and returns null
+    // (Shopify's protected-field-denial shape is exactly this: null value + an ignorable error entry).
+    expect(await adapter.fetchOrder(SHOP, creds, '1001')).toBeNull();
+    expect(callCount).toBe(1);
+  });
+
+  it('retries exactly once on a throttled (HTTP 429) response, then succeeds if it clears', async () => {
+    let callCount = 0;
+    server.use(
+      http.post(`https://${SHOP}/admin/api/*/graphql.json`, () => {
+        callCount += 1;
+        if (callCount === 1) {
+          return HttpResponse.json({ errors: [{ message: 'Throttled' }] }, { status: 429 });
+        }
+        return HttpResponse.json({ data: { order: ORDER_NODE } });
+      }),
+    );
+    const adapter = createShopifyAdapter(CONFIG);
+    const snapshot = await adapter.fetchOrder(SHOP, creds, '1001');
+    expect(callCount).toBe(2);
+    expect(snapshot?.externalOrderId).toBe('1001');
+  });
+
+  it('retries exactly once on a throttled 200-with-errors response (GraphQL-level throttling)', async () => {
+    let callCount = 0;
+    server.use(
+      http.post(`https://${SHOP}/admin/api/*/graphql.json`, () => {
+        callCount += 1;
+        if (callCount === 1) {
+          return HttpResponse.json({
+            errors: [{ message: 'Throttled' }],
+            extensions: { cost: {} },
+          });
+        }
+        return HttpResponse.json({ data: { order: ORDER_NODE } });
+      }),
+    );
+    const adapter = createShopifyAdapter(CONFIG);
+    await adapter.fetchOrder(SHOP, creds, '1001');
+    expect(callCount).toBe(2);
+  });
+
+  it('fails fast (throws) after exhausting retries under sustained throttling, staying well under a 5s budget', async () => {
+    let callCount = 0;
+    server.use(
+      http.post(`https://${SHOP}/admin/api/*/graphql.json`, () => {
+        callCount += 1;
+        return HttpResponse.json({ errors: [{ message: 'Throttled' }] }, { status: 429 });
+      }),
+    );
+    const adapter = createShopifyAdapter(CONFIG);
+    const start = Date.now();
+    await expect(adapter.fetchOrder(SHOP, creds, '1001')).rejects.toThrow(/throttled/i);
+    const elapsedMs = Date.now() - start;
+
+    // Exactly one retry, not an unbounded loop.
+    expect(callCount).toBe(2);
+    // Well under Shopify's 5s webhook timeout even with real (loopback) network overhead.
+    expect(elapsedMs).toBeLessThan(2000);
+  });
+});
+
+describe('createShopifyAdapter: fetchOrder — 401 (expired token)', () => {
+  const creds: ShopifyCredentials = {
+    accessToken: 'shpat_expired',
+    accessTokenExpiresAt: new Date(0).toISOString(),
+    refreshToken: 'shprt_def456',
+    refreshTokenExpiresAt: new Date().toISOString(),
+    scope: 'read_orders',
+  };
+
+  it('throws ShopifyUnauthorizedError, distinguishable from other failures, with no retry', async () => {
+    let callCount = 0;
+    server.use(
+      http.post(`https://${SHOP}/admin/api/*/graphql.json`, () => {
+        callCount += 1;
+        return HttpResponse.json(
+          { errors: [{ message: 'Invalid API key or access token' }] },
+          { status: 401 },
+        );
+      }),
+    );
+    const adapter = createShopifyAdapter(CONFIG);
+    await expect(adapter.fetchOrder(SHOP, creds, '1001')).rejects.toBeInstanceOf(
+      ShopifyUnauthorizedError,
+    );
+    expect(callCount).toBe(1);
   });
 });

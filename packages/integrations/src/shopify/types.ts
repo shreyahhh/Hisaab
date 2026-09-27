@@ -1,6 +1,7 @@
-// Shopify adapter types (shopify-integration.md §2.7, SPEC §8's IntegrationAdapter). This ticket
-// (M1-1) implements only what OAuth install/uninstall needs; upsertWebPixel, startBulkOrders,
-// bulkResultUrl, ordersUpdatedSince, fetchOrder and fetchOrderContact land with M1-2/M1-3/M1-4.
+// Shopify adapter types (shopify-integration.md §2.7, SPEC §8's IntegrationAdapter). M1-1 covered
+// OAuth install/uninstall; M1-2 adds order-webhook mapping (fetchOrder, ShopifyOrderSnapshot).
+// upsertWebPixel, startBulkOrders, bulkResultUrl, ordersUpdatedSince and fetchOrderContact still
+// land with M1-3/M1-4.
 
 /** Stored only in `integrations.encrypted_credentials` (ADR-0023), never in `settings`. */
 export interface ShopifyCredentials {
@@ -20,4 +21,34 @@ export interface ShopifyShopInfo {
 export interface ShopifyHealthStatus {
   readonly healthy: boolean;
   readonly reason?: string;
+}
+
+/**
+ * Unified order shape both the REST webhook payload and the GraphQL `fetchOrder` response are
+ * converted into (shopify-integration.md §2.5), so `mapper.ts`'s field mapping is a single pure
+ * function regardless of which source produced the data. Money fields are decimal strings (e.g.
+ * `"1299.00"`), never parsed here — `parseMoneyToPaise` (mapper.ts) owns that, with no float path.
+ */
+export interface ShopifyOrderSnapshot {
+  readonly externalOrderId: string;
+  readonly createdAtPlatform: string; // ISO 8601
+  /** The snapshot's own version timestamp — what the out-of-order guard compares. */
+  readonly updatedAtPlatform: string; // ISO 8601
+  readonly cancelledAt: string | null; // ISO 8601
+  readonly currency: string; // ISO 4217, e.g. "INR"
+  readonly totalPrice: string;
+  /** GraphQL only (`totalRefundedSet`) — null from a REST webhook snapshot (LLD §2.5). */
+  readonly totalRefunded: string | null;
+  readonly totalOutstanding: string | null;
+  readonly financialStatus: string | null;
+  readonly fulfillmentStatus: string | null;
+  readonly paymentGatewayNames: readonly string[];
+  /** Protected customer data (Level 2, docs/m0-7-external-setup.md item 3) — null when unapproved. */
+  readonly email: string | null;
+  readonly phone: string | null;
+  readonly shippingAddressZip: string | null;
+  readonly landingSite: string | null;
+  readonly referringSite: string | null;
+  readonly noteAttributes: readonly { readonly name: string; readonly value: string | null }[];
+  readonly discountCodes: readonly string[];
 }

@@ -81,6 +81,9 @@ function fakeShopifyAdapter(options: FakeAdapterOptions = {}): ShopifyAdapter {
       return { healthy: true };
     },
     verifyWebhook: () => true,
+    async fetchOrder() {
+      return null;
+    },
   };
 }
 

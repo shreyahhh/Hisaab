@@ -1,9 +1,57 @@
 import { createHmac, randomUUID } from 'node:crypto';
 import { cleanupTestTenant, seedTestTenant, type TestTenant } from '@truepath/db/testing';
 import { createIntegrationRepository, jobScope, schema, type Db } from '@truepath/db';
+import type { ShopifyAdapter, ShopifyOrderSnapshot } from '@truepath/integrations';
 import { eq } from 'drizzle-orm';
 import { afterEach, describe, expect, it } from 'vitest';
-import { buildTestApp, testCredentialsCipher, testDb } from '../testApp.js';
+import { buildTestApp, testCredentialsCipher, testDb, testShopify } from '../testApp.js';
+
+/** A minimal, schema-valid INR order payload (shopify-integration.md §2.5). */
+function orderWebhookPayload(overrides: Record<string, unknown> = {}) {
+  return {
+    id: 1001,
+    created_at: '2026-09-01T10:00:00+05:30',
+    updated_at: '2026-09-01T10:00:00+05:30',
+    cancelled_at: null,
+    currency: 'INR',
+    total_price: '1299.00',
+    financial_status: 'paid',
+    fulfillment_status: null,
+    payment_gateway_names: ['razorpay'],
+    ...overrides,
+  };
+}
+
+/** A ShopifyAdapter whose fetchOrder is controllable, for the refund/fulfillment hint tests. */
+function appWithFetchOrder(fetchOrderImpl: ShopifyAdapter['fetchOrder']) {
+  return buildTestApp({
+    shopify: { ...testShopify, adapter: { ...testShopify.adapter, fetchOrder: fetchOrderImpl } },
+  });
+}
+
+function graphQlSnapshot(overrides: Partial<ShopifyOrderSnapshot> = {}): ShopifyOrderSnapshot {
+  return {
+    externalOrderId: '1001',
+    createdAtPlatform: '2026-09-01T10:00:00Z',
+    updatedAtPlatform: '2026-09-01T10:05:00Z',
+    cancelledAt: null,
+    currency: 'INR',
+    totalPrice: '1299.00',
+    totalRefunded: '100.00',
+    totalOutstanding: '0.00',
+    financialStatus: 'PAID',
+    fulfillmentStatus: 'UNFULFILLED',
+    paymentGatewayNames: ['razorpay'],
+    email: null,
+    phone: null,
+    shippingAddressZip: null,
+    landingSite: null,
+    referringSite: null,
+    noteAttributes: [],
+    discountCodes: [],
+    ...overrides,
+  };
+}
 
 /**
  * Wraps `realDb` so its *first* `.update(...)` call throws instead of running — simulating a
@@ -131,8 +179,8 @@ describe('POST /webhooks/shopify/:topic — HMAC and shop resolution', () => {
     expect(row?.status).not.toBe('uninstalled');
   });
 
-  it('acknowledges an orders/* webhook without changing anything (M1-2/M1-3 handles these)', async () => {
-    const t = await tenant('webhook-orders-noop');
+  it('acknowledges a valid orders/create webhook with 200', async () => {
+    const t = await tenant('webhook-orders-ack');
     const [store] = await testDb
       .select()
       .from(schema.stores)
@@ -141,19 +189,19 @@ describe('POST /webhooks/shopify/:topic — HMAC and shop resolution', () => {
       topic: 'orders',
       shopifyTopic: 'orders/create',
       shopDomain: store!.shopDomain,
-      body: { id: 1 },
+      body: orderWebhookPayload(),
     });
     expect(res.statusCode).toBe(200);
   });
 
-  it('records exactly one delivery for a replayed orders/* webhook, even though it is a no-op today', async () => {
+  it('records exactly one delivery for a replayed orders/* webhook', async () => {
     const t = await tenant('webhook-orders-dedup');
     const [store] = await testDb
       .select()
       .from(schema.stores)
       .where(eq(schema.stores.id, t.storeId));
     const webhookId = randomUUID();
-    const body = { id: 1 };
+    const body = orderWebhookPayload();
     await sendWebhook({
       topic: 'orders',
       shopifyTopic: 'orders/create',
@@ -558,5 +606,402 @@ describe('CSRF-hook exemption stays scoped to /webhooks/ (app.ts)', () => {
       },
     });
     expect(res.statusCode).toBe(200);
+  });
+});
+
+describe('POST /webhooks/shopify/orders — real snapshot apply (M1-2)', () => {
+  it('orders/create stores the order with hashed identity and parsed money', async () => {
+    const t = await tenant('webhook-orders-create-real');
+    const [store] = await testDb
+      .select()
+      .from(schema.stores)
+      .where(eq(schema.stores.id, t.storeId));
+    await sendWebhook({
+      topic: 'orders',
+      shopifyTopic: 'orders/create',
+      shopDomain: store!.shopDomain,
+      body: orderWebhookPayload({
+        email: 'shopper@example.com',
+        phone: '+919812345670',
+        shipping_address: { zip: '560034', phone: '+919812345670' },
+      }),
+    });
+
+    const rows = await testDb
+      .select()
+      .from(schema.orders)
+      .where(eq(schema.orders.storeId, t.storeId));
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.totalAmountPaise).toBe(129900);
+    expect(rows[0]?.pincodePrefix).toBe('560');
+    expect(rows[0]?.phoneHashHmac).toMatch(/^k\d+:[0-9a-f]{64}$/);
+    expect(JSON.stringify(rows[0])).not.toContain('shopper@example.com');
+  });
+
+  it('orders/updated updates the existing order rather than creating a second one', async () => {
+    const t = await tenant('webhook-orders-update-real');
+    const [store] = await testDb
+      .select()
+      .from(schema.stores)
+      .where(eq(schema.stores.id, t.storeId));
+    await sendWebhook({
+      topic: 'orders',
+      shopifyTopic: 'orders/create',
+      shopDomain: store!.shopDomain,
+      body: orderWebhookPayload({ financial_status: 'pending' }),
+    });
+    await sendWebhook({
+      topic: 'orders',
+      shopifyTopic: 'orders/updated',
+      shopDomain: store!.shopDomain,
+      body: orderWebhookPayload({
+        financial_status: 'paid',
+        updated_at: '2026-09-01T11:00:00+05:30',
+      }),
+    });
+
+    const rows = await testDb
+      .select()
+      .from(schema.orders)
+      .where(eq(schema.orders.storeId, t.storeId));
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.financialStatus).toBe('paid');
+  });
+
+  it('orders/cancelled cancels a pending order', async () => {
+    const t = await tenant('webhook-orders-cancel-real');
+    const [store] = await testDb
+      .select()
+      .from(schema.stores)
+      .where(eq(schema.stores.id, t.storeId));
+    await sendWebhook({
+      topic: 'orders',
+      shopifyTopic: 'orders/create',
+      shopDomain: store!.shopDomain,
+      body: orderWebhookPayload(),
+    });
+    await sendWebhook({
+      topic: 'orders',
+      shopifyTopic: 'orders/cancelled',
+      shopDomain: store!.shopDomain,
+      body: orderWebhookPayload({
+        cancelled_at: '2026-09-01T11:00:00+05:30',
+        updated_at: '2026-09-01T11:00:00+05:30',
+      }),
+    });
+    const [row] = await testDb
+      .select()
+      .from(schema.orders)
+      .where(eq(schema.orders.storeId, t.storeId));
+    expect(row?.deliveryStatus).toBe('cancelled');
+  });
+
+  it('a stale (older) orders/updated does not overwrite newer state', async () => {
+    const t = await tenant('webhook-orders-stale-real');
+    const [store] = await testDb
+      .select()
+      .from(schema.stores)
+      .where(eq(schema.stores.id, t.storeId));
+    await sendWebhook({
+      topic: 'orders',
+      shopifyTopic: 'orders/updated',
+      shopDomain: store!.shopDomain,
+      body: orderWebhookPayload({
+        financial_status: 'paid',
+        updated_at: '2026-09-01T12:00:00+05:30',
+      }),
+    });
+    await sendWebhook({
+      topic: 'orders',
+      shopifyTopic: 'orders/updated',
+      shopDomain: store!.shopDomain,
+      body: orderWebhookPayload({
+        financial_status: 'pending',
+        updated_at: '2026-09-01T09:00:00+05:30',
+      }),
+    });
+    const [row] = await testDb
+      .select()
+      .from(schema.orders)
+      .where(eq(schema.orders.storeId, t.storeId));
+    expect(row?.financialStatus).toBe('paid');
+  });
+});
+
+describe('POST /webhooks/shopify/orders — non-INR currency (M1-2 review item 5)', () => {
+  it('skips storing a non-INR order rather than converting it to a wrong paise value', async () => {
+    const t = await tenant('webhook-orders-non-inr');
+    const [store] = await testDb
+      .select()
+      .from(schema.stores)
+      .where(eq(schema.stores.id, t.storeId));
+    const res = await sendWebhook({
+      topic: 'orders',
+      shopifyTopic: 'orders/create',
+      shopDomain: store!.shopDomain,
+      body: orderWebhookPayload({ currency: 'USD', total_price: '50.00' }),
+    });
+    expect(res.statusCode).toBe(200); // acknowledged — retrying wouldn't change the currency
+
+    const rows = await testDb
+      .select()
+      .from(schema.orders)
+      .where(eq(schema.orders.storeId, t.storeId));
+    expect(rows).toHaveLength(0);
+  });
+
+  it('still processes a subsequent INR order for the same store normally', async () => {
+    const t = await tenant('webhook-orders-non-inr-then-inr');
+    const [store] = await testDb
+      .select()
+      .from(schema.stores)
+      .where(eq(schema.stores.id, t.storeId));
+    await sendWebhook({
+      topic: 'orders',
+      shopifyTopic: 'orders/create',
+      shopDomain: store!.shopDomain,
+      body: orderWebhookPayload({ id: 2001, currency: 'USD', total_price: '50.00' }),
+    });
+    await sendWebhook({
+      topic: 'orders',
+      shopifyTopic: 'orders/create',
+      shopDomain: store!.shopDomain,
+      body: orderWebhookPayload({ id: 2002, currency: 'INR' }),
+    });
+    const rows = await testDb
+      .select()
+      .from(schema.orders)
+      .where(eq(schema.orders.storeId, t.storeId));
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.externalOrderId).toBe('2002');
+  });
+});
+
+describe('POST /webhooks/shopify/orders — validation failures log field paths only (M1-2 review item 6)', () => {
+  it('logs only field paths, never the received value, for an invalid payload', async () => {
+    const t = await tenant('webhook-orders-validation-log');
+    const [store] = await testDb
+      .select()
+      .from(schema.stores)
+      .where(eq(schema.stores.id, t.storeId));
+    const poisonValue = 'super-secret-poison-value-should-never-be-logged';
+    const originalConsoleError = console.error;
+    const logged: string[] = [];
+    console.error = (...args: unknown[]) => logged.push(args.map(String).join(' '));
+    try {
+      const res = await sendWebhook({
+        topic: 'orders',
+        shopifyTopic: 'orders/create',
+        shopDomain: store!.shopDomain,
+        body: orderWebhookPayload({ total_price: poisonValue }), // fails the money-string regex
+      });
+      expect(res.statusCode).toBe(200); // ack — malformed payloads aren't retried
+    } finally {
+      console.error = originalConsoleError;
+    }
+    const combined = logged.join('\n');
+    expect(combined).not.toContain(poisonValue);
+    expect(combined).toContain('total_price'); // the field path is exactly what should be logged
+
+    const rows = await testDb
+      .select()
+      .from(schema.orders)
+      .where(eq(schema.orders.storeId, t.storeId));
+    expect(rows).toHaveLength(0);
+  });
+
+  it('never crashes on non-JSON body — logs and acks instead', async () => {
+    const t = await tenant('webhook-orders-bad-json');
+    const [store] = await testDb
+      .select()
+      .from(schema.stores)
+      .where(eq(schema.stores.id, t.storeId));
+    const payload = 'not valid json {{{';
+    const res = await app.inject({
+      method: 'POST',
+      url: '/webhooks/shopify/orders',
+      payload,
+      headers: {
+        'content-type': 'application/json',
+        'x-shopify-hmac-sha256': sign(payload),
+        'x-shopify-shop-domain': store!.shopDomain,
+        'x-shopify-topic': 'orders/create',
+        'x-shopify-webhook-id': randomUUID(),
+      },
+    });
+    expect(res.statusCode).toBe(200);
+  });
+});
+
+describe('POST /webhooks/shopify/order-hints — refunds/fulfillments (M1-2)', () => {
+  async function tenantWithIntegration(label: string) {
+    const t = await tenant(label);
+    await createIntegrationRepository(testDb).upsertShopify(jobScope(t.organizationId, t.storeId), {
+      storeId: t.storeId,
+      externalAccountId: `gid://shopify/Shop/${label}`,
+      credentialsJson: JSON.stringify({
+        accessToken: 'shpat_test',
+        accessTokenExpiresAt: new Date(Date.now() + 3600_000).toISOString(),
+        refreshToken: 'shprt_test',
+        refreshTokenExpiresAt: new Date(Date.now() + 7_776_000_000).toISOString(),
+        scope: 'read_orders',
+      }),
+      scopes: ['read_orders'],
+      cipher: testCredentialsCipher,
+    });
+    return t;
+  }
+
+  it('refunds/create fetches the full order and updates refunded_amount_paise', async () => {
+    const t = await tenantWithIntegration('webhook-refund-hint');
+    const [store] = await testDb
+      .select()
+      .from(schema.stores)
+      .where(eq(schema.stores.id, t.storeId));
+    const app2 = appWithFetchOrder(async () => graphQlSnapshot());
+    try {
+      const payload = JSON.stringify({ order_id: 1001, created_at: '2026-09-01T11:00:00Z' });
+      const res = await app2.inject({
+        method: 'POST',
+        url: '/webhooks/shopify/order-hints',
+        payload,
+        headers: {
+          'content-type': 'application/json',
+          'x-shopify-hmac-sha256': sign(payload),
+          'x-shopify-shop-domain': store!.shopDomain,
+          'x-shopify-topic': 'refunds/create',
+          'x-shopify-webhook-id': randomUUID(),
+        },
+      });
+      expect(res.statusCode).toBe(200);
+
+      const [row] = await testDb
+        .select()
+        .from(schema.orders)
+        .where(eq(schema.orders.storeId, t.storeId));
+      expect(row?.externalOrderId).toBe('1001');
+      expect(row?.refundedAmountPaise).toBe(10000);
+    } finally {
+      await app2.close();
+    }
+  });
+
+  it('a hint for an order that does not exist yet creates it from the fetched snapshot (out-of-order delivery)', async () => {
+    const t = await tenantWithIntegration('webhook-hint-order-not-yet-created');
+    const [store] = await testDb
+      .select()
+      .from(schema.stores)
+      .where(eq(schema.stores.id, t.storeId));
+    const app2 = appWithFetchOrder(async () => graphQlSnapshot({ externalOrderId: '5001' }));
+    try {
+      const payload = JSON.stringify({ order_id: 5001, updated_at: '2026-09-01T11:00:00Z' });
+      const res = await app2.inject({
+        method: 'POST',
+        url: '/webhooks/shopify/order-hints',
+        payload,
+        headers: {
+          'content-type': 'application/json',
+          'x-shopify-hmac-sha256': sign(payload),
+          'x-shopify-shop-domain': store!.shopDomain,
+          'x-shopify-topic': 'fulfillments/create',
+          'x-shopify-webhook-id': randomUUID(),
+        },
+      });
+      expect(res.statusCode).toBe(200);
+      const [row] = await testDb
+        .select()
+        .from(schema.orders)
+        .where(eq(schema.orders.storeId, t.storeId));
+      expect(row?.externalOrderId).toBe('5001'); // created purely from the hint's fetchOrder call
+    } finally {
+      await app2.close();
+    }
+  });
+
+  it('acks and skips when Shopify has no such order (never retries forever)', async () => {
+    const t = await tenantWithIntegration('webhook-hint-order-missing');
+    const [store] = await testDb
+      .select()
+      .from(schema.stores)
+      .where(eq(schema.stores.id, t.storeId));
+    const app2 = appWithFetchOrder(async () => null);
+    try {
+      const payload = JSON.stringify({ order_id: 9999 });
+      const res = await app2.inject({
+        method: 'POST',
+        url: '/webhooks/shopify/order-hints',
+        payload,
+        headers: {
+          'content-type': 'application/json',
+          'x-shopify-hmac-sha256': sign(payload),
+          'x-shopify-shop-domain': store!.shopDomain,
+          'x-shopify-topic': 'refunds/create',
+          'x-shopify-webhook-id': randomUUID(),
+        },
+      });
+      expect(res.statusCode).toBe(200);
+      const rows = await testDb
+        .select()
+        .from(schema.orders)
+        .where(eq(schema.orders.storeId, t.storeId));
+      expect(rows).toHaveLength(0);
+    } finally {
+      await app2.close();
+    }
+  });
+
+  it('calls fetchOrder before ever touching the database — never inside a transaction (M1-2 review item 1)', async () => {
+    const t = await tenantWithIntegration('webhook-hint-fetch-order');
+    const [store] = await testDb
+      .select()
+      .from(schema.stores)
+      .where(eq(schema.stores.id, t.storeId));
+    const callOrder: string[] = [];
+    const realTransaction = testDb.transaction.bind(testDb);
+    const spiedDb = new Proxy(testDb, {
+      get(target, prop, receiver) {
+        if (prop === 'transaction') {
+          return (...args: Parameters<typeof realTransaction>) => {
+            callOrder.push('transaction-start');
+            return realTransaction(...args);
+          };
+        }
+        const value = Reflect.get(target, prop, receiver);
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    });
+    const app2 = buildTestApp({
+      db: spiedDb,
+      shopify: {
+        ...testShopify,
+        adapter: {
+          ...testShopify.adapter,
+          fetchOrder: async () => {
+            callOrder.push('fetch-order');
+            return graphQlSnapshot();
+          },
+        },
+      },
+    });
+    try {
+      const payload = JSON.stringify({ order_id: 1001 });
+      await app2.inject({
+        method: 'POST',
+        url: '/webhooks/shopify/order-hints',
+        payload,
+        headers: {
+          'content-type': 'application/json',
+          'x-shopify-hmac-sha256': sign(payload),
+          'x-shopify-shop-domain': store!.shopDomain,
+          'x-shopify-topic': 'refunds/create',
+          'x-shopify-webhook-id': randomUUID(),
+        },
+      });
+      expect(callOrder[0]).toBe('fetch-order');
+      expect(callOrder).toContain('transaction-start');
+      expect(callOrder.indexOf('fetch-order')).toBeLessThan(callOrder.indexOf('transaction-start'));
+    } finally {
+      await app2.close();
+    }
   });
 });
