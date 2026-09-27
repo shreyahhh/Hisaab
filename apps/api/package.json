@@ -15,6 +15,7 @@
     "@fastify/rate-limit": "^11.2.0",
     "@truepath/auth": "workspace:*",
     "@truepath/db": "workspace:*",
+    "@truepath/integrations": "workspace:^",
     "@truepath/privacy": "workspace:*",
     "@truepath/shared": "workspace:*",
     "better-auth": "^1.7.6",

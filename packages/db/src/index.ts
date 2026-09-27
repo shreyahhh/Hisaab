@@ -6,13 +6,32 @@
 export * as schema from './schema/index.js';
 export { createDb } from './client.js';
 export type { Db } from './client.js';
-export { resolveStoreOrganization } from './scopeResolution.js';
+export {
+  resolveStoreOrganization,
+  resolveStoreByShopDomain,
+  type ResolvedStore,
+} from './scopeResolution.js';
 export { createSystemScope, type CreateSystemScopeOptions } from './systemScope.js';
+export { jobScope } from './jobScope.js';
 export {
   createStoreRepository,
+  ShopLinkedToAnotherOrganizationError,
   type StoreRepository,
   type StoreRow,
+  type UpsertStoreByShopDomainInput,
 } from './repositories/storeRepository.js';
+export {
+  createIntegrationRepository,
+  type IntegrationRepository,
+  type IntegrationRow,
+  type UpsertShopifyIntegrationInput,
+} from './repositories/integrationRepository.js';
+export {
+  createDsrRequestRepository,
+  type CreateDsrRequestFromWebhookInput,
+  type DsrRequestRepository,
+  type DsrRequestRow,
+} from './repositories/dsrRequestRepository.js';
 export {
   createAuditLogRepository,
   DEFAULT_AUDIT_PAGE_SIZE,

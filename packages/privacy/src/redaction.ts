@@ -11,11 +11,15 @@ const EMAIL = String.raw`[^\s@"'<>()\[\],;:]+@[^\s@"'<>()\[\],;:]+\.[^\s@"'<>()\
 const HEX_64 = String.raw`(?<![0-9a-fA-F])[0-9a-fA-F]{64}(?![0-9a-fA-F])`;
 // `IDENTITY_MASTER_K1=abc…` or `IDENTITY_MASTER_K1: abc…` as it would appear in a dumped env.
 const MASTER_KEY_ASSIGNMENT = String.raw`IDENTITY_MASTER_\w*["']?\s*[=:]\s*["']?[^\s"',;]+`;
+// Same shape, for the credential-envelope master keys (ADR-0023) — a distinct key family from the
+// identity-hashing one, redacted the same way.
+const CREDENTIALS_MASTER_KEY_ASSIGNMENT = String.raw`CREDENTIALS_MASTER_\w*["']?\s*[=:]\s*["']?[^\s"',;]+`;
 
 export type PiiKind = 'email' | 'phone' | 'hash' | 'secret';
 
 const PATTERNS: readonly { readonly kind: PiiKind; readonly source: string }[] = [
   { kind: 'secret', source: MASTER_KEY_ASSIGNMENT },
+  { kind: 'secret', source: CREDENTIALS_MASTER_KEY_ASSIGNMENT },
   { kind: 'email', source: EMAIL },
   { kind: 'hash', source: HEX_64 },
   { kind: 'phone', source: INDIAN_MOBILE },
@@ -28,6 +32,7 @@ const PATTERNS: readonly { readonly kind: PiiKind; readonly source: string }[] =
  */
 export const SENSITIVE_KEY_PATTERNS: readonly RegExp[] = [
   /^identity_master_/i,
+  /^credentials_master_/i,
   /pass(word|wd)/i,
   /secret/i,
   /token/i,

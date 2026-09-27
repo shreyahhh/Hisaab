@@ -3,6 +3,7 @@ import { createIdentityHasher } from '@truepath/privacy';
 import {
   apiPortEnvSchema,
   clickhouseEnvSchema,
+  credentialsKeyEnvSchema,
   dpaEnvSchema,
   identityKeyEnvSchema,
   loadDotEnvIfPresent,
@@ -10,21 +11,26 @@ import {
   postgresEnvSchema,
   redisCacheEnvSchema,
   redisDurableEnvSchema,
+  shopifyEnvSchema,
 } from '@truepath/shared';
 
 // Core API (Fastify): auth, tenants, integrations, reports, DPDP endpoints, webhooks (SPEC §10,
 // §4). The Fastify server, zod validation and the auth/tenant middleware land in M0-4 onward.
-// M0-2 wires env validation at boot only.
+// M0-2 wires env validation at boot only. Building the real running server (buildApp + listen(),
+// Better Auth config, the Shopify adapter/cipher instances) is a deploy-prerequisite tracked
+// separately (issues #2-#5) — this file validates the full env shape the real entrypoint will need.
 
-// The identity keys and DPA_VERSION have no default: without them the API refuses to start
-// (privacy-dpdp.md §4.1, §4.10).
+// The identity/credentials keys and DPA_VERSION have no default: without them the API refuses to
+// start (privacy-dpdp.md §4.1, §4.10; ADR-0023).
 export const apiEnvSchema = postgresEnvSchema
   .and(clickhouseEnvSchema)
   .and(redisDurableEnvSchema)
   .and(redisCacheEnvSchema)
   .and(apiPortEnvSchema)
   .and(identityKeyEnvSchema)
-  .and(dpaEnvSchema);
+  .and(credentialsKeyEnvSchema)
+  .and(dpaEnvSchema)
+  .and(shopifyEnvSchema);
 
 export function placeholder(): string {
   return 'apps/api not yet implemented (SPEC §12 M0-4+)';

@@ -18,3 +18,27 @@ export async function resolveStoreOrganization(db: Db, storeId: string): Promise
     .limit(1);
   return rows[0]?.organizationId ?? null;
 }
+
+export interface ResolvedStore {
+  readonly id: string;
+  readonly organizationId: string;
+}
+
+/**
+ * Resolves a store by its (verified) Shopify shop domain — no scope. The second bootstrap primitive
+ * outside the scoped repository layer (ADR-0016): a Shopify webhook authenticates by HMAC signature
+ * plus `X-Shopify-Shop-Domain`, never a session, so there is no TenantScope yet when the handler
+ * needs to know which store the payload belongs to. Its only sanctioned caller is the Shopify
+ * webhook route (eslint.config.js). Returns nothing but an id mapping, never business data.
+ */
+export async function resolveStoreByShopDomain(
+  db: Db,
+  shopDomain: string,
+): Promise<ResolvedStore | null> {
+  const rows = await db
+    .select({ id: stores.id, organizationId: stores.organizationId })
+    .from(stores)
+    .where(eq(stores.shopDomain, shopDomain))
+    .limit(1);
+  return rows[0] ?? null;
+}

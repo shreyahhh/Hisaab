@@ -1,8 +1,11 @@
 import { randomUUID } from 'node:crypto';
 import Fastify, { type FastifyInstance } from 'fastify';
 import fastifyCors from '@fastify/cors';
+import type { Redis } from 'ioredis';
 import type { Auth } from '@truepath/auth';
 import { createAuditLogRepository, type Db } from '@truepath/db';
+import type { ShopifyAdapter } from '@truepath/integrations';
+import type { CredentialsCipher, IdentityHasher } from '@truepath/privacy';
 import { createAuditService, type AuditService } from './audit.js';
 import { registerAuthBridge } from './authBridge.js';
 import { registerAuthErrorHandler, type ErrorReporter } from './errors.js';
@@ -18,10 +21,27 @@ import { registerRouteRegistry } from './routeRegistry.js';
 import type { TenantScopeDeps } from './tenantScope.js';
 import { registerAuthWrapperRoutes } from './routes/authWrappers.js';
 import { registerDpaRoutes } from './routes/dpa.js';
+import { registerIntegrationRoutes } from './routes/integrations.js';
 import { registerInviteRoutes } from './routes/invites.js';
 import { registerMemberRoutes } from './routes/members.js';
 import { registerMeRoutes } from './routes/me.js';
 import { registerOrgRoutes } from './routes/orgs.js';
+import { registerShopifyWebhookRoutes } from './routes/shopifyWebhooks.js';
+
+/** Everything the Shopify OAuth (connect/callback/disconnect) and webhook routes need (M1-1). */
+export interface ShopifyDeps {
+  readonly adapter: ShopifyAdapter;
+  /** ADR-0023 envelope encryption for `integrations.encrypted_credentials`. */
+  readonly cipher: CredentialsCipher;
+  /** Hashes customer email/phone on compliance webhooks (SPEC §5.4) — the same instance rateLimit.ts uses. */
+  readonly hasher: IdentityHasher;
+  /** Durable Redis — ADR-0025's single-use OAuth-state nonce store; the same connection rateLimit.ts uses. */
+  readonly redis: Redis;
+  readonly oauthStateSecret: string;
+  /** Our own base URL — builds the one fixed OAuth redirect_uri (ADR-0024). */
+  readonly appUrl: string;
+  readonly dashboardUrl: string;
+}
 
 export interface AppDeps {
   readonly db: Db;
@@ -34,6 +54,7 @@ export interface AppDeps {
   readonly rateLimit: RateLimitDeps;
   /** The DPA version organizations must accept (env DPA_VERSION, docs/dpdp/). Required: no silent default. */
   readonly dpaVersion: string;
+  readonly shopify: ShopifyDeps;
   /**
    * Fastify `trustProxy`: which proxies (e.g. the ALB's VPC CIDR) to trust for `request.ip`. Left
    * unset, every client behind the ALB shares the ALB's IP, so the per-IP limits fail closed for all
@@ -76,6 +97,13 @@ export function buildApp(deps: AppDeps): FastifyInstance {
   // still reaches the handler and executes before CORS ever comes into it — this hook is what
   // actually stops that.
   app.addHook('onRequest', async (request, reply) => {
+    // Shopify webhooks (shopify-integration.md §4.2) authenticate with a per-request HMAC signature
+    // over the raw body, never a browser session or an Origin header — Shopify sends neither. This
+    // hook's CSRF checks (Content-Type, Origin) don't apply and would reject every real delivery.
+    // The prefix is anchored (`startsWith`, not `includes`), so nothing outside `/webhooks/` is
+    // affected — see app.test.ts's dedicated non-extension test.
+    if (request.url.startsWith('/webhooks/')) return;
+
     if (request.method === 'GET' || request.method === 'HEAD' || request.method === 'OPTIONS')
       return;
 
@@ -100,6 +128,17 @@ export function buildApp(deps: AppDeps): FastifyInstance {
   // The few Better Auth routes we expose (EXPOSED_AUTH_ROUTES in @truepath/auth, ADR-0022). Not a
   // catch-all: any other path is a 404 from Fastify, and Better Auth disables it too.
   registerAuthBridge(app, deps.auth);
+
+  // Encapsulated on its own so its raw-body content-type parser (needed for HMAC verification) is
+  // scoped to this plugin instance only, per Fastify's own encapsulation rules — no other route sees
+  // a Buffer where it expects parsed JSON.
+  void app.register(async (scope) => {
+    registerShopifyWebhookRoutes(scope, tenantDeps, {
+      adapter: deps.shopify.adapter,
+      hasher: deps.shopify.hasher,
+    });
+  });
+
   app.setNotFoundHandler(async (_request, reply) => {
     await reply.code(404).send({ error: 'not_found' });
   });
@@ -123,6 +162,14 @@ export function buildApp(deps: AppDeps): FastifyInstance {
     registerInviteRoutes(scope, tenantDeps, limits);
     registerMemberRoutes(scope, tenantDeps);
     registerDpaRoutes(scope, tenantDeps, { dpaVersion: deps.dpaVersion });
+    registerIntegrationRoutes(scope, tenantDeps, {
+      adapter: deps.shopify.adapter,
+      cipher: deps.shopify.cipher,
+      redis: deps.shopify.redis,
+      oauthStateSecret: deps.shopify.oauthStateSecret,
+      appUrl: deps.shopify.appUrl,
+      dashboardUrl: deps.shopify.dashboardUrl,
+    });
   });
 
   app.decorate('appDeps', deps);

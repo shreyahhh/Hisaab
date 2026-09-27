@@ -22,15 +22,15 @@ Everything TruePath does with Shopify:
 
 ## 2. Interfaces
 
-### 2.1 Endpoints (Core API; SPEC v0.3 §10)
+### 2.1 Endpoints (Core API; SPEC v0.3 §10, as modified by ADR-0024/ADR-0025 — M1-1)
 
 | Method & path | Purpose |
 |---|---|
-| `GET /v1/integrations/shopify/connect?orgId=&shop=<name>.myshopify.com` (first install) or `?storeId=` (re-auth) | Owner/admin only. Validates the shop domain against `^[a-z0-9][a-z0-9-]*\.myshopify\.com$`, then `302` to `https://{shop}/admin/oauth/authorize?client_id&scope&redirect_uri&state`. `state` is a signed JWT (`orgId`, `userId`, `storeId?`, `nonce`, `exp` = 10 min). |
-| `GET /v1/integrations/shopify/callback` | Verifies the query `hmac`, the `state` signature and expiry, and that the user matches the session. Exchanges the code for an **expiring offline token + refresh token**. Creates or updates `stores`/`integrations`, creates the Web Pixel, publishes the collector config, enqueues the backfill. Audit `integration_connected`. |
-| `PUT /v1/integrations/:id/settings` | Owner/admin. Validated per provider (`ShopifySettingsPatch`: `cod_mapping`, confirmations for unmapped gateways). Secrets are rejected by schema. Audit `integration_settings_changed`. |
-| `DELETE /v1/integrations/:id` | Marks the integration revoked. It can't uninstall the app; the dashboard tells the merchant to uninstall in Shopify admin. Audit `integration_disconnected`. |
-| `POST /webhooks/shopify/:topic` | All Shopify webhooks. `:topic` is one of `orders | order-hints | app | compliance` (§2.2); `X-Shopify-Topic` is authoritative and must belong to that group. |
+| `GET /v1/orgs/:id/integrations/shopify/connect?shop=<name>.myshopify.com` | **ADR-0024**: nested under `/v1/orgs/:id`, not a flat path with `?orgId=` — reuses `requireOrgScope`/`requirePermission('integrations.manage')` like every other org-scoped route, and the generated cross-tenant harness covers it with no override. Validates the shop domain against `^[a-z0-9][a-z0-9-]*\.myshopify\.com$`, then `302` to `https://{shop}/admin/oauth/authorize?client_id&scope&redirect_uri&state`. `redirect_uri` is the one fixed URL below. `state` is **not a JWT** (ADR-0025): an HMAC-signed token (`userId`, `organizationId`, `shop`, `nonce`, `exp` = 10 min) whose `nonce` is also written to durable Redis (`oauth:shopify:state:<nonce>`, `EX 600`) as the actual single-use control. |
+| `GET /v1/integrations/shopify/callback` | **Deliberately flat, no `:id`** (ADR-0024): Shopify's `redirect_uri` must exactly match one URL pre-registered in the app's own config, on the same host as the Application URL — it cannot carry a per-organization path segment. Verifies (ADR-0025): the state's HMAC signature and `exp`; that its nonce hasn't already been consumed (atomic GET-then-DEL); that the signed-in session's user matches the state's `userId`; that the `shop` query param matches the state's `shop`; and that the user still holds `integrations.manage` in the state's `organizationId` (re-checked live, in case of a role change between connect and callback). Every one of these failures replies the same `403 invalid_oauth_state`. On success: exchanges the code for an **expiring offline token + refresh token**, queries `shop { id myshopifyDomain currencyCode }`, upserts `stores`/`integrations` (credentials envelope-encrypted per ADR-0023), audits `integration_connected`, redirects to the dashboard. A shop already linked to a different org is `409 shop_linked_elsewhere`. **Not yet done in M1-1** (tracked as follow-ups): creating the Web Pixel, publishing the collector config, and enqueuing the backfill — each depends on a module (M1-4, M1-3) that doesn't exist yet. |
+| `PUT /v1/integrations/:id/settings` | Owner/admin. Validated per provider (`ShopifySettingsPatch`: `cod_mapping`, confirmations for unmapped gateways). Secrets are rejected by schema. Audit `integration_settings_changed`. **Not built in M1-1** — no settings exist yet to change (M1-2+). |
+| `DELETE /v1/orgs/:id/integrations/:integrationId` | **ADR-0024**: nested under `/v1/orgs/:id`, provider-agnostic (will also serve Meta/Google Ads integrations from M2). The integration is looked up *within* the already-established org scope (joined through `stores`), so a foreign integration id under the caller's own org id is the same 404 as a nonexistent one — no bootstrap primitive needed. Marks the integration revoked and wipes `encrypted_credentials`. It can't uninstall the app on Shopify's side (no such API for a public app); the dashboard tells the merchant to uninstall from Shopify admin. Audit `integration_disconnected`. |
+| `POST /webhooks/shopify/:topic` | All Shopify webhooks. `:topic` is one of `orders | order-hints | app | compliance` (§2.2); `X-Shopify-Topic` is authoritative and must belong to that group. **M1-1 fully implements only `app/uninstalled` and the three compliance topics** (as a durable `dsr_requests` receipt, never a silent no-op — see §4.3/§4.8 below); `orders/*`, `order-hints/*` and `bulk_operations/finish` are acknowledged (`200`) but not processed until M1-2/M1-3 (tracked issue). No session or `:id`-shaped param authenticates this route — it is exempted from the CSRF/Origin hook and from the generated cross-tenant harness for the same reason: HMAC + a verified shop domain is the entire authentication story (ADR-0024). |
 
 ### 2.2 App configuration
 
@@ -169,31 +169,38 @@ Both shapes map to one internal `ShopifyOrderSnapshot`. For webhook snapshots, `
 | `reconcile` | `shopify-reconcile:<storeId>:<yyyymmdd>` | |
 | `order_refresh` | `shopify-refresh:<storeId>:<externalOrderId>` | **Debounced, 30 s**: enqueued with `delay: 30000`. While a job with that id is waiting or delayed, BullMQ ignores further adds with the same `jobId`, so a burst of `orders/create` + `refunds/create` + `fulfillments/*` for one order collapses into one fetch ~30 s after the first hint. `removeOnComplete: true`, so the next hint after completion schedules a new refresh. One job per order (`externalOrderIds` has length 1). |
 
-### 2.7 Adapter (`packages/integrations/shopify`)
+### 2.7 Adapter (`packages/integrations/src/shopify`)
+
+**M1-1 implements the subset OAuth install/uninstall needs.** `upsertWebPixel`, `startBulkOrders`,
+`bulkResultUrl`, `ordersUpdatedSince`, `fetchOrder` and `fetchOrderContact` are added incrementally by
+the tickets that need them (M1-3/M1-4/M4-1), not defined as unimplemented stubs ahead of time —
+matching `packages/integrations`'s own M0-1 scaffold comment ("provider subfolders are added starting
+M1-1"). `ShopifyCredentials` has no `pixelSigningKeys` yet, for the same reason (that's M1-4's job).
 
 ```ts
-export type ShopifyCredentials = {            // stored only in integrations.encrypted_credentials
-  accessToken: string; accessTokenExpiresAt: string;
+export interface ShopifyCredentials {           // stored only in integrations.encrypted_credentials,
+  accessToken: string; accessTokenExpiresAt: string;   // envelope-encrypted per ADR-0023
   refreshToken: string; refreshTokenExpiresAt: string;
-  pixelSigningKeys: { kid: string; secret: string }[];   // secrets live here, never in settings
-};
+  scope: string;                                // comma-separated, as Shopify returns it
+}
 
-export interface ShopifyAdapter extends IntegrationAdapter {   // SPEC §8
+export interface ShopifyAdapter {   // SPEC §8's IntegrationAdapter, M1-1 subset
   provider: 'shopify';
-  authUrl(state: string, shop: string): string;   // shop is required for Shopify
-  exchangeCode(code: string, shop: string): Promise<ShopifyCredentials>;
-  refresh(creds: ShopifyCredentials): Promise<ShopifyCredentials>;   // expiring offline tokens (§4.1)
-  healthCheck(creds: ShopifyCredentials): Promise<HealthStatus>;
-  verifyWebhook(rawBody: Buffer, hmacHeader: string): boolean;  // current + previous client secret
-  shopInfo(creds): Promise<{ gid: string; myshopifyDomain: string; hosts: string[]; currency: string }>;
-  upsertWebPixel(creds, settings: PixelSettings, existingId?: string): Promise<{ pixelId: string }>;  // webPixelCreate / webPixelUpdate(id, webPixel)
-  startBulkOrders(creds, sinceIso: string, untilIso?: string): Promise<{ bulkOperationId: string }>;
-  bulkResultUrl(creds, id: string): Promise<{ url: string | null; partialDataUrl: string | null; status: string }>;
-  ordersUpdatedSince(creds, sinceIso: string, cursor?: string): Promise<{ orders: ShopifyOrderSnapshot[]; next?: string }>;
-  fetchOrder(creds, externalOrderId: string): Promise<ShopifyOrderSnapshot | null>;
-  fetchOrderContact(creds, externalOrderId: string): Promise<{ email?: string; phone?: string } | null>;  // CAPI re-fetch; caller hashes and discards
+  authUrl(shop: string, state: string, redirectUri: string): string;
+  exchangeCode(shop: string, code: string): Promise<ShopifyCredentials>;
+  refresh(shop: string, creds: ShopifyCredentials): Promise<ShopifyCredentials>;   // expiring offline tokens (§4.1) — not yet called anywhere in M1-1; wired in when a later ticket first needs a stored token
+  shopInfo(shop: string, creds: ShopifyCredentials): Promise<{ gid: string; myshopifyDomain: string; currency: string }>;
+  healthCheck(shop: string, creds: ShopifyCredentials): Promise<{ healthy: boolean; reason?: string }>;   // token validity only; the full health screen is M2-4
+  verifyWebhook(rawBody: Buffer, hmacHeaderValue: string): boolean;  // current + previous client secret, timing-safe
 }
 ```
+
+**Credential storage** (ADR-0023): `integrationRepository.upsertShopify` — not the route or the
+adapter — owns encryption. It resolves the row's id first (the existing row's id on re-auth, a freshly
+generated one on first connect, both inside a Postgres advisory transaction lock keyed on the store, to
+serialise concurrent connect attempts), then encrypts `JSON.stringify(credentials)` with that id bound
+into the envelope's AAD, then writes the row. This ordering only exists because the AAD must bind the
+row's *actual* id, which isn't known until the insert/update is about to happen.
 
 ## 3. Data owned
 
@@ -343,6 +350,14 @@ sequenceDiagram
   - `shop/redact` → `type='store_erasure'`.
 
   All with `trigger='shopify_webhook'` and `source_ref`. Payload email/phone are hashed in memory and discarded. `200` after commit. Shopify's deadline is 30 days ([privacy compliance](https://shopify.dev/docs/apps/build/compliance/privacy-law-compliance)); ours is 7 days.
+
+  **M1-1 scope note**: this ticket implements the *receipt* only — inserting the `dsr_requests` row,
+  deduped on `(store_id, source_ref)` so a retried webhook delivery never creates a second row. It does
+  not implement *fulfilment* (actually exporting or erasing the shopper's data). Not fulfilling these
+  requests within the SLA is a compliance failure, so that pipeline is tracked as a launch-blocking
+  follow-up issue, not deferred silently. `identity_hash` is nullable (corrected from the original
+  schema, which had it `NOT NULL`) specifically for `store_erasure`, which is store-wide and carries no
+  shopper identity — see privacy-dpdp.md's own line for this mapping, which already specified `null`.
 
 ### 4.9 Health check (SPEC M2-4)
 

@@ -66,6 +66,29 @@ describe('redactLogValue: IDENTITY_MASTER_*', () => {
   });
 });
 
+describe('redactLogValue: CREDENTIALS_MASTER_* (ADR-0023)', () => {
+  const key = randomBytes(32).toString('base64');
+
+  it('redacts the value of any CREDENTIALS_MASTER_* key, whatever it holds', () => {
+    const out = redactLogValue({
+      CREDENTIALS_MASTER_K1: key,
+      credentials_master_k2: 'x',
+      CREDENTIALS_KEY_WRITE: 'k1',
+    }) as Record<string, unknown>;
+    expect(out.CREDENTIALS_MASTER_K1).toBe(REDACTED);
+    expect(out.credentials_master_k2).toBe(REDACTED);
+    expect(out.CREDENTIALS_KEY_WRITE).toBe('k1');
+    expect(JSON.stringify(out)).not.toContain(key);
+  });
+
+  it('redacts the assignment when an env dump is logged as text', () => {
+    const text = `CREDENTIALS_MASTER_K1=${key}`;
+    const out = redactLogValue(text) as string;
+    expect(out).not.toContain(key);
+    expect(out).toContain(REDACTED);
+  });
+});
+
 describe('redactLogValue: structures', () => {
   it('redacts identifier and credential keys by name', () => {
     const out = redactLogValue({

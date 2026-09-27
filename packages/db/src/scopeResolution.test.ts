@@ -1,5 +1,7 @@
+import { eq } from 'drizzle-orm';
 import { describe, expect, it } from 'vitest';
-import { resolveStoreOrganization } from './scopeResolution.js';
+import { resolveStoreByShopDomain, resolveStoreOrganization } from './scopeResolution.js';
+import { stores } from './schema/index.js';
 import { cleanupTestTenant, db, seedTestTenant } from './testing.js';
 
 describe('resolveStoreOrganization (ADR-0016 bootstrap primitive)', () => {
@@ -29,5 +31,25 @@ describe('resolveStoreOrganization (ADR-0016 bootstrap primitive)', () => {
     } finally {
       await cleanupTestTenant(tenant);
     }
+  });
+});
+
+describe('resolveStoreByShopDomain (ADR-0024 bootstrap primitive)', () => {
+  it('resolves the store id and organization id that own a shop domain', async () => {
+    const tenant = await seedTestTenant('resolve-shop-domain');
+    try {
+      const [store] = await db.select().from(stores).where(eq(stores.id, tenant.storeId)).limit(1);
+      if (!store) throw new Error('seeded store not found');
+      await expect(resolveStoreByShopDomain(db, store.shopDomain)).resolves.toEqual({
+        id: tenant.storeId,
+        organizationId: tenant.organizationId,
+      });
+    } finally {
+      await cleanupTestTenant(tenant);
+    }
+  });
+
+  it('returns null for an unknown shop domain', async () => {
+    await expect(resolveStoreByShopDomain(db, 'no-such-shop.myshopify.com')).resolves.toBeNull();
   });
 });

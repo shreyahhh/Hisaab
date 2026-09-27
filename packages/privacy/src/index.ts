@@ -45,3 +45,8 @@ export {
   type PiiKind,
 } from './redaction.js';
 export { generateIdentityMasterKey } from './generateKey.js';
+export {
+  createCredentialsCipher,
+  type CredentialsCipher,
+  type CredentialsContext,
+} from './credentialsCipher.js';

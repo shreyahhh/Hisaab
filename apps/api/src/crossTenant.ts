@@ -141,6 +141,23 @@ export const EXEMPT_ROUTES: readonly RouteExemption[] = [
     reason:
       "The :token is a single-use invitation id (a capability), not an enumerable tenant resource id. Redeeming another organization's invitation is governed by Better Auth's invited-email match, not TenantScope, and that property is exercised directly in routeRbac.test.ts rather than by substituting a foreign id here.",
   },
+  {
+    method: 'POST',
+    url: '/webhooks/shopify/:topic',
+    reason:
+      'Authenticated by Shopify’s per-request HMAC signature over the raw body, not a session — the store is resolved from a verified shop domain inside the handler (ADR-0024, shopify-integration.md §4.2), never from a caller-supplied id. Covered by shopifyWebhooks.test.ts, not the generated harness.',
+  },
+  {
+    method: 'GET',
+    url: '/v1/integrations/shopify/callback',
+    reason:
+      "Deliberately flat, no :id (ADR-0024/ADR-0025): Shopify's redirect_uri must be one fixed, pre-registered URL, so tenant binding comes from the signed single-use state token plus a live-session check, not a path param. Its rejection paths are covered individually in shopifyOAuthCallback.test.ts, not the generated harness.",
+  },
+  {
+    method: 'HEAD',
+    url: '/v1/integrations/shopify/callback',
+    reason: 'Fastify-generated HEAD mirror of GET /v1/integrations/shopify/callback.',
+  },
 ];
 
 export function isExemptRoute(

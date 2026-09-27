@@ -1,0 +1,227 @@
+import { createHmac } from 'node:crypto';
+import { HttpResponse, http } from 'msw';
+import { setupServer } from 'msw/node';
+import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
+import { createShopifyAdapter, type ShopifyAdapterConfig } from './adapter.js';
+import type { ShopifyCredentials } from './types.js';
+
+const SHOP = 'test-shop.myshopify.com';
+
+const CONFIG: ShopifyAdapterConfig = {
+  clientId: 'client-id',
+  clientSecret: 'client-secret',
+  scopes: ['read_orders', 'write_pixels', 'read_customer_events'],
+};
+
+const TOKEN_RESPONSE = {
+  access_token: 'shpat_abc123',
+  refresh_token: 'shprt_def456',
+  expires_in: 3600,
+  refresh_token_expires_in: 7776000,
+  scope: 'read_orders,write_pixels,read_customer_events',
+};
+
+const server = setupServer();
+beforeAll(() => server.listen({ onUnhandledRequest: 'error' }));
+afterEach(() => server.resetHandlers());
+afterAll(() => server.close());
+
+describe('createShopifyAdapter: authUrl', () => {
+  it('builds the authorize URL with client id, joined scopes, redirect_uri and state', () => {
+    const adapter = createShopifyAdapter(CONFIG);
+    const url = new URL(
+      adapter.authUrl(
+        SHOP,
+        'the-state',
+        'https://api.example.com/v1/integrations/shopify/callback',
+      ),
+    );
+    expect(url.origin + url.pathname).toBe(`https://${SHOP}/admin/oauth/authorize`);
+    expect(url.searchParams.get('client_id')).toBe('client-id');
+    expect(url.searchParams.get('scope')).toBe('read_orders,write_pixels,read_customer_events');
+    expect(url.searchParams.get('redirect_uri')).toBe(
+      'https://api.example.com/v1/integrations/shopify/callback',
+    );
+    expect(url.searchParams.get('state')).toBe('the-state');
+  });
+});
+
+describe('createShopifyAdapter: exchangeCode', () => {
+  it('POSTs client_id/client_secret/code/expiring=1 and maps the response to ShopifyCredentials', async () => {
+    let receivedBody: URLSearchParams | undefined;
+    server.use(
+      http.post(`https://${SHOP}/admin/oauth/access_token`, async ({ request }) => {
+        receivedBody = new URLSearchParams(await request.text());
+        return HttpResponse.json(TOKEN_RESPONSE);
+      }),
+    );
+
+    const adapter = createShopifyAdapter(CONFIG);
+    const before = Date.now();
+    const creds = await adapter.exchangeCode(SHOP, 'the-code');
+    const after = Date.now();
+
+    expect(receivedBody?.get('client_id')).toBe('client-id');
+    expect(receivedBody?.get('client_secret')).toBe('client-secret');
+    expect(receivedBody?.get('code')).toBe('the-code');
+    expect(receivedBody?.get('expiring')).toBe('1');
+    expect(receivedBody?.get('grant_type')).toBeNull();
+
+    expect(creds.accessToken).toBe('shpat_abc123');
+    expect(creds.refreshToken).toBe('shprt_def456');
+    expect(creds.scope).toBe(TOKEN_RESPONSE.scope);
+    const expiresAt = new Date(creds.accessTokenExpiresAt).getTime();
+    expect(expiresAt).toBeGreaterThanOrEqual(before + 3600_000);
+    expect(expiresAt).toBeLessThanOrEqual(after + 3600_000 + 1000);
+  });
+
+  it('throws on a non-2xx response, without leaking the response body', async () => {
+    server.use(
+      http.post(`https://${SHOP}/admin/oauth/access_token`, () =>
+        HttpResponse.json({ error: 'invalid_request' }, { status: 400 }),
+      ),
+    );
+    const adapter = createShopifyAdapter(CONFIG);
+    await expect(adapter.exchangeCode(SHOP, 'bad-code')).rejects.toThrow('400');
+  });
+
+  it('throws on a malformed (schema-invalid) response body', async () => {
+    server.use(
+      http.post(`https://${SHOP}/admin/oauth/access_token`, () =>
+        HttpResponse.json({ unexpected: true }),
+      ),
+    );
+    const adapter = createShopifyAdapter(CONFIG);
+    await expect(adapter.exchangeCode(SHOP, 'the-code')).rejects.toThrow(
+      'unexpected response shape',
+    );
+  });
+});
+
+describe('createShopifyAdapter: refresh', () => {
+  it('POSTs grant_type=refresh_token with the stored refresh token, and no `code`', async () => {
+    let receivedBody: URLSearchParams | undefined;
+    server.use(
+      http.post(`https://${SHOP}/admin/oauth/access_token`, async ({ request }) => {
+        receivedBody = new URLSearchParams(await request.text());
+        return HttpResponse.json({ ...TOKEN_RESPONSE, access_token: 'shpat_rotated' });
+      }),
+    );
+    const adapter = createShopifyAdapter(CONFIG);
+    const creds = await adapter.refresh(SHOP, {
+      accessToken: 'old',
+      accessTokenExpiresAt: new Date().toISOString(),
+      refreshToken: 'shprt_old',
+      refreshTokenExpiresAt: new Date().toISOString(),
+      scope: TOKEN_RESPONSE.scope,
+    });
+
+    expect(receivedBody?.get('grant_type')).toBe('refresh_token');
+    expect(receivedBody?.get('refresh_token')).toBe('shprt_old');
+    expect(receivedBody?.get('code')).toBeNull();
+    expect(creds.accessToken).toBe('shpat_rotated');
+  });
+});
+
+describe('createShopifyAdapter: shopInfo', () => {
+  const creds: ShopifyCredentials = {
+    accessToken: 'shpat_abc123',
+    accessTokenExpiresAt: new Date().toISOString(),
+    refreshToken: 'shprt_def456',
+    refreshTokenExpiresAt: new Date().toISOString(),
+    scope: TOKEN_RESPONSE.scope,
+  };
+
+  it('queries the GraphQL Admin API with the access token header and maps the result', async () => {
+    let receivedToken: string | null = null;
+    server.use(
+      http.post(`https://${SHOP}/admin/api/*/graphql.json`, ({ request }) => {
+        receivedToken = request.headers.get('X-Shopify-Access-Token');
+        return HttpResponse.json({
+          data: {
+            shop: { id: 'gid://shopify/Shop/1', myshopifyDomain: SHOP, currencyCode: 'INR' },
+          },
+        });
+      }),
+    );
+    const adapter = createShopifyAdapter(CONFIG);
+    const info = await adapter.shopInfo(SHOP, creds);
+
+    expect(receivedToken).toBe('shpat_abc123');
+    expect(info).toEqual({ gid: 'gid://shopify/Shop/1', myshopifyDomain: SHOP, currency: 'INR' });
+  });
+
+  it('healthCheck reports healthy when shopInfo succeeds', async () => {
+    server.use(
+      http.post(`https://${SHOP}/admin/api/*/graphql.json`, () =>
+        HttpResponse.json({
+          data: {
+            shop: { id: 'gid://shopify/Shop/1', myshopifyDomain: SHOP, currencyCode: 'INR' },
+          },
+        }),
+      ),
+    );
+    const adapter = createShopifyAdapter(CONFIG);
+    await expect(adapter.healthCheck(SHOP, creds)).resolves.toEqual({ healthy: true });
+  });
+
+  it('healthCheck reports unhealthy with a reason when the token is invalid', async () => {
+    server.use(
+      http.post(`https://${SHOP}/admin/api/*/graphql.json`, () =>
+        HttpResponse.json(
+          { errors: [{ message: 'Invalid API key or access token' }] },
+          { status: 401 },
+        ),
+      ),
+    );
+    const adapter = createShopifyAdapter(CONFIG);
+    const health = await adapter.healthCheck(SHOP, creds);
+    expect(health.healthy).toBe(false);
+    expect(health.reason).toContain('401');
+  });
+});
+
+describe('createShopifyAdapter: verifyWebhook', () => {
+  function sign(secret: string, body: Buffer): string {
+    return createHmac('sha256', secret).update(body).digest('base64');
+  }
+
+  it('accepts a signature made with the current client secret', () => {
+    const adapter = createShopifyAdapter(CONFIG);
+    const body = Buffer.from(JSON.stringify({ id: 1 }));
+    expect(adapter.verifyWebhook(body, sign(CONFIG.clientSecret, body))).toBe(true);
+  });
+
+  it('rejects a signature made with the wrong secret', () => {
+    const adapter = createShopifyAdapter(CONFIG);
+    const body = Buffer.from(JSON.stringify({ id: 1 }));
+    expect(adapter.verifyWebhook(body, sign('someone-elses-secret', body))).toBe(false);
+  });
+
+  it('rejects if the body was tampered with after signing', () => {
+    const adapter = createShopifyAdapter(CONFIG);
+    const original = Buffer.from(JSON.stringify({ id: 1 }));
+    const signature = sign(CONFIG.clientSecret, original);
+    const tampered = Buffer.from(JSON.stringify({ id: 2 }));
+    expect(adapter.verifyWebhook(tampered, signature)).toBe(false);
+  });
+
+  it('accepts the previous secret during a rotation window, and still accepts the current one', () => {
+    const adapter = createShopifyAdapter({ ...CONFIG, clientSecretPrevious: 'the-old-secret' });
+    const body = Buffer.from(JSON.stringify({ id: 1 }));
+    expect(adapter.verifyWebhook(body, sign('the-old-secret', body))).toBe(true);
+    expect(adapter.verifyWebhook(body, sign(CONFIG.clientSecret, body))).toBe(true);
+  });
+
+  it('rejects a malformed (non-base64) header without throwing', () => {
+    const adapter = createShopifyAdapter(CONFIG);
+    const body = Buffer.from('{}');
+    expect(() => adapter.verifyWebhook(body, 'not-valid-base64-!!!')).not.toThrow();
+    expect(adapter.verifyWebhook(body, 'not-valid-base64-!!!')).toBe(false);
+  });
+
+  it('rejects an empty header', () => {
+    const adapter = createShopifyAdapter(CONFIG);
+    expect(adapter.verifyWebhook(Buffer.from('{}'), '')).toBe(false);
+  });
+});

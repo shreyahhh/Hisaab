@@ -1,8 +1,33 @@
 import type { Scope } from '@truepath/shared';
+import type { CredentialsCipher } from '@truepath/privacy';
 import type { Db } from '../client.js';
 import { createAuditLogRepository } from './auditLogRepository.js';
 import { createDpaAcceptanceRepository } from './dpaAcceptanceRepository.js';
+import { createDsrRequestRepository } from './dsrRequestRepository.js';
+import { createIntegrationRepository } from './integrationRepository.js';
 import { createStoreRepository } from './storeRepository.js';
+
+// A resource id that never matches a real row, for scope-assertion-only harness invocations (the
+// assertion throws before the query would run, so which nonexistent id is passed is immaterial).
+const NEVER_MATCHES = '00000000-0000-0000-0000-000000000000';
+
+// A cipher that must never actually run: upsertShopify's assertStoreInScope throws on a foreign
+// storeId before any encryption happens, so the harness never needs a real, working cipher — only
+// something typed correctly. Throwing here (rather than importing the real test cipher from
+// @truepath/privacy/testing) also keeps this production file from depending on a test-only module.
+const UNUSED_CIPHER: CredentialsCipher = {
+  writeVersion: 'k1',
+  encrypt: () => {
+    throw new Error(
+      'registry harness: cipher should never be invoked (scope check must run first)',
+    );
+  },
+  decrypt: () => {
+    throw new Error(
+      'registry harness: cipher should never be invoked (scope check must run first)',
+    );
+  },
+};
 
 export type ScopeKind = 'store' | 'organization';
 
@@ -42,6 +67,80 @@ export const repositoryRegistry: readonly RepositoryDescriptor[] = [
         name: 'getById',
         scopeKind: 'store',
         invoke: (db, scope, storeId) => createStoreRepository(db).getById(scope, storeId),
+      },
+      {
+        name: 'upsertByShopDomain',
+        scopeKind: 'organization',
+        invoke: (db, scope, organizationId) =>
+          createStoreRepository(db).upsertByShopDomain(scope, {
+            organizationId,
+            shopDomain: 'cross-tenant-test.myshopify.com',
+          }),
+      },
+      {
+        name: 'markUninstalled',
+        scopeKind: 'store',
+        invoke: (db, scope, storeId) => createStoreRepository(db).markUninstalled(scope, storeId),
+      },
+    ],
+  },
+  {
+    name: 'IntegrationRepository',
+    methods: [
+      {
+        name: 'upsertShopify',
+        scopeKind: 'store',
+        invoke: (db, scope, storeId) =>
+          createIntegrationRepository(db).upsertShopify(scope, {
+            storeId,
+            externalAccountId: 'cross-tenant-test',
+            credentialsJson: '{}',
+            scopes: [],
+            cipher: UNUSED_CIPHER,
+          }),
+      },
+      {
+        name: 'getByIdForOrganization',
+        scopeKind: 'organization',
+        invoke: (db, scope, organizationId) =>
+          createIntegrationRepository(db).getByIdForOrganization(
+            scope,
+            organizationId,
+            NEVER_MATCHES,
+          ),
+      },
+      {
+        name: 'revokeForOrganization',
+        scopeKind: 'organization',
+        invoke: (db, scope, organizationId) =>
+          createIntegrationRepository(db).revokeForOrganization(
+            scope,
+            organizationId,
+            NEVER_MATCHES,
+          ),
+      },
+      {
+        name: 'markUninstalled',
+        scopeKind: 'store',
+        invoke: (db, scope, storeId) =>
+          createIntegrationRepository(db).markUninstalled(scope, storeId),
+      },
+    ],
+  },
+  {
+    name: 'DsrRequestRepository',
+    methods: [
+      {
+        name: 'createFromWebhook',
+        scopeKind: 'store',
+        invoke: (db, scope, storeId) =>
+          createDsrRequestRepository(db).createFromWebhook(scope, {
+            storeId,
+            type: 'store_erasure',
+            identityHash: null,
+            dueAt: new Date(),
+            sourceRef: `cross-tenant-test-${storeId}`,
+          }),
       },
     ],
   },
