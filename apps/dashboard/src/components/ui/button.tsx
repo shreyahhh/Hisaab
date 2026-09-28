@@ -1,3 +1,4 @@
+import * as React from 'react';
 import { Button as ButtonPrimitive } from '@base-ui/react/button';
 import { cva, type VariantProps } from 'class-variance-authority';
 import { cn } from 'cn';
@@ -37,19 +38,24 @@ const buttonVariants = cva(
   },
 );
 
-function Button({
-  className,
-  variant = 'default',
-  size = 'default',
-  ...props
-}: ButtonPrimitive.Props & VariantProps<typeof buttonVariants>) {
+// React 18 (this app doesn't use React 19) doesn't put an external `ref` prop inside `props` for a
+// plain function component — it strips it and warns "Function components cannot be given refs"
+// instead. Base UI's own docs call out exactly this: forwardRef is required here, or a `<Button
+// render={<X/>}>` composition (used for DropdownMenuTrigger/AlertDialogTrigger/DialogTrigger
+// elsewhere in this app) never gets a real DOM ref, so the popup it anchors positions incorrectly —
+// this was a real, reproducible bug (the profile menu opening with no visible position), not cosmetic.
+const Button = React.forwardRef<
+  HTMLButtonElement,
+  ButtonPrimitive.Props & VariantProps<typeof buttonVariants>
+>(function Button({ className, variant = 'default', size = 'default', ...props }, ref) {
   return (
     <ButtonPrimitive
+      ref={ref}
       data-slot="button"
       className={cn(buttonVariants({ variant, size, className }))}
       {...props}
     />
   );
-}
+});
 
 export { Button, buttonVariants };

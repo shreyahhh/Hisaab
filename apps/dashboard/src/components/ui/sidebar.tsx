@@ -474,22 +474,28 @@ const sidebarMenuButtonVariants = cva(
   },
 );
 
-function SidebarMenuButton({
-  render,
-  isActive = false,
-  variant = 'default',
-  size = 'default',
-  tooltip,
-  className,
-  ...props
-}: useRender.ComponentProps<'button'> &
-  React.ComponentProps<'button'> & {
-    isActive?: boolean;
-    tooltip?: string | React.ComponentProps<typeof TooltipContent>;
-  } & VariantProps<typeof sidebarMenuButtonVariants>) {
+// forwardRef for the same reason as button.tsx's Button: under React 18, a plain function
+// component never receives an external `ref` prop at all (React strips it silently rather than
+// putting it in `props`), so `<DropdownMenuTrigger render={<SidebarMenuButton .../>}>` /
+// `<Tooltip render={<SidebarMenuButton .../>}>`-style composition could never get a real anchor
+// element — the Base UI popup it positions would render with no (or a stale) anchor rect. This was
+// the actual cause of the profile/org-switcher dropdown "glitching": Base UI reported the menu as
+// open (it's in the accessibility tree) while it failed to position itself visibly.
+const SidebarMenuButton = React.forwardRef<
+  HTMLButtonElement,
+  useRender.ComponentProps<'button'> &
+    React.ComponentProps<'button'> & {
+      isActive?: boolean;
+      tooltip?: string | React.ComponentProps<typeof TooltipContent>;
+    } & VariantProps<typeof sidebarMenuButtonVariants>
+>(function SidebarMenuButton(
+  { render, isActive = false, variant = 'default', size = 'default', tooltip, className, ...props },
+  ref,
+) {
   const { isMobile, state } = useSidebar();
   const comp = useRender({
     defaultTagName: 'button',
+    ref,
     props: mergeProps<'button'>(
       {
         className: cn(sidebarMenuButtonVariants({ variant, size }), className),
@@ -526,7 +532,7 @@ function SidebarMenuButton({
       />
     </Tooltip>
   );
-}
+});
 
 function SidebarMenuAction({
   className,
