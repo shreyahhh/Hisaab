@@ -15,6 +15,7 @@ import { LoginPage } from '@/pages/login';
 import { SignupPage } from '@/pages/signup';
 import { InviteAcceptPage } from '@/pages/invite-accept';
 import { NewOrgPage } from '@/pages/new-org';
+import { StoreConnectedPage } from '@/pages/store-connected';
 import { OrgLayout } from '@/pages/org-layout';
 import { OverviewPage } from '@/pages/overview';
 import { TeamPage } from '@/pages/team';
@@ -95,6 +96,12 @@ const newOrgRoute = createRoute({
   component: NewOrgPage,
 });
 
+const storeConnectedRoute = createRoute({
+  getParentRoute: () => authedRoute,
+  path: 'stores/$storeId/connected',
+  component: () => <StoreConnectedPage storeId={storeConnectedRoute.useParams().storeId} />,
+});
+
 const orgRoute = createRoute({
   getParentRoute: () => authedRoute,
   path: 'o/$orgId',
@@ -163,6 +170,7 @@ const orgRouteWithChildren = orgRoute.addChildren([
 const authedRouteWithChildren = authedRoute.addChildren([
   indexRoute,
   newOrgRoute,
+  storeConnectedRoute,
   orgRouteWithChildren,
 ]);
 
