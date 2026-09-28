@@ -16,6 +16,7 @@ import {
   testDb,
   testHasher,
   testRedis,
+  testIdentityStitchQueue,
   testShopifySyncQueue,
   TEST_DASHBOARD_URL,
   TEST_DPA_VERSION,
@@ -85,6 +86,7 @@ function appWith(
       appUrl: 'http://localhost:3000',
       dashboardUrl: TEST_DASHBOARD_URL,
       shopifySyncQueue: testShopifySyncQueue,
+      identityStitchQueue: testIdentityStitchQueue,
       ...(collectorUrl ? { collectorUrl } : {}),
     },
   });

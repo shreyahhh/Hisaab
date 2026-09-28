@@ -1,4 +1,4 @@
-import type { Job } from 'bullmq';
+import type { Job, Queue } from 'bullmq';
 import {
   createIntegrationRepository,
   createOrderRepository,
@@ -14,8 +14,19 @@ import {
   type ShopifyCredentials,
   type ShopifyOrderSnapshot,
 } from '@truepath/integrations';
-import type { CredentialsCipher, IdentityHasher } from '@truepath/privacy';
-import type { Scope, ShopifySyncJob } from '@truepath/shared';
+import {
+  isIdentityErased,
+  type CredentialsCipher,
+  type IdentityHasher,
+  type SuppressionReader,
+} from '@truepath/privacy';
+import {
+  IDENTITY_STITCH_JOB_OPTIONS,
+  identityStitchJobId,
+  type IdentityStitchJob,
+  type Scope,
+  type ShopifySyncJob,
+} from '@truepath/shared';
 
 // The `shopify-sync` queue's processor (HLD §8; shopify-integration.md §4.7). Implements
 // `mode: 'backfill'` (start the bulk order query, M1-3) and `mode: 'bulk_result'` (stream and apply
@@ -28,6 +39,10 @@ export interface ShopifySyncDeps {
   readonly cipher: CredentialsCipher;
   /** Hashes phone/email in memory (packages/privacy); raw values never leave `mapOrderSnapshot`. */
   readonly hasher: IdentityHasher;
+  /** Durable Redis, read for the erased-identity list when an order is stored (HLD §6b). */
+  readonly redis: SuppressionReader;
+  /** HLD §8 `identity-stitch`: backfilled orders enter at attempt 2 (identity-stitching.md §5). */
+  readonly identityStitchQueue: Pick<Queue<IdentityStitchJob>, 'addBulk'>;
 }
 
 function decryptCredentials(
@@ -145,8 +160,10 @@ async function applyBulkOrder(
   scope: Scope,
   storeId: string,
   snapshot: ShopifyOrderSnapshot,
-): Promise<'applied' | 'skipped_non_inr'> {
-  if (snapshot.currency !== 'INR') return 'skipped_non_inr';
+): Promise<
+  { outcome: 'applied'; orderId: string } | { outcome: 'skipped_non_inr'; orderId?: undefined }
+> {
+  if (snapshot.currency !== 'INR') return { outcome: 'skipped_non_inr' };
 
   const fields = mapOrderSnapshot(snapshot, storeId, deps.hasher);
   if (fields.moneySanityExceeded) {
@@ -155,7 +172,15 @@ async function applyBulkOrder(
     );
   }
 
-  await createOrderRepository(deps.db).applySnapshot(scope, {
+  // HLD §6b: an erased shopper's order is stored without their hashes (the same rule as the webhook).
+  const erased = await isIdentityErased(
+    deps.redis,
+    storeId,
+    fields.identityLookup,
+    Math.floor(Date.now() / 1000),
+  );
+
+  const applied = await createOrderRepository(deps.db).applySnapshot(scope, {
     storeId,
     externalOrderId: snapshot.externalOrderId,
     createdAtPlatform: fields.createdAtPlatform,
@@ -167,8 +192,8 @@ async function applyBulkOrder(
     fulfilmentStatus: fields.fulfilmentStatus,
     cancelledAt: fields.cancelledAt,
     pincodePrefix: fields.pincodePrefix,
-    phoneHashHmac: fields.phoneHashHmac,
-    emailHashHmac: fields.emailHashHmac,
+    phoneHashHmac: erased ? null : fields.phoneHashHmac,
+    emailHashHmac: erased ? null : fields.emailHashHmac,
     landingSite: fields.landingSite,
     referringSite: fields.referringSite,
     noteAttributes: fields.noteAttributes,
@@ -179,7 +204,7 @@ async function applyBulkOrder(
     // `applySnapshot`'s (order, source, raw_ref) unique constraint makes the whole job idempotent.
     rawRef: `recon:${snapshot.updatedAtPlatform}`,
   });
-  return 'applied';
+  return { outcome: 'applied', orderId: applied.orderId };
 }
 
 // Shopify's terminal-but-unsuccessful bulk statuses. CREATED/RUNNING/CANCELING are "not done yet".
@@ -228,6 +253,7 @@ async function runBulkResult(deps: ShopifySyncDeps, job: ShopifySyncJob): Promis
 
   let applied = 0;
   let skippedNonInr = 0;
+  const toStitch: string[] = [];
   let invalidLines = 0;
   // A completed query that matched no orders has no result file at all.
   if (operation.url) {
@@ -236,11 +262,18 @@ async function runBulkResult(deps: ShopifySyncDeps, job: ShopifySyncJob): Promis
         invalidLines += 1;
         continue;
       }
-      const outcome = await applyBulkOrder(deps, scope, job.storeId, line.snapshot);
-      if (outcome === 'applied') applied += 1;
-      else skippedNonInr += 1;
+      const result = await applyBulkOrder(deps, scope, job.storeId, line.snapshot);
+      if (result.outcome === 'applied') {
+        applied += 1;
+        toStitch.push(result.orderId);
+        if (toStitch.length >= STITCH_ENQUEUE_CHUNK)
+          await enqueueStitch(deps, job.storeId, toStitch.splice(0));
+      } else {
+        skippedNonInr += 1;
+      }
     }
   }
+  await enqueueStitch(deps, job.storeId, toStitch.splice(0));
 
   if (skippedNonInr > 0) {
     console.error(
@@ -276,7 +309,28 @@ async function runBulkResult(deps: ShopifySyncDeps, job: ShopifySyncJob): Promis
     invalid_lines: 0,
     finished_at: finishedAt,
   });
-  // Bulk-enqueueing IdentityStitchJob{attempt:2} (LLD §4.7) waits on the identity-stitch queue (M1-7).
+}
+
+const STITCH_ENQUEUE_CHUNK = 500;
+
+/**
+ * Backfilled orders have no pixel data to wait for, so they enter the stitch chain at its last attempt:
+ * the HMAC fallback, then the UTM fallback (identity-stitching.md §5, shopify-integration.md §4.7).
+ * The job ids dedupe a re-run of the same bulk result.
+ */
+async function enqueueStitch(
+  deps: ShopifySyncDeps,
+  storeId: string,
+  orderIds: readonly string[],
+): Promise<void> {
+  if (orderIds.length === 0) return;
+  await deps.identityStitchQueue.addBulk(
+    orderIds.map((orderId) => ({
+      name: 'stitch',
+      data: { storeId, orderId, attempt: 2 as const },
+      opts: { jobId: identityStitchJobId(orderId, 2), ...IDENTITY_STITCH_JOB_OPTIONS },
+    })),
+  );
 }
 
 export function createShopifySyncProcessor(deps: ShopifySyncDeps) {

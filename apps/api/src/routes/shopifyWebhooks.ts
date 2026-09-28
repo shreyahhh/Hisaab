@@ -18,8 +18,20 @@ import {
   type ShopifyAdapter,
   type ShopifyOrderSnapshot,
 } from '@truepath/integrations';
-import { storeContext, type CredentialsCipher, type IdentityHasher } from '@truepath/privacy';
-import type { ShopifySyncJob, TenantScope } from '@truepath/shared';
+import {
+  isIdentityErased,
+  storeContext,
+  type CredentialsCipher,
+  type IdentityHasher,
+  type SuppressionReader,
+} from '@truepath/privacy';
+import {
+  IDENTITY_STITCH_JOB_OPTIONS,
+  identityStitchJobId,
+  type IdentityStitchJob,
+  type ShopifySyncJob,
+  type TenantScope,
+} from '@truepath/shared';
 import { fetchOrderWithTokenRefresh } from '../shopifyOrderCredentials.js';
 import type { TenantScopeDeps } from '../tenantScope.js';
 
@@ -65,7 +77,14 @@ export interface ShopifyWebhookDeps {
   readonly hasher: IdentityHasher;
   readonly cipher: CredentialsCipher;
   readonly shopifySyncQueue: Queue<ShopifySyncJob>;
+  /** Durable Redis: read for the erased-identity list when an order is stored (HLD §6b). */
+  readonly redis: SuppressionReader;
+  /** HLD §8 `identity-stitch`: an applied order enqueues attempt 0 (identity-stitching.md §2.1). */
+  readonly identityStitchQueue: Pick<Queue<IdentityStitchJob>, 'add'>;
 }
+
+/** What applying an order needs beyond the database: the suppression check and the stitch queue. */
+type OrderApplyDeps = Pick<ShopifyWebhookDeps, 'redis' | 'identityStitchQueue'>;
 
 /** Logs a structured, redacted line — field paths only, never the received value (M1-2 review item 6). */
 function reportValidationFailure(event: string, topic: string, fields: readonly string[]): void {
@@ -162,6 +181,7 @@ async function applyOrderSnapshot(
   scope: TenantScope,
   storeId: string,
   hasher: IdentityHasher,
+  identity: OrderApplyDeps,
   snapshot: ShopifyOrderSnapshot,
   eventStatus: 'created' | 'updated' | 'cancelled' | 'refund' | 'fulfillment',
   rawRef: string,
@@ -185,7 +205,16 @@ async function applyOrderSnapshot(
     );
   }
 
-  await createOrderRepository(deps.db).applySnapshot(scope, {
+  // HLD §6b: an erased shopper's order is stored without their hashes (and so is never stitched to a
+  // visitor); the revenue still counts, as Unattributed. The check tries every key version's hash.
+  const erased = await isIdentityErased(
+    identity.redis,
+    storeId,
+    fields.identityLookup,
+    Math.floor(Date.now() / 1000),
+  );
+
+  const applied = await createOrderRepository(deps.db).applySnapshot(scope, {
     storeId,
     externalOrderId: snapshot.externalOrderId,
     createdAtPlatform: fields.createdAtPlatform,
@@ -197,8 +226,8 @@ async function applyOrderSnapshot(
     fulfilmentStatus: fields.fulfilmentStatus,
     cancelledAt: fields.cancelledAt,
     pincodePrefix: fields.pincodePrefix,
-    phoneHashHmac: fields.phoneHashHmac,
-    emailHashHmac: fields.emailHashHmac,
+    phoneHashHmac: erased ? null : fields.phoneHashHmac,
+    emailHashHmac: erased ? null : fields.emailHashHmac,
     landingSite: fields.landingSite,
     referringSite: fields.referringSite,
     noteAttributes: fields.noteAttributes,
@@ -207,6 +236,15 @@ async function applyOrderSnapshot(
     eventStatus,
     rawRef,
   });
+
+  // Stitch the order to its visitor (identity-stitching.md §2.1). Enqueued on every apply, not only a
+  // new event: a crash between the apply and this call would otherwise lose the job for good, and the
+  // job id dedupes the repeats (a completed job is kept 30 days).
+  await identity.identityStitchQueue.add(
+    'stitch',
+    { storeId, orderId: applied.orderId, attempt: 0 },
+    { jobId: identityStitchJobId(applied.orderId, 0), ...IDENTITY_STITCH_JOB_OPTIONS },
+  );
 }
 
 const ORDER_EVENT_STATUS_BY_TOPIC: Readonly<
@@ -223,6 +261,7 @@ async function handleOrderWebhook(
   scope: TenantScope,
   storeId: string,
   hasher: IdentityHasher,
+  identity: OrderApplyDeps,
   shopifyTopic: (typeof ORDERS_TOPICS)[number],
   rawBody: Buffer,
   webhookId: string,
@@ -249,6 +288,7 @@ async function handleOrderWebhook(
     scope,
     storeId,
     hasher,
+    identity,
     snapshot,
     ORDER_EVENT_STATUS_BY_TOPIC[shopifyTopic],
     webhookId,
@@ -268,6 +308,7 @@ async function handleOrderHintWebhook(
   storeId: string,
   shop: string,
   hasher: IdentityHasher,
+  identity: OrderApplyDeps,
   credentialsDeps: { readonly adapter: ShopifyAdapter; readonly cipher: CredentialsCipher },
   shopifyTopic: (typeof ORDER_HINTS_TOPICS)[number],
   rawBody: Buffer,
@@ -311,7 +352,16 @@ async function handleOrderHintWebhook(
   }
 
   const eventStatus = shopifyTopic === 'refunds/create' ? 'refund' : 'fulfillment';
-  await applyOrderSnapshot(deps, scope, storeId, hasher, snapshot, eventStatus, webhookId);
+  await applyOrderSnapshot(
+    deps,
+    scope,
+    storeId,
+    hasher,
+    identity,
+    snapshot,
+    eventStatus,
+    webhookId,
+  );
 }
 
 /**
@@ -459,6 +509,7 @@ export function registerShopifyWebhookRoutes(
             scope,
             resolved.id,
             webhook.hasher,
+            webhook,
             shopifyTopic,
             rawBody,
             webhookId,
@@ -474,6 +525,7 @@ export function registerShopifyWebhookRoutes(
             resolved.id,
             shopDomainHeader.toLowerCase(),
             webhook.hasher,
+            webhook,
             { adapter: webhook.adapter, cipher: webhook.cipher },
             shopifyTopic,
             rawBody,

@@ -45,20 +45,61 @@ const INSERT_SETTINGS = {
 
 // ClickHouse parameter types we actually bind (HLD §6/§8 column types used by tenant-scoped
 // queries). Extend as new query shapes need them — never accept an arbitrary type string.
-export type ClickHouseParamType = 'UUID' | 'String' | 'DateTime64(3)' | 'Int64' | 'UInt8';
+export type ClickHouseParamType =
+  'UUID' | 'String' | 'DateTime64(3)' | 'Int64' | 'UInt8' | 'Array(String)';
 
 export interface WhereCondition {
-  readonly op: '=' | '!=' | '>' | '>=' | '<' | '<=';
+  /** `IN` takes a list and must be typed `Array(String)`; every other operator takes one value. */
+  readonly op: '=' | '!=' | '>' | '>=' | '<' | '<=' | 'IN';
   readonly value: unknown;
   readonly type: ClickHouseParamType;
+}
+
+/**
+ * Aggregates the builder can emit, by name — a caller never supplies SQL. The `*EpochMs` forms return
+ * the min/max of a DateTime64 as epoch milliseconds (an Int64, which JSON delivers as a string: parse it
+ * with parseClickHouseInt64), so callers needn't interpret a time zone.
+ */
+export type AggregateFn = 'count' | 'uniqExact' | 'min' | 'max' | 'minEpochMs' | 'maxEpochMs';
+
+export interface AggregateColumn {
+  readonly fn: AggregateFn;
+  /** Not used by `count`. */
+  readonly column?: string;
+  /** The result key. */
+  readonly as: string;
 }
 
 export interface ScopedSelectOptions {
   readonly table: ClickHouseTableName;
   readonly columns: readonly string[];
+  /** Emitted after `columns`, each as `fn(column) AS as`. Pair with `groupBy` for the plain columns. */
+  readonly aggregates?: readonly AggregateColumn[];
+  readonly groupBy?: readonly string[];
+  /** `FROM table FINAL`: collapse ReplacingMergeTree duplicates at read time (ADR-0017). */
+  readonly final?: boolean;
   readonly where?: Readonly<Record<string, WhereCondition>>;
   readonly orderBy?: string;
   readonly limit?: number;
+}
+
+function aggregateSql(a: AggregateColumn): string {
+  const alias = assertSafeIdentifier(a.as);
+  if (a.fn === 'count') return `count() AS ${alias}`;
+  if (a.column === undefined) throw new Error(`Aggregate ${a.fn} needs a column`);
+  const column = assertSafeIdentifier(a.column);
+  switch (a.fn) {
+    case 'uniqExact':
+      return `uniqExact(${column}) AS ${alias}`;
+    case 'min':
+      return `min(${column}) AS ${alias}`;
+    case 'max':
+      return `max(${column}) AS ${alias}`;
+    case 'minEpochMs':
+      return `toUnixTimestamp64Milli(min(${column})) AS ${alias}`;
+    case 'maxEpochMs':
+      return `toUnixTimestamp64Milli(max(${column})) AS ${alias}`;
+  }
 }
 
 export interface ScopedClickHouse {
@@ -93,21 +134,32 @@ export function ch(client: ClickHouseClient, scope: Scope, storeId: string): Sco
 
     async select<T = Record<string, unknown>>(opts: ScopedSelectOptions): Promise<T[]> {
       assertKnownTable(opts.table);
-      const columns = opts.columns.map(assertSafeIdentifier).join(', ');
+      const selectList = [
+        ...opts.columns.map(assertSafeIdentifier),
+        ...(opts.aggregates ?? []).map(aggregateSql),
+      ];
+      if (selectList.length === 0) throw new Error('select() needs at least one column');
+      const columns = selectList.join(', ');
 
       const whereClauses = ['store_id = {store_id:UUID}'];
       const params: Record<string, unknown> = { store_id: storeId };
 
       for (const [column, condition] of Object.entries(opts.where ?? {})) {
         assertSafeIdentifier(column);
+        if ((condition.op === 'IN') !== (condition.type === 'Array(String)')) {
+          throw new Error('IN takes an Array(String) and Array(String) is only for IN');
+        }
         const paramName = `w_${column}`;
         whereClauses.push(`${column} ${condition.op} {${paramName}:${condition.type}}`);
         params[paramName] = condition.value;
       }
 
+      const groupBy = opts.groupBy?.length
+        ? ` GROUP BY ${opts.groupBy.map(assertSafeIdentifier).join(', ')}`
+        : '';
       const orderBy = opts.orderBy ? ` ORDER BY ${assertSafeIdentifier(opts.orderBy)}` : '';
       const limit = opts.limit !== undefined ? ` LIMIT ${Math.trunc(opts.limit)}` : '';
-      const query = `SELECT ${columns} FROM ${opts.table} WHERE ${whereClauses.join(' AND ')}${orderBy}${limit}`;
+      const query = `SELECT ${columns} FROM ${opts.table}${opts.final ? ' FINAL' : ''} WHERE ${whereClauses.join(' AND ')}${groupBy}${orderBy}${limit}`;
 
       const result = await client.query({ query, query_params: params, format: 'JSONEachRow' });
       return result.json<T>();

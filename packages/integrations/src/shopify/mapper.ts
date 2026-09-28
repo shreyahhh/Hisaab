@@ -149,6 +149,12 @@ export interface MappedOrderFields {
   readonly pincodePrefix: string | null;
   readonly phoneHashHmac: VersionedHmac | null;
   readonly emailHashHmac: VersionedHmac | null;
+  /**
+   * The phone and email HMACs under every read key version — what an erased-identity lookup must try
+   * (HLD §8, privacy-dpdp.md §4.1: a suppression entry may have been written under an older version).
+   * Never stored: the write-version hashes above are.
+   */
+  readonly identityLookup: readonly VersionedHmac[];
   readonly landingSite: string | null;
   readonly referringSite: string | null;
   readonly noteAttributes: NoteAttribute[];
@@ -200,6 +206,7 @@ export function mapOrderSnapshot(
     pincodePrefix: pincodePrefixFromZip(snapshot.shippingAddressZip),
     phoneHashHmac: identity.phoneHmac ?? null,
     emailHashHmac: identity.emailHmac ?? null,
+    identityLookup: identity.lookup,
     landingSite: snapshot.landingSite ? sanitiseUrl(snapshot.landingSite) : null,
     referringSite: snapshot.referringSite ? sanitiseReferrer(snapshot.referringSite) : null,
     noteAttributes: filterNoteAttributes(snapshot.noteAttributes),

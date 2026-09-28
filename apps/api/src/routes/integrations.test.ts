@@ -10,6 +10,7 @@ import {
   testDb,
   testHasher,
   testRedis,
+  testIdentityStitchQueue,
   testShopifySyncQueue,
   TEST_DASHBOARD_URL,
   TEST_SHOPIFY_OAUTH_STATE_SECRET,
@@ -111,6 +112,7 @@ function appWith(adapterOptions: FakeAdapterOptions = {}) {
       appUrl: 'http://localhost:3000',
       dashboardUrl: TEST_DASHBOARD_URL,
       shopifySyncQueue: testShopifySyncQueue,
+      identityStitchQueue: testIdentityStitchQueue,
     },
   });
 }

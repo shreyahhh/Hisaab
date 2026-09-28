@@ -24,10 +24,10 @@ This module links visitors, sessions and orders into a journey per shopper, with
 
 ### 2.1 Queue job
 `IdentityStitchJob{storeId, orderId, attempt: 0|1|2}` on queue `identity-stitch` (HLD §8). `orderId` is our `orders.id`, not the Shopify id.
-- BullMQ `jobId = stitch:<orderId>:<attempt>`, so a re-delivered webhook can't double-schedule.
+- BullMQ `jobId = stitch:<orderId>:<attempt>` (exactly three `:`-separated parts, which BullMQ accepts), so a re-delivered webhook can't double-schedule. Jobs retry with exponential backoff (2 s base, 5 attempts) and completed jobs are kept 30 days, so the id keeps deduping; a job's last failure is copied to `identity-stitch-failed` (HLD §8).
 - Attempt 1 is delayed 5 min; attempt 2 is delayed 30 min after attempt 1.
 
-### 2.2 Functions (`apps/workers/src/identity/`; shared by the `identity-stitch`, `event-workers` and `attribution-run` processors, so it lives in the Workers app rather than a new package)
+### 2.2 Functions (`apps/workers/src/identity/` — M1-7 built `stitchOrder` and `resolveJourneyVisitors`; the event-side functions live in `event-workers`, M1-6b; shared by the `identity-stitch`, `event-workers` and `attribution-run` processors, so it lives in the Workers app rather than a new package)
 
 ```ts
 export type StitchOutcome =
@@ -64,7 +64,7 @@ export const IdentityStitchJobSchema = z.object({
 ```
 
 ### 2.3 Downstream jobs it enqueues
-- `AttributionRunJob{storeId, mode:'incremental', orderIds:[orderId]}` — `jobId = attr:<orderId>`, so repeats coalesce while waiting. The incremental attribution run then enqueues the `Purchase` CAPI job (HLD §6b; [attribution-engine.md §4.2](attribution-engine.md#42-incremental-run)).
+- `AttributionRunJob{storeId, mode:'incremental', orderIds:[orderId]}` — `jobId = attr-<orderId>` (a `-`, not the original `attr:<orderId>`: BullMQ rejects a two-part id containing `:`), so repeats coalesce while waiting. The `attribution-run` consumer lands with M3-2; until then the jobs simply wait. The incremental attribution run then enqueues the `Purchase` CAPI job (HLD §6b; [attribution-engine.md §4.2](attribution-engine.md#42-incremental-run)).
 
 No REST endpoints.
 
@@ -93,7 +93,7 @@ No new tables, keys or queues.
 3. Rotation window (privacy-dpdp §4.1): if the Collector supplied hashes for several key versions, one row per version is written.
 
 ### 4.2 Order side — `stitchOrder`
-Triggered by Core API on `orders/create` (and on `orders/updated` when `visitor_id` is still `NULL` and `attempt` 0 has not run), and by the Shopify backfill ([shopify-integration.md](shopify-integration.md)).
+Triggered by Core API after it applies an order snapshot from any order webhook (`orders/*`, and the refund/fulfilment hints, which fetch and apply the full order) — always enqueued, because the job id dedupes it and a crash between the apply and the enqueue would otherwise lose the job — and by the Shopify backfill ([shopify-integration.md](shopify-integration.md)), which enqueues attempt 2 for every applied order. Both apply paths also store an order without its phone/email hashes when the identity is on the erased list (HLD §6b; `packages/privacy` `isIdentityErased`, trying every read key version).
 
 1. Load the order through the scoped repository. Missing → `skipped/order_missing` (acked; the backfill or reconciliation will re-create it).
 2. **Suppression gate.**
@@ -104,8 +104,8 @@ Triggered by Core API on `orders/create` (and on `orders/updated` when `visitor_
    - Else `GET checkout:<s>:<external_order_id>` → if present, set `orders.visitor_id` (guarded by `IS NULL`) → matched via `checkout_key`.
    - A visitor found here is still checked against the erased and withdrawn visitor sets (`HMAC(visitor_id)`); a suppressed visitor is dropped from the result.
 4. **Rule 3 — HMAC fallback** (skipped when `stores.child_directed = true`, pending privacy-dpdp Open question 1):
-   - Query `identity_links FINAL WHERE store_id=? AND identity_hash_hmac IN (phoneHmac, emailHmac)`.
-   - **Phone first**: if any rows match the phone hash, use only those; otherwise use the email-hash rows.
+   - Query `identity_links FINAL WHERE store_id=? AND identity_hash_hmac IN (…)` through the scoped ClickHouse builder (M1-7 added `FINAL`, `IN` on string arrays, aggregates and `GROUP BY` to it).
+   - **Phone first**: the first of the two hashes that has any link and passes the guard is the only one used; the email hash is used only when the phone has no usable links. The choice is made *before* the suppression and `first_seen` filters below, so a phone whose only visitors are filtered out does not fall back to email.
    - Remove suppressed visitors.
    - **Dummy numbers never reach this step.** The blocklist (repeated digits, repeated two-digit blocks, ascending or descending runs such as `1234567890`, plus a platform list) is applied in `normalisePhone` before hashing ([privacy-dpdp.md §4.1](privacy-dpdp.md#41-hashing-the-tenant-key-and-key-rotation)), so such orders have no phone HMAC at all.
    - **Low-quality identifier guard** (for shared numbers that look real): if the chosen hash links more than **20 visitors**, or appears on more than **50 orders in 90 days**, treat it as a shared or dummy identifier and ignore it. Examples: `9999999999`, a store's own number, a courier agent's phone entered for many COD orders. The guard uses `uniqExact(visitor_id)` on `identity_links` and a `count(*)` on `orders`, both scoped by store. It is checked before the result is used.
@@ -115,7 +115,7 @@ Triggered by Core API on `orders/create` (and on `orders/updated` when `visitor_
    - `attempt < 2`: re-enqueue `IdentityStitchJob{attempt: attempt+1}` with delay 5 min (to attempt 1) or 30 min (to attempt 2) → outcome `retry`. The delays cover `checkout_completed` arriving late (pixel batching, network), `event-workers` lag, and the webhook arriving before the pixel event.
    - `attempt = 2`: UTM fallback (rule 4). Set `orders.attribution_confidence='low'` → outcome `utm_fallback`. The attribution engine builds the fallback touchpoint from `orders.landing_site` / `referring_site` / `note_attributes`.
 6. On `matched` or `utm_fallback`:
-   - `matched` also sets `orders.attribution_confidence='high'` (a later match can upgrade a `low`).
+   - `matched` also sets `orders.attribution_confidence='high'` (a later match can upgrade a `low`); the UTM fallback sets `low` **only if the order is not already `high`** (a backfill re-enqueues attempt 2 for orders that may have matched earlier, and must not downgrade them).
    - Enqueue `AttributionRunJob` (incremental). The run enqueues `Purchase` CAPI; `capi-dispatch` performs its own consent, suppression and child-directed checks ([meta-integration.md](meta-integration.md)).
 7. On `retry`, nothing is enqueued downstream yet. The order is shown as "attribution pending" on the journey view for up to ~35 min.
 
@@ -217,8 +217,8 @@ Result: no journey, no attribution beyond Unattributed revenue, no CAPI, and no 
 - Test 7 (cross-tenant): scenario 7 above.
 
 ## 9. Open questions
-1. **Child-directed stores**: disable the HMAC fallback? Currently implemented as "skip" pending legal (privacy-dpdp Q1).
-2. **Guard thresholds** (§7) need calibrating on real COD data. Should merchants be able to see and whitelist a flagged identifier (for example a genuine repeat buyer with 60 orders)? Proposed: not in MVP.
-3. **Email fallback when a phone matches nothing new.** SPEC says "phone first, then email". This design uses email only when the phone has *no* links. The alternative is the union of both. The union stitches more but risks over-merging shared family emails. Proposed: phone-first as written.
-4. **Pixel order id format** (`checkout.order.id`) is not documented. The normaliser handles both a GID and a numeric id; confirm in a dev store.
-5. **Placeholder emails.** COD checkouts often collect filler emails (`noemail@gmail.com`, `test@test.com`, `na@na.com`). Add an email blocklist alongside the phone one? Proposed: yes, as a platform list in `packages/shared/constants.ts` (needs design-partner data to seed).
+1. *(resolved 2026-09-28: skip the HMAC fallback for child-directed stores, pending legal — privacy-dpdp Q1.)*
+2. *(resolved 2026-09-28: no merchant whitelist in MVP; the guard thresholds still need calibrating on real COD data — §7.)*
+3. *(resolved 2026-09-28: phone-first as written, not the union.)*
+4. *(resolved in code 2026-09-28: `normaliseOrderId` accepts both a GID and a numeric id. **Still unverified against a real dev store** — issue #43.)*
+5. **Placeholder emails — deferred (GitHub issue).** COD checkouts often collect filler emails (`noemail@gmail.com`, `test@test.com`, `na@na.com`). Add an email blocklist alongside the phone one? Proposed: yes, as a platform list in `packages/shared/constants.ts` (needs design-partner data to seed).

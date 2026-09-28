@@ -7,7 +7,7 @@ import type { Auth } from '@truepath/auth';
 import { createAuditLogRepository, type Db } from '@truepath/db';
 import type { ShopifyAdapter } from '@truepath/integrations';
 import type { CredentialsCipher, IdentityHasher } from '@truepath/privacy';
-import type { ShopifySyncJob } from '@truepath/shared';
+import type { IdentityStitchJob, ShopifySyncJob } from '@truepath/shared';
 import { createAuditService, type AuditService } from './audit.js';
 import { registerAuthBridge } from './authBridge.js';
 import { registerAuthErrorHandler, type ErrorReporter } from './errors.js';
@@ -45,6 +45,8 @@ export interface ShopifyDeps {
   readonly dashboardUrl: string;
   /** HLD §8 `shopify-sync` queue — the callback enqueues `mode:'backfill'` on a successful connect. */
   readonly shopifySyncQueue: Queue<ShopifySyncJob>;
+  /** HLD §8 `identity-stitch` queue — an applied order webhook enqueues attempt 0 (M1-7). */
+  readonly identityStitchQueue: Queue<IdentityStitchJob>;
   /** Public Collector base URL baked into the pixel's settings (M1-4). Unset → the pixel isn't installed. */
   readonly collectorUrl?: string;
 }
@@ -144,6 +146,8 @@ export function buildApp(deps: AppDeps): FastifyInstance {
       hasher: deps.shopify.hasher,
       cipher: deps.shopify.cipher,
       shopifySyncQueue: deps.shopify.shopifySyncQueue,
+      redis: deps.shopify.redis,
+      identityStitchQueue: deps.shopify.identityStitchQueue,
     });
   });
 

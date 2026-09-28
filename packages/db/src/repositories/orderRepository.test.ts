@@ -308,3 +308,116 @@ describe('OrderRepository.applySnapshot (shopify-integration.md §4.4)', () => {
     }
   });
 });
+
+describe('OrderRepository — identity-stitching methods', () => {
+  const HASH = (n: number): string => `k1:${n.toString(16).padStart(64, '0')}`;
+
+  async function withTenant<T>(
+    fn: (t: Awaited<ReturnType<typeof seedTestTenant>>, scope: TenantScope) => Promise<T>,
+  ): Promise<T> {
+    const tenant = await seedTestTenant('stitch-repo');
+    try {
+      return await fn(tenant, jobScope(tenant.organizationId, tenant.storeId));
+    } finally {
+      await cleanupTestTenant(tenant);
+    }
+  }
+
+  it('getById finds an order in its own store, and nothing in another store', async () => {
+    await withTenant(async (t, scope) => {
+      const repo = createOrderRepository(db);
+      const { orderId } = await repo.applySnapshot(scope, baseInput(t.storeId));
+      expect((await repo.getById(scope, t.storeId, orderId))?.externalOrderId).toBe('1001');
+      expect(await repo.getById(scope, t.storeId, randomUUID())).toBeNull();
+
+      const other = await seedTestTenant('stitch-repo-other');
+      try {
+        // the order exists, but not in the other store: same id, different store → not found
+        expect(
+          await repo.getById(jobScope(other.organizationId, other.storeId), other.storeId, orderId),
+        ).toBeNull();
+      } finally {
+        await cleanupTestTenant(other);
+      }
+    });
+  });
+
+  it('linkVisitorIfUnset sets the visitor once and never overwrites it', async () => {
+    await withTenant(async (t, scope) => {
+      const repo = createOrderRepository(db);
+      const { orderId } = await repo.applySnapshot(scope, baseInput(t.storeId));
+      expect(await repo.linkVisitorIfUnset(scope, t.storeId, orderId, 'visitor-1')).toBe(true);
+      expect(await repo.linkVisitorIfUnset(scope, t.storeId, orderId, 'visitor-2')).toBe(false);
+      expect((await repo.getById(scope, t.storeId, orderId))?.visitorId).toBe('visitor-1');
+    });
+  });
+
+  it('setAttributionConfidence writes high and low, and a later match upgrades low to high', async () => {
+    await withTenant(async (t, scope) => {
+      const repo = createOrderRepository(db);
+      const { orderId } = await repo.applySnapshot(scope, baseInput(t.storeId));
+      expect((await repo.getById(scope, t.storeId, orderId))?.attributionConfidence).toBeNull();
+      await repo.setAttributionConfidence(scope, t.storeId, orderId, 'low');
+      expect((await repo.getById(scope, t.storeId, orderId))?.attributionConfidence).toBe('low');
+      await repo.setAttributionConfidence(scope, t.storeId, orderId, 'high');
+      expect((await repo.getById(scope, t.storeId, orderId))?.attributionConfidence).toBe('high');
+    });
+  });
+
+  it('countOrdersByIdentityHash counts phone or email matches inside the window, in this store only', async () => {
+    await withTenant(async (t, scope) => {
+      const repo = createOrderRepository(db);
+      const at = (day: number) => new Date(`2026-09-${String(day).padStart(2, '0')}T10:00:00Z`);
+      await repo.applySnapshot(
+        scope,
+        baseInput(t.storeId, {
+          externalOrderId: 'a',
+          createdAtPlatform: at(20),
+          phoneHashHmac: HASH(1) as never,
+        }),
+      );
+      await repo.applySnapshot(
+        scope,
+        baseInput(t.storeId, {
+          externalOrderId: 'b',
+          createdAtPlatform: at(21),
+          emailHashHmac: HASH(1) as never,
+        }),
+      );
+      await repo.applySnapshot(
+        scope,
+        baseInput(t.storeId, {
+          externalOrderId: 'c',
+          createdAtPlatform: at(1),
+          phoneHashHmac: HASH(1) as never,
+        }),
+      ); // before the window
+      await repo.applySnapshot(
+        scope,
+        baseInput(t.storeId, {
+          externalOrderId: 'd',
+          createdAtPlatform: at(22),
+          phoneHashHmac: HASH(2) as never,
+        }),
+      );
+
+      expect(await repo.countOrdersByIdentityHash(scope, t.storeId, HASH(1), at(10))).toBe(2);
+      expect(await repo.countOrdersByIdentityHash(scope, t.storeId, HASH(1), at(1))).toBe(3);
+      expect(await repo.countOrdersByIdentityHash(scope, t.storeId, HASH(3), at(1))).toBe(0);
+
+      const other = await seedTestTenant('stitch-repo-other2');
+      try {
+        expect(
+          await repo.countOrdersByIdentityHash(
+            jobScope(other.organizationId, other.storeId),
+            other.storeId,
+            HASH(1),
+            at(1),
+          ),
+        ).toBe(0);
+      } finally {
+        await cleanupTestTenant(other);
+      }
+    });
+  });
+});

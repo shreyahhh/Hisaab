@@ -1,5 +1,7 @@
 import { createHmac, randomUUID } from 'node:crypto';
 import { cleanupTestTenant, seedTestTenant, type TestTenant } from '@truepath/db/testing';
+import { storeContext } from '@truepath/privacy';
+import { storeBoundScope, suppressionSetKey } from '@truepath/shared';
 import { createIntegrationRepository, jobScope, schema, type Db } from '@truepath/db';
 import type { ShopifyAdapter, ShopifyOrderSnapshot } from '@truepath/integrations';
 import { eq } from 'drizzle-orm';
@@ -8,6 +10,9 @@ import {
   buildTestApp,
   testCredentialsCipher,
   testDb,
+  testHasher,
+  testIdentityStitchQueue,
+  testRedis,
   testShopify,
   testShopifySyncQueue,
 } from '../testApp.js';
@@ -1140,5 +1145,143 @@ describe('POST /webhooks/shopify/app — bulk_operations/finish (M1-3b)', () => 
     });
     expect(res.statusCode).toBe(200);
     expect(await jobFor(gid)).toBeUndefined();
+  });
+});
+
+describe('orders → identity-stitch (M1-7, identity-stitching.md §2.1) and erased identities (HLD §6b)', () => {
+  async function shopDomainOf(t: TestTenant): Promise<string> {
+    const [store] = await testDb
+      .select()
+      .from(schema.stores)
+      .where(eq(schema.stores.id, t.storeId));
+    return store!.shopDomain;
+  }
+  async function ordersOf(t: TestTenant) {
+    return testDb.select().from(schema.orders).where(eq(schema.orders.storeId, t.storeId));
+  }
+  async function onlyOrder(t: TestTenant) {
+    const rows = await ordersOf(t);
+    expect(rows).toHaveLength(1);
+    return rows[0]!;
+  }
+  /** The attempt-0 job for an order, removed after the test so the shared queue stays clean. */
+  async function stitchJob(orderId: string) {
+    const job = await testIdentityStitchQueue.getJob(`stitch:${orderId}:0`);
+    if (job) cleanups.push(async () => void (await job.remove().catch(() => undefined)));
+    return job;
+  }
+  async function markErased(t: TestTenant, hash: string) {
+    const key = suppressionSetKey(storeBoundScope(t.storeId), t.storeId, 'erased:identity');
+    await testRedis.zadd(key, Math.floor(Date.now() / 1000) + 10_000, hash);
+    cleanups.push(async () => void (await testRedis.del(key)));
+  }
+  const HASH_SHAPE = /^k\d+:[0-9a-f]{64}$/;
+
+  it('orders/create enqueues attempt 0 for the stored order, with the LLD job id and retry policy', async () => {
+    const t = await tenant('webhook-stitch-create');
+    await sendWebhook({
+      topic: 'orders',
+      shopifyTopic: 'orders/create',
+      shopDomain: await shopDomainOf(t),
+      body: orderWebhookPayload({ phone: '+919812345671' }),
+    });
+    const order = await onlyOrder(t);
+    const job = await stitchJob(order.id);
+    expect(job?.data).toEqual({ storeId: t.storeId, orderId: order.id, attempt: 0 });
+    expect(job?.opts.attempts).toBe(5);
+    expect(job?.opts.backoff).toEqual({ type: 'exponential', delay: 2000 });
+  });
+
+  it('a later orders/updated for the same order does not create a second job (the job id is the key)', async () => {
+    const t = await tenant('webhook-stitch-dedupe');
+    const shopDomain = await shopDomainOf(t);
+    await sendWebhook({
+      topic: 'orders',
+      shopifyTopic: 'orders/create',
+      shopDomain,
+      body: orderWebhookPayload(),
+    });
+    const order = await onlyOrder(t);
+    await stitchJob(order.id);
+    await sendWebhook({
+      topic: 'orders',
+      shopifyTopic: 'orders/updated',
+      shopDomain,
+      body: orderWebhookPayload({ updated_at: '2026-09-01T11:00:00+05:30' }),
+    });
+    const jobs = await testIdentityStitchQueue.getJobs([
+      'waiting',
+      'delayed',
+      'active',
+      'completed',
+    ]);
+    expect(jobs.filter((j) => j.data.orderId === order.id)).toHaveLength(1);
+  });
+
+  it('a non-INR order is skipped: nothing stored, nothing enqueued', async () => {
+    const t = await tenant('webhook-stitch-non-inr');
+    await sendWebhook({
+      topic: 'orders',
+      shopifyTopic: 'orders/create',
+      shopDomain: await shopDomainOf(t),
+      body: orderWebhookPayload({ currency: 'USD' }),
+    });
+    expect(await ordersOf(t)).toEqual([]);
+  });
+
+  it("stores an erased shopper's order without their hashes, still enqueues the stitch, and keeps the revenue", async () => {
+    const t = await tenant('webhook-erased-identity');
+    const phone = '+919812345672';
+    await markErased(t, testHasher.hashPhone(storeContext(t.storeId), phone)!);
+
+    await sendWebhook({
+      topic: 'orders',
+      shopifyTopic: 'orders/create',
+      shopDomain: await shopDomainOf(t),
+      body: orderWebhookPayload({ phone, email: 'erased@example.com' }),
+    });
+    const order = await onlyOrder(t);
+    expect(order.phoneHashHmac).toBeNull();
+    expect(order.emailHashHmac).toBeNull();
+    expect(order.totalAmountPaise).toBe(129900); // the sale still counts, as Unattributed
+    expect((await stitchJob(order.id))?.data.attempt).toBe(0); // the stitcher then skips it as anonymised
+  });
+
+  it('an erased email alone is enough, and another shopper of the same store is unaffected', async () => {
+    const t = await tenant('webhook-erased-email');
+    const email = 'gone@example.com';
+    await markErased(t, testHasher.hashEmail(storeContext(t.storeId), email)!);
+    const shopDomain = await shopDomainOf(t);
+
+    await sendWebhook({
+      topic: 'orders',
+      shopifyTopic: 'orders/create',
+      shopDomain,
+      body: orderWebhookPayload({ id: 3001, email }),
+    });
+    await sendWebhook({
+      topic: 'orders',
+      shopifyTopic: 'orders/create',
+      shopDomain,
+      body: orderWebhookPayload({ id: 3002, email: 'kept@example.com' }),
+    });
+    const byId = new Map((await ordersOf(t)).map((r) => [r.externalOrderId, r]));
+    expect(byId.get('3001')?.emailHashHmac).toBeNull();
+    expect(byId.get('3002')?.emailHashHmac).toMatch(HASH_SHAPE);
+  });
+
+  it("an erased identity in another store does not anonymise this store's order", async () => {
+    const t = await tenant('webhook-erased-own');
+    const other = await tenant('webhook-erased-other');
+    const phone = '+919812345673';
+    await markErased(other, testHasher.hashPhone(storeContext(other.storeId), phone)!);
+
+    await sendWebhook({
+      topic: 'orders',
+      shopifyTopic: 'orders/create',
+      shopDomain: await shopDomainOf(t),
+      body: orderWebhookPayload({ phone }),
+    });
+    expect((await onlyOrder(t)).phoneHashHmac).toMatch(HASH_SHAPE);
   });
 });

@@ -1,4 +1,4 @@
-import { and, eq, or, sql } from 'drizzle-orm';
+import { and, eq, gte, isNull, or, sql } from 'drizzle-orm';
 import { assertStoreInScope, type Scope } from '@truepath/shared';
 import type { Db } from '../client.js';
 import { orders, orderStatusEvents } from '../schema/index.js';
@@ -60,6 +60,35 @@ export interface OrderRepository {
    * new once serialized.
    */
   applySnapshot(scope: Scope, input: ApplyOrderSnapshotInput): Promise<ApplyOrderSnapshotResult>;
+
+  // ---- identity stitching (identity-stitching.md §3, §4.2) --------------------------------------------
+
+  /** The order by our own id, within the store; null if it doesn't exist there. */
+  getById(scope: Scope, storeId: string, orderId: string): Promise<OrderRow | null>;
+  /** Sets `visitor_id` only while it is still null (the primary `order_id` / `checkout:` match). True if it was set. */
+  linkVisitorIfUnset(
+    scope: Scope,
+    storeId: string,
+    orderId: string,
+    visitorId: string,
+  ): Promise<boolean>;
+  /** `high` on a match (a later match upgrades a `low`), `low` for the UTM fallback. */
+  setAttributionConfidence(
+    scope: Scope,
+    storeId: string,
+    orderId: string,
+    confidence: 'high' | 'low',
+  ): Promise<void>;
+  /**
+   * How many of the store's orders carry this identity HMAC (as phone or email) and were created at or
+   * after `since`. The shared-identifier guard's order count (a courier agent's phone on many COD orders).
+   */
+  countOrdersByIdentityHash(
+    scope: Scope,
+    storeId: string,
+    identityHash: string,
+    since: Date,
+  ): Promise<number>;
 }
 
 /** The only sanctioned way to read/write `orders`/`order_status_events` (ADR-0016). */
@@ -202,6 +231,49 @@ export function createOrderRepository(db: Db): OrderRepository {
 
         return { orderId: existing.id, applied, isNewEvent: insertedEvent.length > 0 };
       });
+    },
+
+    async getById(scope, storeId, orderId) {
+      assertStoreInScope(scope, storeId);
+      const rows = await db
+        .select()
+        .from(orders)
+        .where(and(eq(orders.storeId, storeId), eq(orders.id, orderId)))
+        .limit(1);
+      return rows[0] ?? null;
+    },
+
+    async linkVisitorIfUnset(scope, storeId, orderId, visitorId) {
+      assertStoreInScope(scope, storeId);
+      const updated = await db
+        .update(orders)
+        .set({ visitorId })
+        .where(and(eq(orders.storeId, storeId), eq(orders.id, orderId), isNull(orders.visitorId)))
+        .returning({ id: orders.id });
+      return updated.length > 0;
+    },
+
+    async setAttributionConfidence(scope, storeId, orderId, confidence) {
+      assertStoreInScope(scope, storeId);
+      await db
+        .update(orders)
+        .set({ attributionConfidence: confidence })
+        .where(and(eq(orders.storeId, storeId), eq(orders.id, orderId)));
+    },
+
+    async countOrdersByIdentityHash(scope, storeId, identityHash, since) {
+      assertStoreInScope(scope, storeId);
+      const [row] = await db
+        .select({ n: sql<number>`count(*)::int` })
+        .from(orders)
+        .where(
+          and(
+            eq(orders.storeId, storeId),
+            or(eq(orders.phoneHashHmac, identityHash), eq(orders.emailHashHmac, identityHash)),
+            gte(orders.createdAtPlatform, since),
+          ),
+        );
+      return row?.n ?? 0;
     },
   };
 }

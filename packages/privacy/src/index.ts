@@ -50,6 +50,12 @@ export {
   type PiiFinding,
   type PiiKind,
 } from './redaction.js';
+export {
+  isIdentityErased,
+  visitorSuppression,
+  type SuppressionReader,
+  type VisitorSuppression,
+} from './suppression.js';
 export { generateIdentityMasterKey } from './generateKey.js';
 export {
   createCredentialsCipher,

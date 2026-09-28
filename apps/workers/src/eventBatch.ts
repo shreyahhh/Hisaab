@@ -18,6 +18,7 @@ import {
   classify,
   dedupeKey,
   externalReferrerHost,
+  normaliseOrderId,
   parseLanding,
   resolveFbc,
   sessionKey,
@@ -500,8 +501,11 @@ export async function processEventBatch(
           consentChanges.push({ kind: 'grant', visitorHmacs: hasher.hmacAll(hctx, e.visitor_id) });
         }
       } else if (e.event_name === 'checkout_completed') {
-        const orderId = e.properties['order_id'];
-        if (typeof orderId === 'string' && orderId !== '') {
+        // Shopify doesn't document the format of the pixel's order id: accept a GID or a number and
+        // store the numeric id `orders.external_order_id` holds (identity-stitching.md §4.1 step 2).
+        const rawOrderId = e.properties['order_id'];
+        const orderId = typeof rawOrderId === 'string' ? normaliseOrderId(rawOrderId) : null;
+        if (orderId !== null) {
           checkoutLinks.push({ externalOrderId: orderId, visitorId: e.visitor_id });
           checkoutWrites.push({ storeId, orderId, visitorId: e.visitor_id });
         }
