@@ -50,9 +50,56 @@ export interface ShopifySettingsPatch {
   readonly pixel_error_codes?: string;
 }
 
+export interface UpsertMetaIntegrationInput {
+  readonly storeId: string;
+  readonly externalAccountId: string; // Meta's own id for the *business* the token is issued to
+  /** Plaintext, JSON-serialised `MetaCredentials` — encrypted here, never by the caller (ADR-0023, mirrors `upsertShopify`). */
+  readonly credentialsJson: string;
+  readonly scopes: readonly string[];
+  readonly cipher: CredentialsCipher;
+}
+
+/**
+ * `integrations.settings` for a Meta integration (meta-integration.md §3; M1-8 only writes
+ * `ad_account_ids` and `warmup` — `capi`/`insights` land with M2/M4).
+ */
+export interface MetaSettingsPatch {
+  readonly ad_account_ids?: readonly string[];
+}
+
+/**
+ * `integrations.settings.warmup` (M1-8, meta-integration.md §2.2 `meta-warmup`): the running ledger
+ * behind the ≥ 1,500-calls / < 15%-errors Advanced Access requirement. Every field is optional so each
+ * run patches only what it knows; the stored object is the merge of all patches (mirrors
+ * `patchShopifyBackfillState`'s shape, not its lifecycle — there is no terminal state here, it runs
+ * indefinitely until App Review passes).
+ */
+export interface MetaWarmupStatePatch {
+  readonly calls_total?: number;
+  readonly calls_success?: number;
+  readonly calls_error?: number;
+  readonly last_run_at?: string;
+  /** A Graph API error code/subcode only — never a message, which can echo request data. */
+  readonly last_error_code?: string;
+}
+
 export interface IntegrationRepository {
   /** Creates the store's Shopify integration on first connect, or updates it on re-auth. */
   upsertShopify(scope: Scope, input: UpsertShopifyIntegrationInput): Promise<IntegrationRow>;
+  /** Creates or updates the store's Meta integration (M1-8: registered by the operator CLI, not OAuth yet). */
+  upsertMeta(scope: Scope, input: UpsertMetaIntegrationInput): Promise<IntegrationRow>;
+  /** Merges `patch` into the store's Meta `settings` (top-level keys only, atomically). No-op without an active Meta integration. */
+  patchMetaSettings(
+    scope: Scope,
+    storeId: string,
+    patch: MetaSettingsPatch,
+  ): Promise<IntegrationRow | null>;
+  /** Merges `patch` into the store's Meta `settings.warmup` ledger, creating it if absent. No-op without an active Meta integration. */
+  patchMetaWarmupState(
+    scope: Scope,
+    storeId: string,
+    patch: MetaWarmupStatePatch,
+  ): Promise<IntegrationRow | null>;
   /**
    * Looks the integration up *within* `organizationId`'s scope (ADR-0024): a foreign integration id
    * under the caller's own org, and a nonexistent id, both come back `null` — the same shape, by
@@ -170,6 +217,97 @@ export function createIntegrationRepository(db: Db): IntegrationRepository {
         if (!row) throw new Error('upsertShopify: insert/update did not return a row');
         return row;
       });
+    },
+
+    async upsertMeta(scope, input) {
+      assertStoreInScope(scope, input.storeId);
+      return db.transaction(async (tx) => {
+        // Same race the Shopify method guards against (concurrent connect/re-auth for one store) — see
+        // its comment. M1-8 has only one writer (the operator CLI), but the lock costs nothing and
+        // keeps the two methods' safety properties identical.
+        await tx.execute(
+          sql`select pg_advisory_xact_lock(hashtext(${`meta-integration:${input.storeId}`}))`,
+        );
+
+        const existingRows = await tx
+          .select({ id: integrations.id })
+          .from(integrations)
+          .where(and(eq(integrations.storeId, input.storeId), eq(integrations.provider, 'meta')))
+          .limit(1);
+        const id = existingRows[0]?.id ?? randomUUID();
+        const encryptedCredentials = input.cipher.encrypt(
+          { integrationId: id },
+          input.credentialsJson,
+        );
+
+        const [row] = await tx
+          .insert(integrations)
+          .values({
+            id,
+            storeId: input.storeId,
+            provider: 'meta',
+            externalAccountId: input.externalAccountId,
+            encryptedCredentials,
+            scopes: [...input.scopes],
+            status: 'active',
+            lastSyncedAt: new Date(),
+            error: null,
+          })
+          .onConflictDoUpdate({
+            target: [integrations.storeId, integrations.provider, integrations.externalAccountId],
+            set: {
+              encryptedCredentials,
+              scopes: [...input.scopes],
+              status: 'active',
+              lastSyncedAt: new Date(),
+              error: null,
+            },
+          })
+          .returning();
+        if (!row) throw new Error('upsertMeta: insert/update did not return a row');
+        return row;
+      });
+    },
+
+    async patchMetaSettings(scope, storeId, patch) {
+      assertStoreInScope(scope, storeId);
+      const [row] = await db
+        .update(integrations)
+        .set({
+          settings: sql`coalesce(${integrations.settings}, '{}'::jsonb) || ${JSON.stringify(patch)}::jsonb`,
+        })
+        .where(
+          and(
+            eq(integrations.storeId, storeId),
+            eq(integrations.provider, 'meta'),
+            eq(integrations.status, 'active'),
+          ),
+        )
+        .returning();
+      return row ?? null;
+    },
+
+    async patchMetaWarmupState(scope, storeId, patch) {
+      assertStoreInScope(scope, storeId);
+      const patchJson = JSON.stringify(patch);
+      const [row] = await db
+        .update(integrations)
+        .set({
+          settings: sql`jsonb_set(
+            coalesce(${integrations.settings}, '{}'::jsonb),
+            '{warmup}',
+            coalesce(${integrations.settings} -> 'warmup', '{}'::jsonb) || ${patchJson}::jsonb
+          )`,
+        })
+        .where(
+          and(
+            eq(integrations.storeId, storeId),
+            eq(integrations.provider, 'meta'),
+            eq(integrations.status, 'active'),
+          ),
+        )
+        .returning();
+      return row ?? null;
     },
 
     async revokeForOrganization(scope, organizationId, integrationId) {

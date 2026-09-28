@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "tsx watch src/index.ts",
     "dev:backfill": "tsx src/devShopifyBackfill.ts",
+    "dev:meta-warmup": "tsx src/devMetaWarmup.ts",
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "lint": "eslint .",

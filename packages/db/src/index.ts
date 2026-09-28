@@ -25,9 +25,23 @@ export {
   type BackfillStatePatch,
   type IntegrationRepository,
   type IntegrationRow,
+  type MetaSettingsPatch,
+  type MetaWarmupStatePatch,
   type ShopifySettingsPatch,
+  type UpsertMetaIntegrationInput,
   type UpsertShopifyIntegrationInput,
 } from './repositories/integrationRepository.js';
+export {
+  createAdAccountRepository,
+  type AdAccountRepository,
+  type AdAccountRow,
+  type UpsertAdAccountInput,
+} from './repositories/adAccountRepository.js';
+export {
+  createMetaWarmupSchedulingRepository,
+  type MetaWarmupSchedulingRepository,
+  type WarmupStore,
+} from './repositories/metaWarmupSchedulingRepository.js';
 export {
   createDsrRequestRepository,
   type CreateDsrRequestFromWebhookInput,

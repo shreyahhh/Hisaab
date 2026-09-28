@@ -3,6 +3,7 @@ import type { CredentialsCipher } from '@truepath/privacy';
 import type { Db } from '../client.js';
 import { createAuditLogRepository } from './auditLogRepository.js';
 import { createDpaAcceptanceRepository } from './dpaAcceptanceRepository.js';
+import { createAdAccountRepository } from './adAccountRepository.js';
 import { createChannelRuleRepository } from './channelRuleRepository.js';
 import { createDsrRequestRepository } from './dsrRequestRepository.js';
 import { createEventEffectsRepository } from './eventEffectsRepository.js';
@@ -207,6 +208,59 @@ export const repositoryRegistry: readonly RepositoryDescriptor[] = [
         scopeKind: 'store',
         invoke: (db, scope, storeId) =>
           createOrderRepository(db).countOrdersByIdentityHash(scope, storeId, 'k1:x', new Date()),
+      },
+    ],
+  },
+  {
+    name: 'AdAccountRepository',
+    methods: [
+      {
+        name: 'upsert',
+        scopeKind: 'store',
+        invoke: (db, scope, storeId) =>
+          createAdAccountRepository(db).upsert(scope, {
+            storeId,
+            provider: 'meta',
+            externalId: `cross-tenant-test-${storeId}`,
+            name: 'x',
+            currency: 'INR',
+            timezone: 'Asia/Kolkata',
+          }),
+      },
+      {
+        name: 'listByStore',
+        scopeKind: 'store',
+        invoke: (db, scope, storeId) =>
+          createAdAccountRepository(db).listByStore(scope, storeId, 'meta'),
+      },
+    ],
+  },
+  {
+    name: 'IntegrationRepository.meta',
+    methods: [
+      {
+        name: 'upsertMeta',
+        scopeKind: 'store',
+        invoke: (db, scope, storeId) =>
+          createIntegrationRepository(db).upsertMeta(scope, {
+            storeId,
+            externalAccountId: 'cross-tenant-test',
+            credentialsJson: '{}',
+            scopes: [],
+            cipher: UNUSED_CIPHER,
+          }),
+      },
+      {
+        name: 'patchMetaSettings',
+        scopeKind: 'store',
+        invoke: (db, scope, storeId) =>
+          createIntegrationRepository(db).patchMetaSettings(scope, storeId, { ad_account_ids: [] }),
+      },
+      {
+        name: 'patchMetaWarmupState',
+        scopeKind: 'store',
+        invoke: (db, scope, storeId) =>
+          createIntegrationRepository(db).patchMetaWarmupState(scope, storeId, { calls_total: 1 }),
       },
     ],
   },

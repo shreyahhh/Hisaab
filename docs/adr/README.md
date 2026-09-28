@@ -30,6 +30,7 @@ Michael Nygard format (Title, Status, Context, Decision, Consequences). **Accept
 | [0024](0024-shopify-integration-routes-nested-under-orgs.md) | Shopify connect/disconnect nested under `/v1/orgs/:id/integrations` | Accepted, narrows SPEC §10 | M1-1 review |
 | [0025](0025-shopify-oauth-state-token.md) | Shopify OAuth `state`: HMAC-signed token + single-use Redis nonce | Accepted | M1-1 review |
 | [0026](0026-event-workers-per-store-scope.md) | Event workers act under a one-store TenantScope, not a SystemScope (per-store ClickHouse inserts) | Accepted, refines ADR-0016 | M1-6 review |
+| [0027](0027-meta-warmup-token-registration.md) | Meta warm-up slice: token registration via an operator CLI, not OAuth | Accepted | M1-8 planning |
 
 **Decisions made during the review that are recorded in HLD §8 / SPEC v0.5 rather than as separate ADRs** (candidates to promote if they are ever revisited):
 - query-time delivered revenue via `order_status`;
