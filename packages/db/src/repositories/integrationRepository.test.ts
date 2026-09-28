@@ -313,3 +313,171 @@ describe('IntegrationRepository (ADR-0016, ADR-0023, ADR-0024)', () => {
     }
   });
 });
+
+describe('IntegrationRepository — Meta (M1-8)', () => {
+  it('creates a Meta integration, encrypted under its own row id like the Shopify one', async () => {
+    const tenant = await seedTestTenant('meta-repo-create');
+    try {
+      const repo = createIntegrationRepository(db);
+      const scope = jobScope(tenant.organizationId, tenant.storeId);
+      const cipher = createTestCredentialsCipher();
+
+      const created = await repo.upsertMeta(scope, {
+        storeId: tenant.storeId,
+        externalAccountId: 'biz_123',
+        credentialsJson: JSON.stringify({ accessToken: 'EAAtest' }),
+        scopes: ['ads_read'],
+        cipher,
+      });
+      expect(created).toMatchObject({
+        provider: 'meta',
+        status: 'active',
+        externalAccountId: 'biz_123',
+      });
+      expect(cipher.decrypt({ integrationId: created.id }, created.encryptedCredentials!)).toBe(
+        JSON.stringify({ accessToken: 'EAAtest' }),
+      );
+    } finally {
+      await cleanupTestTenant(tenant);
+    }
+  });
+
+  it('re-registering the same account updates the row rather than duplicating it', async () => {
+    const tenant = await seedTestTenant('meta-repo-reregister');
+    try {
+      const repo = createIntegrationRepository(db);
+      const scope = jobScope(tenant.organizationId, tenant.storeId);
+      const cipher = createTestCredentialsCipher();
+      const input = {
+        storeId: tenant.storeId,
+        externalAccountId: 'biz_1',
+        scopes: ['ads_read'],
+        cipher,
+      };
+
+      const first = await repo.upsertMeta(scope, {
+        ...input,
+        credentialsJson: JSON.stringify({ accessToken: 'old' }),
+      });
+      const second = await repo.upsertMeta(scope, {
+        ...input,
+        credentialsJson: JSON.stringify({ accessToken: 'new' }),
+      });
+      expect(second.id).toBe(first.id);
+      expect(cipher.decrypt({ integrationId: second.id }, second.encryptedCredentials!)).toBe(
+        JSON.stringify({ accessToken: 'new' }),
+      );
+
+      const active = await repo.getActiveByStore(scope, tenant.storeId, 'meta');
+      expect(active?.id).toBe(first.id);
+    } finally {
+      await cleanupTestTenant(tenant);
+    }
+  });
+
+  it('a Shopify and a Meta integration on the same store coexist as separate rows', async () => {
+    const tenant = await seedTestTenant('meta-repo-coexist');
+    try {
+      const repo = createIntegrationRepository(db);
+      const scope = jobScope(tenant.organizationId, tenant.storeId);
+      const cipher = createTestCredentialsCipher();
+      await repo.upsertShopify(scope, {
+        storeId: tenant.storeId,
+        externalAccountId: 'gid://shopify/Shop/9',
+        credentialsJson: '{}',
+        scopes: [],
+        cipher,
+      });
+      const meta = await repo.upsertMeta(scope, {
+        storeId: tenant.storeId,
+        externalAccountId: 'biz_9',
+        credentialsJson: '{}',
+        scopes: [],
+        cipher,
+      });
+      expect(await repo.getActiveByStore(scope, tenant.storeId, 'shopify')).not.toBeNull();
+      expect(await repo.getActiveByStore(scope, tenant.storeId, 'meta')).toMatchObject({
+        id: meta.id,
+      });
+    } finally {
+      await cleanupTestTenant(tenant);
+    }
+  });
+
+  it('patchMetaSettings merges ad_account_ids without touching other keys, and is a no-op without an active Meta integration', async () => {
+    const tenant = await seedTestTenant('meta-repo-settings');
+    try {
+      const repo = createIntegrationRepository(db);
+      const scope = jobScope(tenant.organizationId, tenant.storeId);
+      expect(
+        await repo.patchMetaSettings(scope, tenant.storeId, { ad_account_ids: ['act_1'] }),
+      ).toBeNull();
+
+      await repo.upsertMeta(scope, {
+        storeId: tenant.storeId,
+        externalAccountId: 'biz_settings',
+        credentialsJson: '{}',
+        scopes: [],
+        cipher: createTestCredentialsCipher(),
+      });
+      const patched = await repo.patchMetaSettings(scope, tenant.storeId, {
+        ad_account_ids: ['act_1', 'act_2'],
+      });
+      expect(patched?.settings).toEqual({ ad_account_ids: ['act_1', 'act_2'] });
+      const again = await repo.patchMetaWarmupState(scope, tenant.storeId, { calls_total: 1 });
+      // patching warmup must not clobber ad_account_ids written moments earlier
+      expect(again?.settings).toMatchObject({ ad_account_ids: ['act_1', 'act_2'] });
+    } finally {
+      await cleanupTestTenant(tenant);
+    }
+  });
+
+  it('patchMetaWarmupState merges into settings.warmup atomically, without clobbering other settings keys', async () => {
+    const tenant = await seedTestTenant('meta-repo-warmup');
+    try {
+      const repo = createIntegrationRepository(db);
+      const scope = jobScope(tenant.organizationId, tenant.storeId);
+      expect(await repo.patchMetaWarmupState(scope, tenant.storeId, { calls_total: 1 })).toBeNull();
+
+      await repo.upsertMeta(scope, {
+        storeId: tenant.storeId,
+        externalAccountId: 'biz_warmup',
+        credentialsJson: '{}',
+        scopes: [],
+        cipher: createTestCredentialsCipher(),
+      });
+      await repo.patchMetaSettings(scope, tenant.storeId, { ad_account_ids: ['act_1'] });
+      await repo.patchMetaWarmupState(scope, tenant.storeId, { calls_total: 1, calls_success: 1 });
+      const second = await repo.patchMetaWarmupState(scope, tenant.storeId, {
+        calls_total: 2,
+        last_run_at: '2026-09-29T00:00:00.000Z',
+      });
+      expect(second?.settings).toEqual({
+        ad_account_ids: ['act_1'],
+        warmup: { calls_total: 2, calls_success: 1, last_run_at: '2026-09-29T00:00:00.000Z' },
+      });
+    } finally {
+      await cleanupTestTenant(tenant);
+    }
+  });
+
+  it('refuses a scope that does not cover the store (ADR-0016)', async () => {
+    const a = await seedTestTenant('meta-repo-scope-a');
+    const b = await seedTestTenant('meta-repo-scope-b');
+    try {
+      const repo = createIntegrationRepository(db);
+      await expect(
+        repo.upsertMeta(jobScope(a.organizationId, a.storeId), {
+          storeId: b.storeId,
+          externalAccountId: 'biz_x',
+          credentialsJson: '{}',
+          scopes: [],
+          cipher: createTestCredentialsCipher(),
+        }),
+      ).rejects.toThrow();
+    } finally {
+      await cleanupTestTenant(a);
+      await cleanupTestTenant(b);
+    }
+  });
+});

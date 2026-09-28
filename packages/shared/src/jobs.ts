@@ -127,3 +127,43 @@ export const IDENTITY_STITCH_JOB_OPTIONS = {
 
 /** Same retry policy for the `attribution-run` jobs the stitcher enqueues (consumer lands with M3-2). */
 export const ATTRIBUTION_RUN_JOB_OPTIONS = IDENTITY_STITCH_JOB_OPTIONS;
+
+/** HLD §8: `ad-sync-meta`. */
+export const AD_SYNC_META_QUEUE = 'ad-sync-meta';
+
+/**
+ * HLD §8: `AdSyncMetaJob{storeId}` — the job derives its date range from its **repeatable-job name**
+ * (meta-integration.md §2.2), so the payload never changes across `meta-daily`/`meta-intraday`/
+ * `meta-backfill`/`meta-warmup`.
+ */
+export interface AdSyncMetaJob {
+  readonly storeId: string;
+}
+
+/** meta-integration.md §2.2: only `meta-warmup` (M1 App Review warm-up) is built; the other three land with M2. */
+export const AD_SYNC_META_JOB_NAMES = [
+  'meta-daily',
+  'meta-intraday',
+  'meta-backfill',
+  'meta-warmup',
+] as const;
+export type AdSyncMetaJobName = (typeof AD_SYNC_META_JOB_NAMES)[number];
+
+/**
+ * `meta-<storeId>-<name>-<yyyymmddhh>` (meta-integration.md §2.2 wrote `meta:<storeId>:<name>:<hh>` — a
+ * 4-part, 3-colon id; BullMQ 6.x rejects a custom job id containing `:` unless it has exactly 3 parts,
+ * the same constraint already hit for `dsr`/`identity-stitch` job ids, so this uses `-` instead). `now`
+ * is a Date so tests can pin it.
+ */
+export function adSyncMetaJobId(storeId: string, name: AdSyncMetaJobName, now: Date): string {
+  const iso = now.toISOString(); // "2026-09-29T01:14:14.000Z"
+  const stamp = iso.slice(0, 10).replace(/-/g, '') + iso.slice(11, 13); // YYYYMMDD + HH, UTC
+  return `meta-${storeId}-${name}-${stamp}`;
+}
+
+/** meta-integration.md §2.2 `meta-warmup`: every 15 minutes, until App Review passes (removed then). */
+export const META_WARMUP_INTERVAL_MS = 15 * 60_000;
+/** BullMQ Job Scheduler id (`queue.upsertJobScheduler`), stable per store so re-registering it on every Workers boot is idempotent. */
+export function metaWarmupSchedulerId(storeId: string): string {
+  return `meta-warmup-${storeId}`;
+}

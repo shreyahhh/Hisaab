@@ -37,6 +37,21 @@ The event-pipeline tests need the local Postgres, ClickHouse and durable Redis
 (`docker compose up`). They isolate the global names (readiness marker, streams) per run and namespace
 every other key by a freshly seeded store id.
 
+## `ad-sync-meta` — `meta-warmup` slice (M1-8)
+
+Builds the Marketing API call history Advanced Access / App Review needs, ahead of the real Meta OAuth connect (M2-1). See `docs/architecture/lld/meta-integration.md` §2.2 and ADR-0027.
+
+- No connect flow yet: register a store's ad account and access token by hand (stdin, never argv):
+  ```sh
+  pnpm --filter @truepath/workers dev:meta-warmup register <storeId> <adAccountId> <name> <currency> <timezone>
+  pnpm --filter @truepath/workers dev:meta-warmup start  <storeId>   # registers the repeatable 15-min job
+  pnpm --filter @truepath/workers dev:meta-warmup run    <storeId>   # enqueues one immediate run, to check it works
+  pnpm --filter @truepath/workers dev:meta-warmup status <storeId>   # prints non-secret state (ad accounts, the ledger)
+  ```
+- `metaWarmup.ts` — `runMetaWarmup` pulls `GET act_<id>/insights` for every account the store has registered (`packages/integrations` `createMetaAdapter`), writes what it gets to ClickHouse `ad_spend_daily`, and keeps a running success/error ledger in `integrations.settings.warmup`. One account failing doesn't stop the others; each run is logged (`meta_warmup_run`) with the ledger totals — there is no live dashboard yet (issue tracked).
+- At Workers boot, every store already registered gets its repeatable job re-registered (idempotent); a store registered *after* boot needs the `start` command until this is rescanned some other way.
+- No shopper data is involved, so this worker is never paused by the suppression rebuilder.
+
 ## `identity-stitch` (M1-7)
 
 Links each order to the visitor(s) whose journey it belongs to (`docs/architecture/lld/identity-stitching.md`).

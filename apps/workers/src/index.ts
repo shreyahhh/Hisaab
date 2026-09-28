@@ -4,10 +4,11 @@ import { fileURLToPath } from 'node:url';
 import { Queue, Worker } from 'bullmq';
 import { Redis } from 'ioredis';
 import { createClickHouseClient } from '@truepath/clickhouse';
-import { createDb } from '@truepath/db';
-import { createShopifyAdapter } from '@truepath/integrations';
+import { createDb, createMetaWarmupSchedulingRepository, createSystemScope } from '@truepath/db';
+import { createMetaAdapter, createShopifyAdapter } from '@truepath/integrations';
 import { createCredentialsCipher, createIdentityHasher } from '@truepath/privacy';
 import {
+  AD_SYNC_META_QUEUE,
   ATTRIBUTION_RUN_QUEUE,
   clickhouseEnvSchema,
   credentialsKeyEnvSchema,
@@ -17,12 +18,15 @@ import {
   identityKeyEnvSchema,
   loadDotEnvIfPresent,
   loadEnv,
+  META_WARMUP_INTERVAL_MS,
+  metaWarmupSchedulerId,
   postgresEnvSchema,
   redisDurableEnvSchema,
   SHOPIFY_OAUTH_SCOPES,
   SHOPIFY_SYNC_QUEUE,
   shopifyEnvSchema,
   uuidV7,
+  type AdSyncMetaJob,
   type AttributionRunJob,
   type DsrJob,
   type IdentityStitchJob,
@@ -31,15 +35,18 @@ import { processEventBatch } from './eventBatch.js';
 import { EventConsumer } from './eventConsumer.js';
 import { attachDeadLetter } from './deadLetter.js';
 import { createIdentityStitchProcessor } from './identity/stitch.js';
+import { runMetaWarmup } from './metaWarmup.js';
 import { createShopifySyncProcessor } from './shopifySync.js';
 import { StoreContextCache } from './storeEventContext.js';
 import { SuppressionRebuilder } from './suppressionRebuild.js';
 
-// Workers (HLD §8): shopify-sync (M1-3), event-workers (M1-6, the `stream:events-raw` consumer group)
-// and identity-stitch (M1-7) are built; ad-sync-meta, ad-sync-google-ads, shiprocket-sync,
-// attribution-run (enqueued to by identity-stitch; its consumer is M3-2), capi-dispatch, order-status-reconcile, retention and dsr land in later milestones
-// (the `dsr` queue is enqueued to by event-workers but has no consumer until M4-2). No cache-Redis
-// connection — that instance is only used by the API (report cache) and Better Auth rate limiting.
+// Workers (HLD §8): shopify-sync (M1-3), event-workers (M1-6, the `stream:events-raw` consumer group),
+// identity-stitch (M1-7) and the `meta-warmup` slice of ad-sync-meta (M1-8) are built; the rest of
+// ad-sync-meta, ad-sync-google-ads, shiprocket-sync, attribution-run (enqueued to by identity-stitch;
+// its consumer is M3-2), capi-dispatch, order-status-reconcile, retention and dsr land in later
+// milestones (the `dsr` queue is enqueued to by event-workers but has no consumer until M4-2). No
+// cache-Redis connection — that instance is only used by the API (report cache) and Better Auth rate
+// limiting.
 export const workersEnvSchema = postgresEnvSchema
   .and(clickhouseEnvSchema)
   .and(redisDurableEnvSchema)
@@ -123,6 +130,50 @@ function main(): void {
     log,
   );
   console.log('apps/workers: identity-stitch worker listening');
+
+  // ad-sync-meta / meta-warmup (M1-8, meta-integration.md §2.2): only the `meta-warmup` job name is
+  // implemented; meta-daily/meta-intraday/meta-backfill land with M2. No shopper data is touched (LLD
+  // §4.2 step 1: "Suppression isn't relevant"), so this is never paused by the rebuilder.
+  const metaAdapter = createMetaAdapter();
+  const metaWarmupWorker = new Worker<AdSyncMetaJob>(
+    AD_SYNC_META_QUEUE,
+    async (job) => {
+      if (job.name !== 'meta-warmup') {
+        throw new Error(`ad-sync-meta: job name '${job.name}' is not implemented yet`);
+      }
+      return runMetaWarmup(
+        { db, clickhouse, cipher, adapter: metaAdapter, now: () => new Date(), log },
+        job.data,
+      );
+    },
+    { connection },
+  );
+  attachDeadLetter(
+    metaWarmupWorker,
+    new Queue<AdSyncMetaJob>(`${AD_SYNC_META_QUEUE}-failed`, { connection }),
+    log,
+  );
+
+  // Registers the repeatable job for every store the operator has already registered an account for
+  // (idempotent: `upsertJobScheduler` keys on the stable per-store scheduler id). A store registered
+  // *after* boot needs `pnpm --filter @truepath/workers dev:meta-warmup start <storeId>` until this
+  // list is rescanned some other way — acceptable for a handful of design-partner/test accounts in M1.
+  void (async () => {
+    const metaWarmupQueue = new Queue<AdSyncMetaJob>(AD_SYNC_META_QUEUE, { connection });
+    const scope = await createSystemScope(db, 'scheduler_fanout', {
+      metadata: { for: 'meta_warmup' },
+    });
+    const warmupStores = await createMetaWarmupSchedulingRepository(db).listWarmupStores(scope);
+    for (const { storeId } of warmupStores) {
+      await metaWarmupQueue.upsertJobScheduler(
+        metaWarmupSchedulerId(storeId),
+        { every: META_WARMUP_INTERVAL_MS },
+        { name: 'meta-warmup', data: { storeId } },
+      );
+    }
+    log({ event: 'meta_warmup_scheduled', stores: warmupStores.length });
+  })();
+  console.log('apps/workers: meta-warmup worker listening');
 
   // event-workers (M1-6): the `stream:events-raw` consumer group.
   const stores = new StoreContextCache(db);

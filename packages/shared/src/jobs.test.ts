@@ -1,6 +1,11 @@
 import { describe, expect, it } from 'vitest';
 import {
+  AD_SYNC_META_JOB_NAMES,
+  AD_SYNC_META_QUEUE,
   ATTRIBUTION_RUN_QUEUE,
+  adSyncMetaJobId,
+  META_WARMUP_INTERVAL_MS,
+  metaWarmupSchedulerId,
   IDENTITY_STITCH_DELAY_MS,
   IDENTITY_STITCH_QUEUE,
   IdentityStitchJobSchema,
@@ -79,5 +84,45 @@ describe('normaliseOrderId', () => {
     '1'.repeat(21),
   ])('rejects %j', (raw) => {
     expect(normaliseOrderId(raw)).toBeNull();
+  });
+});
+
+describe('ad-sync-meta registry (HLD §8)', () => {
+  const storeId = '0192f3a4-7b1c-7c2d-8e3f-4a5b6c7d8e9f';
+  const now = new Date('2026-09-29T01:14:14.000Z');
+
+  it('names the queue exactly as HLD §8 registers it', () => {
+    expect(AD_SYNC_META_QUEUE).toBe('ad-sync-meta');
+  });
+
+  it('lists every job name meta-integration.md §2.2 defines, once each', () => {
+    expect(AD_SYNC_META_JOB_NAMES).toEqual([
+      'meta-daily',
+      'meta-intraday',
+      'meta-backfill',
+      'meta-warmup',
+    ]);
+    expect(new Set(AD_SYNC_META_JOB_NAMES).size).toBe(AD_SYNC_META_JOB_NAMES.length);
+  });
+
+  it('builds a job id BullMQ accepts, stamped to the hour in UTC', () => {
+    const id = adSyncMetaJobId(storeId, 'meta-warmup', now);
+    expect(bullmqAcceptsJobId(id)).toBe(true);
+    expect(id).toBe(`meta-${storeId}-meta-warmup-2026092901`);
+  });
+
+  it('differs by name and by hour, so distinct runs never collide', () => {
+    expect(adSyncMetaJobId(storeId, 'meta-warmup', now)).not.toBe(
+      adSyncMetaJobId(storeId, 'meta-daily', now),
+    );
+    expect(adSyncMetaJobId(storeId, 'meta-warmup', now)).not.toBe(
+      adSyncMetaJobId(storeId, 'meta-warmup', new Date('2026-09-29T02:00:00.000Z')),
+    );
+  });
+
+  it('runs every 15 minutes, and the scheduler id is stable per store', () => {
+    expect(META_WARMUP_INTERVAL_MS).toBe(900_000);
+    expect(metaWarmupSchedulerId(storeId)).toBe(`meta-warmup-${storeId}`);
+    expect(metaWarmupSchedulerId(storeId)).toBe(metaWarmupSchedulerId(storeId));
   });
 });

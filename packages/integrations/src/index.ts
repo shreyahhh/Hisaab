@@ -5,6 +5,33 @@
 
 export const PACKAGE_NAME = '@truepath/integrations';
 
+export { roundDecimalToPaise } from './money.js';
+export { createMetaAdapter, META_API_VERSION, type MetaAdapter } from './meta/adapter.js';
+export {
+  ATTRIBUTION_WINDOW as META_ATTRIBUTION_WINDOW,
+  InsightsRow as MetaInsightsRowSchema,
+  mapInsightsRow,
+  PURCHASE_ACTION_TYPES as META_PURCHASE_ACTION_TYPES,
+} from './meta/mapper.js';
+export {
+  decideRateLimit,
+  isThrottleError,
+  parseBusinessUseCaseUsage,
+  parseGraphApiError,
+  RATE_LIMIT_PAUSE_MS,
+  throttleBackoffMs,
+  THROTTLE_MAX_ATTEMPTS,
+  type BusinessUseCaseUsage,
+  type GraphApiError,
+  type RateLimitDecision,
+} from './meta/rateLimit.js';
+export type {
+  MetaCredentials,
+  MetaHealthStatus,
+  MetaInsightsRange,
+  MetaInsightsResult,
+  MetaSpendRow,
+} from './meta/types.js';
 export {
   createShopifyAdapter,
   ShopifyPixelError,
