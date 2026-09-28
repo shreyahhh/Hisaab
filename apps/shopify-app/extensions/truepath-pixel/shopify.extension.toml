@@ -1,0 +1,49 @@
+# TruePath Web Pixel (SPEC §7.1, shopify-integration.md §2.2). Format verified against
+# https://shopify.dev/docs/apps/build/marketing-analytics/build-web-pixels (2026-09): flat keys, not
+# `[[extensions]]`. `uid` is assigned by the Shopify CLI on first deploy — do not invent one here.
+type = "web_pixel_extension"
+name = "TruePath"
+runtime_context = "strict"
+
+# Consent gating (SPEC P-1): Shopify loads this pixel only when the shopper has consented to
+# analytics processing. Marketing consent is NOT required to load — the pixel reports it per batch
+# so the Collector can decide CAPI eligibility separately.
+[customer_privacy]
+analytics = true
+marketing = false
+preferences = false
+sale_of_data = "enabled"
+
+# Set by `webPixelCreate` at install (issue #28) — `webPixelCreate` fails if these don't match.
+[settings]
+type = "object"
+
+[settings.fields.storeKey]
+name = "Store key"
+description = "Public key identifying the store to the collector"
+type = "single_line_text_field"
+validations = [{ name = "min", value = "1" }]
+
+[settings.fields.collectorUrl]
+name = "Collector URL"
+description = "Base URL of the TruePath collector"
+type = "single_line_text_field"
+validations = [{ name = "min", value = "1" }]
+
+[settings.fields.signingKid]
+name = "Signing key id"
+description = "Identifies which signing secret this pixel uses"
+type = "single_line_text_field"
+validations = [{ name = "min", value = "1" }]
+
+[settings.fields.signingSecret]
+name = "Signing secret"
+description = "Signs each batch; not a credential (visible to the shopper's browser by design)"
+type = "single_line_text_field"
+validations = [{ name = "min", value = "1" }]
+
+[settings.fields.noticeVersion]
+name = "Notice version"
+description = "Version of the shopper privacy notice the store shows"
+type = "single_line_text_field"
+validations = [{ name = "min", value = "1" }]

@@ -17,6 +17,7 @@ import {
   type TenantScope,
 } from '@truepath/shared';
 import { consumeShopifyOAuthState, issueShopifyOAuthState } from '../shopifyOAuthState.js';
+import { installWebPixel, publishCollectorConfig, resolvePixelKeys } from '../shopifyPixel.js';
 import {
   requireOrgScope,
   requirePermission,
@@ -42,6 +43,10 @@ export interface ShopifyIntegrationDeps {
   readonly dashboardUrl: string;
   /** HLD §8 `shopify-sync` queue (M1-3). */
   readonly shopifySyncQueue: Queue<ShopifySyncJob>;
+  /** Public Collector base URL for the pixel's settings (M1-4). Unset → the pixel isn't installed yet. */
+  readonly collectorUrl?: string;
+  /** The DPA version the org must have accepted for the Collector config to be `active`. */
+  readonly dpaVersion: string;
 }
 
 function callbackRedirectUri(appUrl: string): string {
@@ -166,13 +171,36 @@ export function registerIntegrationRoutes(
       }
 
       const storeScope: TenantScope = { ...orgScope, storeIds: new Set([store.id]) };
+      const pixelDeps = {
+        db: deps.db,
+        adapter: shopify.adapter,
+        cipher: shopify.cipher,
+        redis: shopify.redis,
+        collectorUrl: shopify.collectorUrl,
+        dpaVersion: shopify.dpaVersion,
+      };
+      // The pixel keys are decided before the credentials are written: a reconnect's fresh tokens
+      // don't carry them, so they are stored in the same envelope in one upsert (M1-4).
+      const pixelKeys = await resolvePixelKeys(pixelDeps, storeScope, store.id);
+      const credentialsWithKeys = { ...credentials, pixelSigningKeys: pixelKeys.signingKeys };
       const integration = await createIntegrationRepository(deps.db).upsertShopify(storeScope, {
         storeId: store.id,
         externalAccountId: info.gid,
-        credentialsJson: JSON.stringify(credentials),
+        credentialsJson: JSON.stringify(credentialsWithKeys),
         scopes: credentials.scope.split(','),
         cipher: shopify.cipher,
       });
+      await createIntegrationRepository(deps.db).patchShopifySettings(storeScope, store.id, {
+        store_key: pixelKeys.storeKey,
+      });
+      // Best-effort: the pixel extension may not be deployed yet, and that must not fail the connect.
+      await installWebPixel(pixelDeps, storeScope, {
+        storeId: store.id,
+        shopDomain: normalizedShop,
+        keys: pixelKeys,
+        credentials: credentialsWithKeys,
+      });
+      await publishCollectorConfig(pixelDeps, storeScope, store.id);
 
       await deps.audit.log.write(storeScope, {
         organizationId: consumed.claims.organizationId,

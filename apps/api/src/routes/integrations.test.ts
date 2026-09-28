@@ -94,6 +94,9 @@ function fakeShopifyAdapter(options: FakeAdapterOptions = {}): ShopifyAdapter {
     async *streamBulkOrders() {
       // no result rows
     },
+    async upsertWebPixel() {
+      return { pixelId: 'gid://shopify/WebPixel/test' };
+    },
   };
 }
 
@@ -211,7 +214,11 @@ describe('GET /v1/integrations/shopify/callback', () => {
         { integrationId: integration!.id },
         integration!.encryptedCredentials!,
       );
-      expect(JSON.parse(decrypted)).toEqual(DEFAULT_CREDENTIALS);
+      // The OAuth tokens as Shopify returned them, plus the pixel signing key made at connect (M1-4).
+      expect(JSON.parse(decrypted)).toEqual({
+        ...DEFAULT_CREDENTIALS,
+        pixelSigningKeys: [{ kid: 's1', secret: expect.stringMatching(/^[A-Za-z0-9_-]{43}$/) }],
+      });
 
       const [auditRow] = await testDb
         .select()

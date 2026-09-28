@@ -57,6 +57,7 @@ function fakeAdapter(options: {
     streamBulkOrders: async function* () {
       // no result rows
     },
+    upsertWebPixel: async () => ({ pixelId: 'gid://shopify/WebPixel/test' }),
   };
 }
 

@@ -64,6 +64,7 @@ function fakeAdapter(options: FakeAdapterOptions = {}) {
     startBulkOrders,
     bulkOperation,
     streamBulkOrders,
+    upsertWebPixel: () => Promise.reject(new Error('not used')),
   };
   return { adapter, startBulkOrders, refresh, bulkOperation, streamBulkOrders };
 }

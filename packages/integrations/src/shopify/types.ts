@@ -4,6 +4,12 @@
 // for what's deferred). upsertWebPixel, bulkResultUrl, ordersUpdatedSince and fetchOrderContact
 // still land with M1-3's follow-up / M1-4.
 
+/** A pixel signing key (shopify-integration.md §4.1 step 5): `kid` is public, `secret` is not stored anywhere but here. */
+export interface PixelSigningKey {
+  readonly kid: string;
+  readonly secret: string;
+}
+
 /** Stored only in `integrations.encrypted_credentials` (ADR-0023), never in `settings`. */
 export interface ShopifyCredentials {
   readonly accessToken: string;
@@ -11,6 +17,21 @@ export interface ShopifyCredentials {
   readonly refreshToken: string;
   readonly refreshTokenExpiresAt: string; // ISO 8601
   readonly scope: string; // comma-separated, as Shopify returns it
+  /**
+   * The pixel's HMAC signing keys — one, or two during a rotation (collector.md §2.5). They live in
+   * the same envelope as the OAuth tokens (SPEC v0.3 secrets rule). `refresh` carries them through; a
+   * fresh `exchangeCode` does not have them, so a reconnect must copy them over (apps/api).
+   */
+  readonly pixelSigningKeys?: readonly PixelSigningKey[];
+}
+
+/** The pixel extension's `[settings]` (extensions/truepath-pixel/shopify.extension.toml). */
+export interface WebPixelSettings {
+  readonly storeKey: string;
+  readonly collectorUrl: string;
+  readonly signingKid: string;
+  readonly signingSecret: string;
+  readonly noticeVersion: string;
 }
 
 export interface ShopifyShopInfo {

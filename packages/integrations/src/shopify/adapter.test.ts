@@ -4,6 +4,7 @@ import { setupServer } from 'msw/node';
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 import {
   createShopifyAdapter,
+  ShopifyPixelError,
   ShopifyUnauthorizedError,
   type ShopifyAdapterConfig,
 } from './adapter.js';
@@ -688,5 +689,143 @@ describe('createShopifyAdapter: streamBulkOrders', () => {
     await expect(collect()).rejects.toThrow('403');
     await expect(collect('http://storage.example.com/result.jsonl')).rejects.toThrow('not https');
     await expect(collect('file:///etc/passwd')).rejects.toThrow('not https');
+  });
+});
+
+describe('createShopifyAdapter: refresh keeps the rest of the credentials envelope', () => {
+  it('carries pixelSigningKeys through a token rotation', async () => {
+    server.use(
+      http.post(`https://${SHOP}/admin/oauth/access_token`, () =>
+        HttpResponse.json({ ...TOKEN_RESPONSE, access_token: 'shpat_rotated' }),
+      ),
+    );
+    const keys = [{ kid: 's1', secret: 'k'.repeat(43) }];
+    const refreshed = await createShopifyAdapter(CONFIG).refresh(SHOP, {
+      accessToken: 'old',
+      accessTokenExpiresAt: new Date().toISOString(),
+      refreshToken: 'shprt_old',
+      refreshTokenExpiresAt: new Date().toISOString(),
+      scope: TOKEN_RESPONSE.scope,
+      pixelSigningKeys: keys,
+    });
+    expect(refreshed.accessToken).toBe('shpat_rotated');
+    expect(refreshed.pixelSigningKeys).toEqual(keys);
+  });
+});
+
+describe('createShopifyAdapter: upsertWebPixel', () => {
+  const creds: ShopifyCredentials = {
+    accessToken: 'shpat_abc123',
+    accessTokenExpiresAt: new Date().toISOString(),
+    refreshToken: 'shprt_def456',
+    refreshTokenExpiresAt: new Date().toISOString(),
+    scope: 'write_pixels',
+  };
+  const SETTINGS = {
+    storeKey: 'pk_abcdefghijklmnopqrstuvwx',
+    collectorUrl: 'https://collect.truepath.example',
+    signingKid: 's1',
+    signingSecret: 's'.repeat(43),
+    noticeVersion: 'v1',
+  };
+
+  function graphql(
+    handler: (body: { query: string; variables: Record<string, unknown> }) => unknown,
+  ) {
+    server.use(
+      http.post(`https://${SHOP}/admin/api/*/graphql.json`, async ({ request }) => {
+        const body = (await request.json()) as {
+          query: string;
+          variables: Record<string, unknown>;
+        };
+        return HttpResponse.json(handler(body) as Record<string, unknown>);
+      }),
+    );
+  }
+
+  it('creates the pixel, sending settings as a JSON object (not a string)', async () => {
+    let seen: Record<string, unknown> = {};
+    graphql((body) => {
+      seen = body.variables;
+      return {
+        data: { webPixelCreate: { userErrors: [], webPixel: { id: 'gid://shopify/WebPixel/1' } } },
+      };
+    });
+    const result = await createShopifyAdapter(CONFIG).upsertWebPixel(SHOP, creds, SETTINGS);
+    expect(result).toEqual({ pixelId: 'gid://shopify/WebPixel/1' });
+    expect(seen).toEqual({ webPixel: { settings: SETTINGS } });
+  });
+
+  it('on TAKEN finds the existing pixel and updates it in place', async () => {
+    const calls: string[] = [];
+    graphql((body) => {
+      if (body.query.includes('webPixelCreate')) {
+        calls.push('create');
+        return { data: { webPixelCreate: { userErrors: [{ code: 'TAKEN' }], webPixel: null } } };
+      }
+      if (body.query.includes('webPixelUpdate')) {
+        calls.push(`update:${String(body.variables.id)}`);
+        return {
+          data: {
+            webPixelUpdate: { userErrors: [], webPixel: { id: 'gid://shopify/WebPixel/7' } },
+          },
+        };
+      }
+      calls.push('query');
+      return { data: { webPixel: { id: 'gid://shopify/WebPixel/7' } } };
+    });
+    const result = await createShopifyAdapter(CONFIG).upsertWebPixel(SHOP, creds, SETTINGS);
+    expect(result.pixelId).toBe('gid://shopify/WebPixel/7');
+    expect(calls).toEqual(['create', 'query', 'update:gid://shopify/WebPixel/7']);
+  });
+
+  it('throws ShopifyPixelError carrying only the error codes — never a message that could echo the secret', async () => {
+    graphql(() => ({
+      data: {
+        webPixelCreate: {
+          userErrors: [
+            { code: 'INVALID_SETTINGS', message: `bad settings ${SETTINGS.signingSecret}` },
+          ],
+          webPixel: null,
+        },
+      },
+    }));
+    const error = await createShopifyAdapter(CONFIG)
+      .upsertWebPixel(SHOP, creds, SETTINGS)
+      .catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(ShopifyPixelError);
+    expect((error as ShopifyPixelError).codes).toEqual(['INVALID_SETTINGS']);
+    expect((error as Error).message).not.toContain(SETTINGS.signingSecret);
+  });
+
+  it('reports TAKEN with no findable pixel as its own code instead of looping', async () => {
+    graphql((body) =>
+      body.query.includes('webPixelCreate')
+        ? { data: { webPixelCreate: { userErrors: [{ code: 'TAKEN' }], webPixel: null } } }
+        : { data: { webPixel: null } },
+    );
+    await expect(
+      createShopifyAdapter(CONFIG).upsertWebPixel(SHOP, creds, SETTINGS),
+    ).rejects.toMatchObject({ codes: ['TAKEN_BUT_NOT_FOUND'] });
+  });
+
+  it('throws ShopifyUnauthorizedError on 401, and a generic error (no body) on an unexpected shape', async () => {
+    const adapter = createShopifyAdapter(CONFIG);
+    server.use(
+      http.post(`https://${SHOP}/admin/api/*/graphql.json`, () =>
+        HttpResponse.json({}, { status: 401 }),
+      ),
+    );
+    await expect(adapter.upsertWebPixel(SHOP, creds, SETTINGS)).rejects.toBeInstanceOf(
+      ShopifyUnauthorizedError,
+    );
+    server.use(
+      http.post(`https://${SHOP}/admin/api/*/graphql.json`, () =>
+        HttpResponse.json({ nonsense: SETTINGS.signingSecret }),
+      ),
+    );
+    const error = await adapter.upsertWebPixel(SHOP, creds, SETTINGS).catch((e: unknown) => e);
+    expect((error as Error).message).toContain('unexpected response shape');
+    expect((error as Error).message).not.toContain(SETTINGS.signingSecret);
   });
 });

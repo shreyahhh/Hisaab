@@ -246,4 +246,70 @@ describe('IntegrationRepository (ADR-0016, ADR-0023, ADR-0024)', () => {
       await cleanupTestTenant(tenant);
     }
   });
+
+  it('patchShopifySettings merges top-level keys and keeps unrelated ones (backfill, cod_mapping)', async () => {
+    const tenant = await seedTestTenant('integration-repo-settings-patch');
+    try {
+      const repo = createIntegrationRepository(db);
+      const job = jobScope(tenant.organizationId, tenant.storeId);
+      await repo.upsertShopify(job, {
+        storeId: tenant.storeId,
+        externalAccountId: 'gid://shopify/Shop/11',
+        credentialsJson: JSON.stringify({ accessToken: 'shpat_x' }),
+        scopes: ['read_orders'],
+        cipher: createTestCredentialsCipher(),
+      });
+      await repo.patchShopifyBackfillState(job, tenant.storeId, { status: 'running', days: 60 });
+
+      const first = await repo.patchShopifySettings(job, tenant.storeId, {
+        store_key: 'pk_abcdefghijklmnopqrstuvwx',
+        pixel_status: 'failed',
+        pixel_error_codes: 'NO_EXTENSION',
+      });
+      expect(first?.settings).toMatchObject({
+        store_key: 'pk_abcdefghijklmnopqrstuvwx',
+        pixel_status: 'failed',
+        backfill: { status: 'running', days: 60 },
+      });
+
+      const second = await repo.patchShopifySettings(job, tenant.storeId, {
+        pixel_status: 'installed',
+        pixel_id: 'gid://shopify/WebPixel/1',
+      });
+      expect(second?.settings).toMatchObject({
+        store_key: 'pk_abcdefghijklmnopqrstuvwx', // survived the second patch
+        pixel_status: 'installed',
+        pixel_id: 'gid://shopify/WebPixel/1',
+        pixel_error_codes: 'NO_EXTENSION', // a patch only overwrites the keys it names
+        backfill: { status: 'running', days: 60 },
+      });
+    } finally {
+      await cleanupTestTenant(tenant);
+    }
+  });
+
+  it('patchShopifySettings is a no-op (null) without an active integration, and cannot cross stores', async () => {
+    const tenant = await seedTestTenant('integration-repo-settings-patch-none');
+    const other = await seedTestTenant('integration-repo-settings-patch-other');
+    try {
+      const repo = createIntegrationRepository(db);
+      expect(
+        await repo.patchShopifySettings(
+          jobScope(tenant.organizationId, tenant.storeId),
+          tenant.storeId,
+          {
+            pixel_status: 'installed',
+          },
+        ),
+      ).toBeNull();
+      await expect(
+        repo.patchShopifySettings(jobScope(tenant.organizationId, tenant.storeId), other.storeId, {
+          pixel_status: 'installed',
+        }),
+      ).rejects.toThrow();
+    } finally {
+      await cleanupTestTenant(tenant);
+      await cleanupTestTenant(other);
+    }
+  });
 });
