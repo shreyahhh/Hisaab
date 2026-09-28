@@ -68,6 +68,13 @@ export interface ShopifyAdapter {
     creds: ShopifyCredentials,
     externalOrderId: string,
   ): Promise<ShopifyOrderSnapshot | null>;
+  /**
+   * Starts an async bulk query for every order created on or after `sinceIso`
+   * (shopify-integration.md §4.7 "backfill"). Returns the bulk operation's GID. The actual JSONL
+   * result is fetched later by a handler for the `bulk_operations/finish` webhook — that "bulk_result"
+   * mode is a separate, not-yet-built ticket; this method only starts the query.
+   */
+  startBulkOrders(shop: string, creds: ShopifyCredentials, sinceIso: string): Promise<string>;
 }
 
 const TokenResponse = z.object({
@@ -116,16 +123,22 @@ const OrderQueryResponse = z.object({
   data: z.object({ order: OrderNode.nullable() }),
 });
 
+// Shared between the single-order query and the bulk backfill query, so both stay in sync and
+// `mapOrderNodeToSnapshot` handles either one's rows identically.
+const ORDER_FIELDS = `
+  id createdAt updatedAt cancelledAt email phone
+  totalPriceSet { shopMoney { amount currencyCode } }
+  totalRefundedSet { shopMoney { amount } }
+  totalOutstandingSet { shopMoney { amount } }
+  paymentGatewayNames displayFinancialStatus displayFulfillmentStatus
+  discountCodes
+  shippingAddress { zip phone }
+`;
+
 const ORDER_QUERY = `
   query($id: ID!) {
     order(id: $id) {
-      id createdAt updatedAt cancelledAt email phone
-      totalPriceSet { shopMoney { amount currencyCode } }
-      totalRefundedSet { shopMoney { amount } }
-      totalOutstandingSet { shopMoney { amount } }
-      paymentGatewayNames displayFinancialStatus displayFulfillmentStatus
-      discountCodes
-      shippingAddress { zip phone }
+      ${ORDER_FIELDS}
     }
   }
 `;
@@ -302,6 +315,79 @@ async function fetchOrder(
   throw new Error('fetchOrder: exhausted attempts without a result');
 }
 
+const BulkOperationRunQueryResponse = z.object({
+  data: z.object({
+    bulkOperationRunQuery: z.object({
+      bulkOperation: z.object({ id: z.string().min(1), status: z.string() }).nullable(),
+      userErrors: z.array(z.object({ field: z.array(z.string()).nullable(), message: z.string() })),
+    }),
+  }),
+});
+
+// Shopify's order search syntax takes a plain date (shopify-integration.md §4.7); the query itself
+// is submitted as a GraphQL block string (`"""..."""`), so the embedded double quotes around the
+// search filter are safe — only a literal `"""` would terminate the block early.
+function bulkOrdersQuery(sinceIso: string): string {
+  const sinceDate = sinceIso.slice(0, 10);
+  return `
+    mutation {
+      bulkOperationRunQuery(
+        query: """
+        {
+          orders(query: "created_at:>=${sinceDate}") {
+            edges {
+              node {
+                ${ORDER_FIELDS}
+              }
+            }
+          }
+        }
+        """
+      ) {
+        bulkOperation { id status }
+        userErrors { field message }
+      }
+    }
+  `;
+}
+
+async function startBulkOrders(
+  shop: string,
+  creds: ShopifyCredentials,
+  sinceIso: string,
+): Promise<string> {
+  const response = await fetch(`https://${shop}/admin/api/${SHOPIFY_API_VERSION}/graphql.json`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      'X-Shopify-Access-Token': creds.accessToken,
+    },
+    body: JSON.stringify({ query: bulkOrdersQuery(sinceIso) }),
+  });
+  if (response.status === 401) {
+    throw new ShopifyUnauthorizedError();
+  }
+  if (!response.ok) {
+    throw new Error(`Shopify bulkOperationRunQuery returned ${response.status}`);
+  }
+  const parsed = BulkOperationRunQueryResponse.safeParse(await response.json());
+  if (!parsed.success) {
+    throw new Error('Shopify bulkOperationRunQuery returned an unexpected response shape');
+  }
+  const { bulkOperation, userErrors } = parsed.data.data.bulkOperationRunQuery;
+  if (userErrors.length > 0) {
+    throw new Error(
+      `Shopify bulkOperationRunQuery rejected the query: ${userErrors.map((e) => e.message).join('; ')}`,
+    );
+  }
+  if (!bulkOperation) {
+    throw new Error(
+      'Shopify bulkOperationRunQuery returned neither a bulkOperation nor userErrors',
+    );
+  }
+  return bulkOperation.id;
+}
+
 export function createShopifyAdapter(config: ShopifyAdapterConfig): ShopifyAdapter {
   return {
     provider: 'shopify',
@@ -330,6 +416,8 @@ export function createShopifyAdapter(config: ShopifyAdapterConfig): ShopifyAdapt
     shopInfo: fetchShopInfo,
 
     fetchOrder,
+
+    startBulkOrders,
 
     async healthCheck(shop, creds) {
       try {
