@@ -20,5 +20,18 @@ tracking; privacy-dpdp.md §4.10).
 The DPA version format (`DPA_VERSION_PATTERN`), the strict request body for
 `POST /v1/orgs/:id/dpa/accept` (`DpaAcceptBodySchema`) and its response type.
 
+## `events.ts`, `session.ts`, `uuid.ts` (M1-6a)
+
+The pure half of the event pipeline (`docs/architecture/lld/event-pipeline.md`), with no I/O:
+
+- `events.ts` — `parseLanding` (sanitised page URL + referrer → UTMs, click ids, referrer host),
+  `classify` (SPEC §7.4 defaults plus merchant `channel_rules`, with numeric-only campaign / ad set / ad
+  id mapping), `parseChannelRules` (validates rows; an invalid rule is skipped and its id reported),
+  `resolveFbc` (Meta's server-side `fbc` format), `campaignFingerprint` and the ignorable-referrer list
+  (shop hosts, Shopify checkout, Indian payment gateways).
+- `session.ts` — `assignSession`, the reference implementation of the sessionisation rules. The Lua
+  script in `apps/workers` applies the same rules atomically in Redis; a differential test keeps them equal.
+- `uuid.ts` — `uuidV7(nowMs, randomBytes)` for server-generated session ids.
+
 Otherwise an empty scaffold as of M0-1. Each module adds its own types here as it's built — see that
 module's LLD under `docs/architecture/lld/`.
