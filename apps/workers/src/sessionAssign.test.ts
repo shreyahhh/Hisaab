@@ -239,5 +239,7 @@ describe('session_assign_v1', () => {
         expect(await readState(key)).toEqual(state);
       }
     }
-  });
+    // ~1,200 sequential Redis round trips: about a second alone, over the 5 s default when the whole
+    // suite shares one Redis and Postgres.
+  }, 60_000);
 });

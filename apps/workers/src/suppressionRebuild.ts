@@ -1,11 +1,15 @@
 import type { Redis } from 'ioredis';
 import {
   createAuditLogRepository,
+  createCollectorConfigRepository,
   createSuppressionRebuildRepository,
   createSystemScope,
+  jobScope,
+  publishCollectorConfig,
   type ActiveSuppressionRow,
   type Db,
 } from '@truepath/db';
+import type { CredentialsCipher } from '@truepath/privacy';
 import { SUPPRESS_READY_KEY, suppressionSetKey, type SuppressionSetKind } from '@truepath/shared';
 import { isSuppressionReady } from './eventSuppression.js';
 
@@ -26,11 +30,30 @@ export interface RebuildDeps {
   readonly pageSize?: number;
   /** Limit the rebuild to these stores (a targeted rebuild, or a test). Omitted = every store. */
   readonly storeIds?: readonly string[];
+  /**
+   * When given, every store's `collector:store:<store_key>` config is republished too (#56, HLD §8): after
+   * durable Redis is lost those keys are gone, and without them the Collector rejects the pixel of
+   * every store until each is re-saved. Omitted only by tests that don't seed integrations.
+   */
+  readonly configs?: { readonly cipher: CredentialsCipher; readonly dpaVersion: string };
+  /** Counts and error names only. */
+  readonly log?: (line: Record<string, unknown>) => void;
 }
 
 export interface RebuildResult {
   readonly stores: number;
   readonly entries: number;
+  /** Present when configs were republished. Logged, not audited: the audit schema is counts of sets only. */
+  readonly configs?: ConfigRepublishResult;
+}
+
+export interface ConfigRepublishResult {
+  /** Written to Redis (active or inactive: the Collector needs the key either way). */
+  readonly published: number;
+  /** Nothing to publish yet (no keys). */
+  readonly skipped: number;
+  /** Threw (for example undecryptable credentials); the rebuild carries on without it. */
+  readonly failed: number;
 }
 
 function setKind(row: ActiveSuppressionRow): SuppressionSetKind | null {
@@ -47,7 +70,8 @@ function setKind(row: ActiveSuppressionRow): SuppressionSetKind | null {
  * - Runs under an audited `SystemScope` (reason `suppression_rebuild`, ADR-0016).
  * - Replace-safe: each set is replaced in one MULTI (`DEL` + `ZADD`), so re-running it, or running two at
  *   once, ends in the same state and never leaves a set half-built.
- * - Order matters: sets first, then the `suppression_rebuilt` audit row, then the marker. The marker is
+ * - Order matters: sets first, then (when `configs` is given) every store's collector config, then the
+ *   `suppression_rebuilt` audit row, then the marker. The marker is
  *   the last thing written, so nothing is ever "ready" without its sets or its audit trail. (A failure
  *   after the sets leaves the marker unset and the whole rebuild is retried.)
  */
@@ -92,16 +116,63 @@ export async function rebuildSuppression(deps: RebuildDeps): Promise<RebuildResu
     for (const [error] of (await multi.exec()) ?? []) if (error) throw error;
   }
 
-  const result: RebuildResult = { stores: stores.size, entries };
+  // Configs go in before the marker, like the sets: when the Collector turns ready its stores are there.
+  // One store failing must not keep every other store (and the whole pipeline) waiting: a missing config
+  // fails safe — the Collector rejects that pixel — whereas an absent marker stops everything.
+  const configs = deps.configs ? await republishConfigs(deps, deps.configs, scope) : undefined;
+
+  const counts = { stores: stores.size, entries };
+  const result: RebuildResult = configs ? { ...counts, configs } : counts;
   await createAuditLogRepository(deps.db).writePlatform({
     action: 'suppression_rebuilt',
     actorType: 'system',
     targetType: 'suppression_sets',
     targetId: 'all',
-    metadata: result,
+    metadata: counts,
   });
   await deps.redis.set(deps.readyKey ?? SUPPRESS_READY_KEY, String(now.getTime()));
   return result;
+}
+
+async function republishConfigs(
+  deps: RebuildDeps,
+  configs: NonNullable<RebuildDeps['configs']>,
+  systemScope: Parameters<
+    ReturnType<typeof createCollectorConfigRepository>['listActiveShopifyStores']
+  >[0],
+): Promise<ConfigRepublishResult> {
+  const listed = await createCollectorConfigRepository(deps.db).listActiveShopifyStores(
+    systemScope,
+    deps.storeIds !== undefined ? { storeIds: deps.storeIds } : {},
+  );
+  let published = 0;
+  let skipped = 0;
+  let failed = 0;
+  for (const { storeId, organizationId } of listed) {
+    try {
+      // One-store scope per publish (ADR-0026): only the listing above needed the SystemScope.
+      const config = await publishCollectorConfig(
+        {
+          db: deps.db,
+          cipher: configs.cipher,
+          sink: deps.redis,
+          dpaVersion: configs.dpaVersion,
+        },
+        jobScope(organizationId, storeId),
+        storeId,
+      );
+      if (config) published += 1;
+      else skipped += 1;
+    } catch (error) {
+      failed += 1;
+      deps.log?.({
+        event: 'collector_config_publish_failed',
+        store_id: storeId,
+        error_name: error instanceof Error ? error.name : 'unknown',
+      });
+    }
+  }
+  return { published, skipped, failed };
 }
 
 export interface SuppressionRebuilderDeps extends RebuildDeps {

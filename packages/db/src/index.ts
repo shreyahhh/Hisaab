@@ -48,6 +48,17 @@ export {
   type WebhookDeliveryRepository,
 } from './repositories/webhookDeliveryRepository.js';
 export {
+  publishCollectorConfig,
+  noticeVersionOf,
+  type CollectorConfigDeps,
+  type CollectorConfigSink,
+} from './collectorConfig.js';
+export {
+  createCollectorConfigRepository,
+  type CollectorConfigRepository,
+  type PublishableStore,
+} from './repositories/collectorConfigRepository.js';
+export {
   createSuppressionRebuildRepository,
   SystemScopeRequiredError,
   type ActiveSuppressionRow,
