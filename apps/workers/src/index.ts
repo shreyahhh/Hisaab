@@ -3,10 +3,11 @@ import { Worker } from 'bullmq';
 import { Redis } from 'ioredis';
 import { createDb } from '@truepath/db';
 import { createShopifyAdapter } from '@truepath/integrations';
-import { createCredentialsCipher } from '@truepath/privacy';
+import { createCredentialsCipher, createIdentityHasher } from '@truepath/privacy';
 import {
   clickhouseEnvSchema,
   credentialsKeyEnvSchema,
+  identityKeyEnvSchema,
   loadDotEnvIfPresent,
   loadEnv,
   postgresEnvSchema,
@@ -25,6 +26,7 @@ export const workersEnvSchema = postgresEnvSchema
   .and(clickhouseEnvSchema)
   .and(redisDurableEnvSchema)
   .and(credentialsKeyEnvSchema)
+  .and(identityKeyEnvSchema)
   .and(shopifyEnvSchema);
 
 function main(): void {
@@ -33,6 +35,7 @@ function main(): void {
 
   const db = createDb(env.DATABASE_URL);
   const cipher = createCredentialsCipher(env.credentialsKeys);
+  const hasher = createIdentityHasher(env.identityKeys);
   const adapter = createShopifyAdapter({
     clientId: env.SHOPIFY_CLIENT_ID,
     clientSecret: env.SHOPIFY_CLIENT_SECRET,
@@ -47,7 +50,7 @@ function main(): void {
 
   const worker = new Worker(
     SHOPIFY_SYNC_QUEUE,
-    createShopifySyncProcessor({ db, adapter, cipher }),
+    createShopifySyncProcessor({ db, adapter, cipher, hasher }),
     { connection },
   );
 

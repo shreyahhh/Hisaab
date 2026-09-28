@@ -184,4 +184,66 @@ describe('IntegrationRepository (ADR-0016, ADR-0023, ADR-0024)', () => {
       await cleanupTestTenant(tenant);
     }
   });
+
+  it('patchShopifyBackfillState merges patches without dropping earlier keys, and stamps last_synced_at only on done', async () => {
+    const tenant = await seedTestTenant('integration-repo-backfill-state');
+    try {
+      const repo = createIntegrationRepository(db);
+      const job = jobScope(tenant.organizationId, tenant.storeId);
+      const created = await repo.upsertShopify(job, {
+        storeId: tenant.storeId,
+        externalAccountId: 'gid://shopify/Shop/9',
+        credentialsJson: JSON.stringify({ accessToken: 'shpat_x' }),
+        scopes: ['read_orders'],
+        cipher: createTestCredentialsCipher(),
+      });
+      // upsertShopify itself stamps last_synced_at on connect — capture it so "only on done" is a
+      // real comparison rather than an accident of a null column.
+      const afterConnect = created.lastSyncedAt;
+
+      const running = await repo.patchShopifyBackfillState(job, tenant.storeId, {
+        days: 60,
+        status: 'running',
+        bulk_operation_id: 'gid://shopify/BulkOperation/1',
+      });
+      expect(running?.settings).toMatchObject({
+        backfill: {
+          days: 60,
+          status: 'running',
+          bulk_operation_id: 'gid://shopify/BulkOperation/1',
+        },
+      });
+      expect(running?.lastSyncedAt).toEqual(afterConnect);
+
+      const done = await repo.patchShopifyBackfillState(job, tenant.storeId, {
+        status: 'done',
+        orders_applied: 12,
+      });
+      // The second patch overwrote `status` and added a key, and kept the first patch's keys.
+      expect(done?.settings).toMatchObject({
+        backfill: {
+          days: 60,
+          status: 'done',
+          bulk_operation_id: 'gid://shopify/BulkOperation/1',
+          orders_applied: 12,
+        },
+      });
+      expect(done?.lastSyncedAt?.getTime()).toBeGreaterThanOrEqual(afterConnect?.getTime() ?? 0);
+    } finally {
+      await cleanupTestTenant(tenant);
+    }
+  });
+
+  it('patchShopifyBackfillState keeps unrelated settings keys and is a no-op (null) with no active integration', async () => {
+    const tenant = await seedTestTenant('integration-repo-backfill-state-none');
+    try {
+      const repo = createIntegrationRepository(db);
+      const job = jobScope(tenant.organizationId, tenant.storeId);
+      expect(
+        await repo.patchShopifyBackfillState(job, tenant.storeId, { status: 'running' }),
+      ).toBeNull();
+    } finally {
+      await cleanupTestTenant(tenant);
+    }
+  });
 });

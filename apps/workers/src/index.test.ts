@@ -16,6 +16,9 @@ function env(overrides: Record<string, string | undefined> = {}): NodeJS.Process
     CREDENTIALS_KEY_READ: 'k1',
     CREDENTIALS_KEY_WRITE: 'k1',
     CREDENTIALS_MASTER_K1: key(),
+    IDENTITY_KEY_READ: 'k1',
+    IDENTITY_KEY_WRITE: 'k1',
+    IDENTITY_MASTER_K1: key(),
     SHOPIFY_CLIENT_ID: 'client-id',
     SHOPIFY_CLIENT_SECRET: 'client-secret',
     SHOPIFY_APP_URL: 'https://api.example.com',
@@ -36,6 +39,15 @@ describe('apps/workers boot environment', () => {
         'CREDENTIALS_KEY_WRITE',
         'CREDENTIALS_MASTER_K1',
       ]) {
+        const result = parseEnv(workersEnvSchema, env({ NODE_ENV, [name]: undefined }));
+        expect(result.success, `${NODE_ENV} without ${name}`).toBe(false);
+      }
+    }
+  });
+
+  it('refuses to start without the identity-hashing keys, in any NODE_ENV (ADR-0007)', () => {
+    for (const NODE_ENV of ['development', 'test', 'production']) {
+      for (const name of ['IDENTITY_KEY_READ', 'IDENTITY_KEY_WRITE', 'IDENTITY_MASTER_K1']) {
         const result = parseEnv(workersEnvSchema, env({ NODE_ENV, [name]: undefined }));
         expect(result.success, `${NODE_ENV} without ${name}`).toBe(false);
       }

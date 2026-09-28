@@ -22,6 +22,7 @@ export {
 } from './repositories/storeRepository.js';
 export {
   createIntegrationRepository,
+  type BackfillStatePatch,
   type IntegrationRepository,
   type IntegrationRow,
   type UpsertShopifyIntegrationInput,

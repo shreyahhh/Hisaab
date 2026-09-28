@@ -8,3 +8,25 @@ Empty scaffold as of M0-1. Env validation at boot (Postgres, ClickHouse, durable
 no cache Redis) lands in M0-2. The queue consumers land starting M1-6 (event pipeline) and M2
 (ad/logistics sync); see `docs/architecture/lld/event-pipeline.md`, `identity-stitching.md`,
 `attribution-engine.md`.
+
+## `shopify-sync` (M1-3, M1-3b)
+
+The first queue consumer built. `backfill` starts a Shopify bulk order query; `bulk_result` streams its
+JSONL and applies each order (hashing phone/email in memory, INR only) — see
+`docs/architecture/lld/shopify-integration.md` §4.7 for the design and what is still deferred. Env:
+Postgres, ClickHouse, durable Redis, the credentials-encryption keys, the identity-hashing keys and the
+Shopify app config; it refuses to boot without any of them.
+
+`bulk_result` is normally enqueued by the API when Shopify's `bulk_operations/finish` webhook arrives.
+A laptop can't receive that webhook without a public tunnel, so locally use the operator tool (it
+prints only non-secret state, never credentials):
+
+```sh
+pnpm --filter @truepath/workers dev            # the consumer (needs the env above in the root .env)
+pnpm --filter @truepath/workers dev:backfill start  <storeId> [days]   # enqueue a backfill (default 60)
+pnpm --filter @truepath/workers dev:backfill status <storeId>          # settings.backfill, incl. Shopify's own order count
+pnpm --filter @truepath/workers dev:backfill apply  <storeId>          # enqueue bulk_result once the operation has finished
+```
+
+Compare `orders_applied` with `orders_reported` in `status`: they should match (minus any non-INR orders,
+which the MVP skips). An operation still `RUNNING` makes `apply` fail and retry — just run it again.

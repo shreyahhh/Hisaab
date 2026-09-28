@@ -12,6 +12,8 @@ export {
   type ShopifyAdapterConfig,
 } from './shopify/adapter.js';
 export type {
+  ShopifyBulkOperation,
+  ShopifyBulkOrderLine,
   ShopifyCredentials,
   ShopifyHealthStatus,
   ShopifyOrderSnapshot,

@@ -1,7 +1,11 @@
 import { createHmac, timingSafeEqual } from 'node:crypto';
+import { createInterface } from 'node:readline';
+import { Readable } from 'node:stream';
 import { z } from 'zod';
 import { SHOPIFY_API_VERSION } from '@truepath/shared';
 import type {
+  ShopifyBulkOperation,
+  ShopifyBulkOrderLine,
   ShopifyCredentials,
   ShopifyHealthStatus,
   ShopifyOrderSnapshot,
@@ -75,6 +79,20 @@ export interface ShopifyAdapter {
    * mode is a separate, not-yet-built ticket; this method only starts the query.
    */
   startBulkOrders(shop: string, creds: ShopifyCredentials, sinceIso: string): Promise<string>;
+  /** Reads one bulk operation's status and result URLs (`node(id:)` on `BulkOperation`). `null` if Shopify has no such operation. */
+  bulkOperation(
+    shop: string,
+    creds: ShopifyCredentials,
+    bulkOperationId: string,
+  ): Promise<ShopifyBulkOperation | null>;
+  /**
+   * Streams a bulk orders JSONL result from its signed URL, one order per line (§4.7 `bulk_result`).
+   * Nothing touches disk and the body is never buffered whole — a 90-day backfill can be large.
+   * The URL is a pre-signed link, so no access token is sent. Lines are never logged or included in
+   * an error: they carry protected customer data (SPEC §5.4). Must not be wrapped in a DB transaction
+   * by the caller — it is a network read.
+   */
+  streamBulkOrders(url: string): AsyncGenerator<ShopifyBulkOrderLine, void, void>;
 }
 
 const TokenResponse = z.object({
@@ -388,6 +406,95 @@ async function startBulkOrders(
   return bulkOperation.id;
 }
 
+const BulkOperationNodeResponse = z.object({
+  data: z.object({
+    node: z
+      .object({
+        id: z.string().min(1),
+        status: z.string(),
+        errorCode: z.string().nullable(),
+        // Shopify sends UnsignedInt64 as a string.
+        rootObjectCount: z.string().regex(/^\d+$/),
+        url: z.string().nullable(),
+        partialDataUrl: z.string().nullable(),
+      })
+      .nullable(),
+  }),
+});
+
+const BULK_OPERATION_QUERY = `
+  query($id: ID!) {
+    node(id: $id) {
+      ... on BulkOperation { id status errorCode rootObjectCount url partialDataUrl }
+    }
+  }
+`;
+
+async function bulkOperation(
+  shop: string,
+  creds: ShopifyCredentials,
+  bulkOperationId: string,
+): Promise<ShopifyBulkOperation | null> {
+  const response = await fetch(`https://${shop}/admin/api/${SHOPIFY_API_VERSION}/graphql.json`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      'X-Shopify-Access-Token': creds.accessToken,
+    },
+    body: JSON.stringify({ query: BULK_OPERATION_QUERY, variables: { id: bulkOperationId } }),
+  });
+  if (response.status === 401) {
+    throw new ShopifyUnauthorizedError();
+  }
+  if (!response.ok) {
+    throw new Error(`Shopify bulk operation query returned ${response.status}`);
+  }
+  const parsed = BulkOperationNodeResponse.safeParse(await response.json());
+  if (!parsed.success) {
+    throw new Error('Shopify bulk operation query returned an unexpected response shape');
+  }
+  const node = parsed.data.data.node;
+  return node && { ...node, rootObjectCount: Number(node.rootObjectCount) };
+}
+
+async function* streamBulkOrders(url: string): AsyncGenerator<ShopifyBulkOrderLine, void, void> {
+  // The URL comes from Shopify over an authenticated call, but it is still fetched as-is — refuse
+  // anything that is not https so a malformed value can never turn into a plaintext or file read.
+  if (!url.startsWith('https://')) {
+    throw new Error('Shopify bulk result URL is not https');
+  }
+  const response = await fetch(url);
+  if (!response.ok || !response.body) {
+    throw new Error(`Shopify bulk result download returned ${response.status}`);
+  }
+  const lines = createInterface({
+    // `fromWeb` is typed for the web-stream flavour the Node types declare separately from
+    // undici's `fetch` body type — same runtime object, hence the cast.
+    input: Readable.fromWeb(response.body as Parameters<typeof Readable.fromWeb>[0]),
+    crlfDelay: Infinity,
+  });
+  for await (const line of lines) {
+    if (line.trim() === '') continue;
+    let json: unknown;
+    try {
+      json = JSON.parse(line);
+    } catch {
+      yield { kind: 'invalid' };
+      continue;
+    }
+    // A child row (`__parentId`) belongs to a nested connection; the backfill query has none, so
+    // one appearing means the query changed without this parser — not an order, not silently ignored.
+    if (typeof json === 'object' && json !== null && '__parentId' in json) {
+      yield { kind: 'invalid' };
+      continue;
+    }
+    const node = OrderNode.safeParse(json);
+    yield node.success
+      ? { kind: 'order', snapshot: mapOrderNodeToSnapshot(node.data) }
+      : { kind: 'invalid' };
+  }
+}
+
 export function createShopifyAdapter(config: ShopifyAdapterConfig): ShopifyAdapter {
   return {
     provider: 'shopify',
@@ -418,6 +525,10 @@ export function createShopifyAdapter(config: ShopifyAdapterConfig): ShopifyAdapt
     fetchOrder,
 
     startBulkOrders,
+
+    bulkOperation,
+
+    streamBulkOrders,
 
     async healthCheck(shop, creds) {
       try {

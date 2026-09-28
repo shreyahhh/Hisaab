@@ -387,12 +387,21 @@ never appears in the captured log output.
 
 ### 4.7 Backfill, bulk results, reconciliation, refresh (`shopify-sync`)
 
-**M1-3 status**: the `shopify-sync` BullMQ queue exists, and the OAuth callback enqueues
-`{mode:'backfill', days}` on every successful connect. Only `startBulkOrders` itself is
-implemented — it submits the bulk query and returns; nothing yet consumes its result. Reading the
-JSONL and applying it (`bulk_result`, below), `reconcile`, `order_refresh`, the auto-extend
-re-enqueue, and the up-to-5-concurrent-queries accounting are **not built** and tracked as
-follow-up issues, not silently dropped.
+**M1-3 / M1-3b status**: the `shopify-sync` BullMQ queue exists, and the OAuth callback enqueues
+`{mode:'backfill', days}` on every successful connect. `backfill` starts the bulk query and records
+`settings.backfill {days, status:'running', bulk_operation_id, started_at}`; the `bulk_operations/finish`
+webhook enqueues `bulk_result`, which streams the JSONL through §4.4 and finishes the record with
+`status`, `orders_applied`, `orders_reported` (Shopify's own `rootObjectCount`, for reconciliation),
+`invalid_lines` and `finished_at`. Both modes refresh an expired access token once on a 401.
+Deviations from the text below, all deliberate:
+- The `bulk_result` job id is `bulk-result-<n>`, not `shopify-bulk:<id>` — BullMQ custom job ids can't
+  contain `:`.
+- Orders are applied one at a time, each in its own transaction, not in batches of 1,000.
+- A result with any unreadable line applies the rest, then fails the job and marks the backfill
+  `failed` (`error_code: invalid_lines`) instead of reporting a partly-read backfill as complete.
+- Not built, tracked in issue #41: the `partialDataUrl` restart, `IdentityStitchJob` enqueueing (waits
+  on the `identity-stitch` queue, M1-7), the audit row for backfill counts, `reconcile`,
+  `order_refresh`, the 60→90-day auto-extend, and the up-to-5-concurrent-queries accounting.
 
 - **`backfill`**:
   - `startBulkOrders(since = now − days)`, where `days` = 60 without `read_all_orders`, else 90.
