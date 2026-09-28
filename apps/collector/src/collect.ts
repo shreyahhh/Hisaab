@@ -240,6 +240,8 @@ export async function handleCollect(
       visitor_id: batch.visitor_id,
       visitor_new: batch.visitor_new,
       ...(event.event_name === 'consent_granted' ? { consent_trigger: event.trigger } : {}),
+      // Consent evidence needs the notice version (P-4); only consent events carry it.
+      ...(consentEvent ? { notice_version: batch.consent.notice_version } : {}),
       page_url: pageUrl,
       referrer: sanitiseReferrer(event.referrer),
       // fbp/fbc only with marketing consent, and never for a child-directed store (P-6) — enforced

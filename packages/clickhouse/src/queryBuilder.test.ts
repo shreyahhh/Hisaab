@@ -144,6 +144,79 @@ describe('ch() — scoped ClickHouse query builder (ADR-0016)', () => {
     ).rejects.toThrow(/Unsafe ClickHouse identifier/);
   });
 
+  it('insert() is synchronous and accepts ISO-8601 timestamps (event-workers XACKs right after it)', async () => {
+    const storeC = randomUUID();
+    const eventId = randomUUID();
+    const scoped = ch(client, tenantScope(storeC), storeC);
+    try {
+      await scoped.insert('events', [
+        {
+          store_id: storeC,
+          event_id: eventId,
+          event_name: 'page_viewed',
+          // an ISO-8601 timestamp with an offset, as a stream entry can carry
+          occurred_at: '2026-09-28T15:30:00.123+05:30',
+          received_at: '2026-09-28T10:00:01.000Z',
+          visitor_id: 'v1',
+          session_id: 's1',
+          page_url: 'https://shop.example.com/',
+          referrer: '',
+          utm_source: '',
+          utm_medium: '',
+          utm_campaign: '',
+          utm_content: '',
+          utm_term: '',
+          fbclid: '',
+          gclid: '',
+          gbraid: '',
+          wbraid: '',
+          fbp: '',
+          fbc: '',
+          device_type: 'mobile',
+          os: 'Android',
+          browser: 'Chrome',
+          is_in_app_browser: 0,
+          geo_state: '',
+          geo_city: '',
+          consent_purposes: ['attribution_analytics'],
+          identity_hash_hmac: '',
+          properties: '{}',
+        },
+      ]);
+      // Visible the moment insert() returns — no waiting, no OPTIMIZE.
+      const rows = await scoped.select<{ event_id: string }>({
+        table: 'events',
+        columns: ['event_id'],
+      });
+      expect(rows.map((r) => r.event_id)).toEqual([eventId]);
+    } finally {
+      await client.command({
+        query: `ALTER TABLE events DELETE WHERE store_id = {s:UUID}`,
+        query_params: { s: storeC },
+      });
+    }
+  });
+
+  it('insert() asks ClickHouse for a synchronous, committed insert (contract with the caller that XACKs)', async () => {
+    const calls: Array<Record<string, unknown>> = [];
+    const fake = {
+      insert: (params: Record<string, unknown>) => {
+        calls.push(params);
+        return Promise.resolve();
+      },
+    } as unknown as Parameters<typeof ch>[0];
+    const scoped = ch(fake, tenantScope(storeA), storeA);
+    await scoped.insert('touchpoints', [{ store_id: storeA }]);
+    await scoped.insert('touchpoints', []); // nothing to send, nothing sent
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toMatchObject({
+      table: 'touchpoints',
+      format: 'JSONEachRow',
+      clickhouse_settings: { wait_end_of_query: 1, async_insert: 0 },
+    });
+  });
+
   it('insert() refuses a row whose store_id does not match the scoped store', async () => {
     const scoped = ch(client, tenantScope(storeA), storeA);
     await expect(

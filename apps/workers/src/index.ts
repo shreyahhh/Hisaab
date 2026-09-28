@@ -1,12 +1,16 @@
+import { randomBytes } from 'node:crypto';
+import { hostname } from 'node:os';
 import { fileURLToPath } from 'node:url';
-import { Worker } from 'bullmq';
+import { Queue, Worker } from 'bullmq';
 import { Redis } from 'ioredis';
+import { createClickHouseClient } from '@truepath/clickhouse';
 import { createDb } from '@truepath/db';
 import { createShopifyAdapter } from '@truepath/integrations';
 import { createCredentialsCipher, createIdentityHasher } from '@truepath/privacy';
 import {
   clickhouseEnvSchema,
   credentialsKeyEnvSchema,
+  DSR_QUEUE,
   identityKeyEnvSchema,
   loadDotEnvIfPresent,
   loadEnv,
@@ -15,13 +19,19 @@ import {
   SHOPIFY_OAUTH_SCOPES,
   SHOPIFY_SYNC_QUEUE,
   shopifyEnvSchema,
+  uuidV7,
+  type DsrJob,
 } from '@truepath/shared';
+import { processEventBatch } from './eventBatch.js';
+import { EventConsumer } from './eventConsumer.js';
 import { createShopifySyncProcessor } from './shopifySync.js';
+import { StoreContextCache } from './storeEventContext.js';
 
-// BullMQ workers (HLD §8): shopify-sync is the first one built (M1-3); event-workers, ad-sync-meta,
-// ad-sync-google-ads, shiprocket-sync, identity-stitch, attribution-run, capi-dispatch,
-// order-status-reconcile, retention and dsr land in later milestones. No cache-Redis connection —
-// that instance is only used by the API (report cache) and Better Auth rate limiting.
+// Workers (HLD §8): shopify-sync (M1-3) and event-workers (M1-6, the `stream:events-raw` consumer
+// group) are built; ad-sync-meta, ad-sync-google-ads, shiprocket-sync, identity-stitch,
+// attribution-run, capi-dispatch, order-status-reconcile, retention and dsr land in later milestones
+// (the `dsr` queue is enqueued to by event-workers but has no consumer until M4-2). No cache-Redis
+// connection — that instance is only used by the API (report cache) and Better Auth rate limiting.
 export const workersEnvSchema = postgresEnvSchema
   .and(clickhouseEnvSchema)
   .and(redisDurableEnvSchema)
@@ -66,6 +76,67 @@ function main(): void {
   });
 
   console.log(`apps/workers: shopify-sync worker listening (NODE_ENV=${env.NODE_ENV})`);
+
+  // event-workers (M1-6): the `stream:events-raw` consumer group. `reader` only ever runs the blocking
+  // XREADGROUP; `redis` does everything else (pipelines, acks, reclaim).
+  const clickhouse = createClickHouseClient(env);
+  const redis = new Redis(env.REDIS_DURABLE_URL);
+  const reader = new Redis(env.REDIS_DURABLE_URL, { maxRetriesPerRequest: null });
+  const dsrQueue = new Queue<DsrJob>(DSR_QUEUE, { connection });
+  const stores = new StoreContextCache(db);
+  const consumer = new EventConsumer(
+    {
+      reader,
+      redis,
+      process: (entries, memo) =>
+        processEventBatch(
+          {
+            redis,
+            clickhouse,
+            db,
+            hasher,
+            dsrQueue,
+            stores,
+            now: () => new Date(),
+            newSessionId: () => uuidV7(Date.now(), randomBytes(16)),
+          },
+          entries,
+          memo,
+        ),
+      // Counts and error names only: nothing here may carry an entry, identifier or error message.
+      log: (line) => console.log(JSON.stringify(line)),
+    },
+    { consumer: `event-workers:${hostname()}-${process.pid}` },
+  );
+
+  process.once('SIGTERM', () => consumer.stop());
+  process.once('SIGINT', () => consumer.stop());
+  void runEventWorkers(consumer);
+  console.log('apps/workers: event-workers consumer group started');
+}
+
+/**
+ * Keeps the consumer alive across an unexpected failure (e.g. a dropped Redis connection). Entries it
+ * had read but not acknowledged stay pending and are reclaimed after 60 s.
+ */
+async function runEventWorkers(consumer: EventConsumer): Promise<void> {
+  let stopped = false;
+  process.once('SIGTERM', () => (stopped = true));
+  process.once('SIGINT', () => (stopped = true));
+  while (!stopped) {
+    try {
+      await consumer.run();
+      return;
+    } catch (error) {
+      console.error(
+        JSON.stringify({
+          event: 'event_consumer_crashed',
+          error_name: error instanceof Error ? error.name : 'unknown',
+        }),
+      );
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+    }
+  }
 }
 
 const isMain = process.argv[1] === fileURLToPath(import.meta.url);

@@ -2,6 +2,23 @@
 // new queue names or payload shapes without adding them here first (CLAUDE.md — "Names are
 // canonical").
 
+/** HLD §8: `dsr`. The consumer lands with M4-2; until then jobs enqueued here simply wait. */
+export const DSR_QUEUE = 'dsr';
+
+/**
+ * HLD §8: `DsrJob{storeId, type, requestId, visitorIds?}`. `visitorIds` restricts an erasure to a
+ * follow-up purge of those (raw, pseudonymous) visitor ids — enqueued on a `suppression_hit`.
+ */
+export interface DsrJob {
+  readonly storeId: string;
+  readonly type: 'access' | 'erasure' | 'correction' | 'store_erasure';
+  readonly requestId: string;
+  readonly visitorIds?: readonly string[];
+}
+
+/** privacy-dpdp.md §4.5: withdrawal-triggered erasure jobs wait 60 s so a burst can be coalesced. */
+export const DSR_WITHDRAWAL_DELAY_MS = 60_000;
+
 /** HLD §8: `shopify-sync`. */
 export const SHOPIFY_SYNC_QUEUE = 'shopify-sync';
 

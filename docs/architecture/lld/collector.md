@@ -121,6 +121,7 @@ export type StreamEventEntry = {
   visitor_id: string;
   visitor_new: boolean;                               // from the batch (SPEC v0.6)
   consent_trigger?: 'interaction' | 'initial_state' | 'refresh';   // consent_granted only
+  notice_version?: string;                            // consent_* events only (M1-6b): consent_records needs it (P-4)
   page_url: string; referrer: string;                 // sanitised (§4 step 9)
   fbp?: string; fbc?: string;
   device_type: 'mobile' | 'tablet' | 'desktop' | 'unknown';

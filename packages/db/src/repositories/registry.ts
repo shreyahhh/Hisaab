@@ -3,7 +3,9 @@ import type { CredentialsCipher } from '@truepath/privacy';
 import type { Db } from '../client.js';
 import { createAuditLogRepository } from './auditLogRepository.js';
 import { createDpaAcceptanceRepository } from './dpaAcceptanceRepository.js';
+import { createChannelRuleRepository } from './channelRuleRepository.js';
 import { createDsrRequestRepository } from './dsrRequestRepository.js';
+import { createEventEffectsRepository } from './eventEffectsRepository.js';
 import { createIntegrationRepository } from './integrationRepository.js';
 import { createOrderRepository } from './orderRepository.js';
 import { createStoreRepository } from './storeRepository.js';
@@ -180,6 +182,36 @@ export const repositoryRegistry: readonly RepositoryDescriptor[] = [
             sourceTimestamp: new Date(),
             eventStatus: 'created',
             rawRef: `cross-tenant-test-${storeId}`,
+          }),
+      },
+    ],
+  },
+  {
+    name: 'ChannelRuleRepository',
+    methods: [
+      {
+        name: 'listByStore',
+        scopeKind: 'store',
+        invoke: (db, scope, storeId) => createChannelRuleRepository(db).listByStore(scope, storeId),
+      },
+    ],
+  },
+  {
+    name: 'EventEffectsRepository',
+    methods: [
+      {
+        name: 'applyStoreEffects',
+        scopeKind: 'store',
+        invoke: (db, scope, storeId) =>
+          createEventEffectsRepository(db).applyStoreEffects(scope, {
+            storeId,
+            now: new Date(),
+            consentRecords: [],
+            consentChanges: [],
+            suppressionHits: [],
+            checkoutLinks: [],
+            suppressionExpiresAt: new Date(),
+            withdrawalDueAt: new Date(),
           }),
       },
     ],

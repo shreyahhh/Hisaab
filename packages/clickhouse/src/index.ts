@@ -3,6 +3,9 @@
 // strings anywhere else in the codebase.
 
 export { createClickHouseClient, type ClickHouseEnv } from './client.js';
+// Re-exported so other packages can type a client without importing `@clickhouse/client` themselves
+// (eslint data-access boundary).
+export type { ClickHouseClient } from '@clickhouse/client';
 export { parseClickHouseBigInt, parseClickHouseInt64, parseInt64Fields } from './parseInt64.js';
 export {
   ch,

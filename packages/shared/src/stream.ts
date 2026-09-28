@@ -34,6 +34,10 @@ export type CollectorDropReason = (typeof COLLECTOR_DROP_REASONS)[number];
 /** Default-on-region signal counters, incremented by `event-workers` (HLD §8). */
 export const DEFAULT_ON_STATS_FIELDS = ['new_visitors', 'new_visitors_initial_only'] as const;
 
+/** HLD §8: `dedupe:<store_id>:<event_id>` and `checkout:<store_id>:<order_id>` both expire after a day. */
+export const DEDUPE_TTL_SECONDS = 86_400;
+export const CHECKOUT_KEY_TTL_SECONDS = 86_400;
+
 /** Suppression entries live this long (SPEC §5.7 / HLD §8: ≈ 13 months). */
 export const SUPPRESSION_TTL_DAYS = 13 * 30;
 
@@ -56,6 +60,9 @@ export const StreamEventEntry = z
     visitor_id: z.string().min(1).max(64),
     visitor_new: z.boolean(),
     consent_trigger: z.enum(['interaction', 'initial_state', 'refresh']).optional(),
+    // Consent events only (M1-6b): the notice version in force, which `consent_records` needs (P-4).
+    // Optional so entries already in the stream from before this field still validate.
+    notice_version: z.string().min(1).max(32).optional(),
     page_url: z.string().max(2048),
     referrer: z.string().max(2048),
     fbp: z.string().max(128).optional(),

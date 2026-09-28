@@ -48,6 +48,19 @@ export {
   type WebhookDeliveryRepository,
 } from './repositories/webhookDeliveryRepository.js';
 export {
+  createChannelRuleRepository,
+  type ChannelRuleRepository,
+  type ChannelRuleRow,
+} from './repositories/channelRuleRepository.js';
+export {
+  createEventEffectsRepository,
+  type ApplyEventEffectsInput,
+  type ApplyEventEffectsResult,
+  type ConsentChange,
+  type ConsentRecordInput,
+  type EventEffectsRepository,
+} from './repositories/eventEffectsRepository.js';
+export {
   createAuditLogRepository,
   DEFAULT_AUDIT_PAGE_SIZE,
   InvalidAuditCursorError,

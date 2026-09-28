@@ -33,6 +33,16 @@ function assertKnownTable(table: string): asserts table is ClickHouseTableName {
   }
 }
 
+// Every insert (M1-6b) is synchronous: `wait_end_of_query` makes the call return only once the rows are
+// committed and `async_insert: 0` keeps ClickHouse from buffering them server-side — `event-workers`
+// XACKs a stream batch only after these calls return (event-pipeline.md §4.1 step 10), so an insert
+// that "succeeded" into a buffer could lose events. (ISO-8601 timestamps with an offset go straight
+// into DateTime64 columns — the builder's test inserts one — so no `date_time_input_format` is set.)
+const INSERT_SETTINGS = {
+  wait_end_of_query: 1,
+  async_insert: 0,
+} as const;
+
 // ClickHouse parameter types we actually bind (HLD §6/§8 column types used by tenant-scoped
 // queries). Extend as new query shapes need them — never accept an arbitrary type string.
 export type ClickHouseParamType = 'UUID' | 'String' | 'DateTime64(3)' | 'Int64' | 'UInt8';
@@ -73,7 +83,12 @@ export function ch(client: ClickHouseClient, scope: Scope, storeId: string): Sco
         }
       }
       if (rows.length === 0) return;
-      await client.insert({ table, values: [...rows], format: 'JSONEachRow' });
+      await client.insert({
+        table,
+        values: [...rows],
+        format: 'JSONEachRow',
+        clickhouse_settings: INSERT_SETTINGS,
+      });
     },
 
     async select<T = Record<string, unknown>>(opts: ScopedSelectOptions): Promise<T[]> {
