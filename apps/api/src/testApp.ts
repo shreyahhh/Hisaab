@@ -8,7 +8,9 @@ import {
   loadDotEnvIfPresent,
   loadEnv,
   postgresEnvSchema,
+  IDENTITY_STITCH_QUEUE,
   SHOPIFY_SYNC_QUEUE,
+  type IdentityStitchJob,
   type ShopifySyncJob,
 } from '@truepath/shared';
 import { createAuditService } from './audit.js';
@@ -73,6 +75,12 @@ export const testShopifySyncQueue = new Queue<ShopifySyncJob>(SHOPIFY_SYNC_QUEUE
   prefix: 'bull-test',
 });
 
+// Same isolation for identity-stitch: a real stitch worker on this Redis must never consume these jobs.
+export const testIdentityStitchQueue = new Queue<IdentityStitchJob>(IDENTITY_STITCH_QUEUE, {
+  connection: testQueueRedis,
+  prefix: 'bull-test',
+});
+
 export const testShopify: ShopifyDeps = {
   adapter: testShopifyAdapter,
   cipher: testCredentialsCipher,
@@ -82,6 +90,7 @@ export const testShopify: ShopifyDeps = {
   appUrl: TEST_SHOPIFY_APP_URL,
   dashboardUrl: TEST_DASHBOARD_URL,
   shopifySyncQueue: testShopifySyncQueue,
+  identityStitchQueue: testIdentityStitchQueue,
 };
 
 export function buildTestApp(overrides: Partial<AppDeps> = {}) {

@@ -192,6 +192,17 @@ describe('mapOrderSnapshot', () => {
     expect(fields.moneySanityExceeded).toBe(false);
   });
 
+  it('exposes the phone and email hashes under every read key version for erased-identity lookups', () => {
+    const fields = mapOrderSnapshot(snapshot(), storeId, hasher);
+    expect(fields.identityLookup).toContain(fields.phoneHashHmac);
+    expect(fields.identityLookup).toContain(fields.emailHashHmac);
+    expect(fields.identityLookup).toHaveLength(2 * hasher.readVersions.length);
+    for (const h of fields.identityLookup) expect(h).toMatch(/^k\d+:[0-9a-f]{64}$/);
+    expect(
+      mapOrderSnapshot(snapshot({ phone: null, email: null }), storeId, hasher).identityLookup,
+    ).toEqual([]);
+  });
+
   it('never puts the raw phone or email in any mapped field', () => {
     const fields = mapOrderSnapshot(snapshot(), storeId, hasher);
     const serialised = JSON.stringify(fields);

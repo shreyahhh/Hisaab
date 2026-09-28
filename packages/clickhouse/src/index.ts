@@ -12,6 +12,8 @@ export {
   CLICKHOUSE_TABLES,
   type ClickHouseTableName,
   type ClickHouseParamType,
+  type AggregateColumn,
+  type AggregateFn,
   type WhereCondition,
   type ScopedSelectOptions,
   type ScopedClickHouse,

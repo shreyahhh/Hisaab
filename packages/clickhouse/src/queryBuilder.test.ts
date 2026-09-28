@@ -217,6 +217,198 @@ describe('ch() — scoped ClickHouse query builder (ADR-0016)', () => {
     });
   });
 
+  describe('FINAL, IN, aggregates and GROUP BY (identity-stitching reads)', () => {
+    const storeD = randomUUID();
+    const storeE = randomUUID();
+    const link = (store: string, visitor: string, hash: string, first: string, last: string) => ({
+      store_id: store,
+      visitor_id: visitor,
+      identity_hash_hmac: hash,
+      first_seen: first,
+      last_seen: last,
+    });
+
+    beforeAll(async () => {
+      const scopedD = ch(client, tenantScope(storeD), storeD);
+      // v1 is linked to h1 twice, in separate inserts: ReplacingMergeTree collapses duplicates inside
+      // one insert block on its own (optimize_on_insert), so FINAL only matters across parts.
+      await scopedD.insert('identity_links', [
+        link(
+          storeD,
+          'v1',
+          'k1:h1',
+          '2026-09-28T10:00:00.000+05:30',
+          '2026-09-28T10:00:00.000+05:30',
+        ),
+        link(
+          storeD,
+          'v2',
+          'k1:h1',
+          '2026-09-28T12:00:00.000+05:30',
+          '2026-09-28T12:00:00.000+05:30',
+        ),
+        link(
+          storeD,
+          'v2',
+          'k1:h2',
+          '2026-09-28T12:00:00.000+05:30',
+          '2026-09-28T12:00:00.000+05:30',
+        ),
+      ]);
+      await scopedD.insert('identity_links', [
+        link(
+          storeD,
+          'v1',
+          'k1:h1',
+          '2026-09-28T11:00:00.000+05:30',
+          '2026-09-28T11:00:00.000+05:30',
+        ),
+      ]);
+      await ch(client, tenantScope(storeE), storeE).insert('identity_links', [
+        link(
+          storeE,
+          'other-tenant',
+          'k1:h1',
+          '2026-09-28T10:00:00.000+05:30',
+          '2026-09-28T10:00:00.000+05:30',
+        ),
+      ]);
+    });
+
+    afterAll(async () => {
+      await client.command({
+        query: `ALTER TABLE identity_links DELETE WHERE store_id IN ({d:UUID}, {e:UUID})`,
+        query_params: { d: storeD, e: storeE },
+      });
+    });
+
+    const inList = (values: string[]) => ({
+      op: 'IN' as const,
+      value: values,
+      type: 'Array(String)' as const,
+    });
+
+    it('FINAL collapses duplicate keys; without it both rows are returned', async () => {
+      const scoped = ch(client, tenantScope(storeD), storeD);
+      const where = { identity_hash_hmac: inList(['k1:h1']) };
+      const raw = await scoped.select({ table: 'identity_links', columns: ['visitor_id'], where });
+      const final = await scoped.select({
+        table: 'identity_links',
+        columns: ['visitor_id'],
+        where,
+        final: true,
+      });
+      expect(raw).toHaveLength(3);
+      expect(final.map((r) => (r as { visitor_id: string }).visitor_id).sort()).toEqual([
+        'v1',
+        'v2',
+      ]);
+    });
+
+    it('groups with aggregates: distinct visitors per hash, and epoch-ms first/last seen', async () => {
+      const scoped = ch(client, tenantScope(storeD), storeD);
+      const perHash = await scoped.select<{ identity_hash_hmac: string; visitors: string }>({
+        table: 'identity_links',
+        columns: ['identity_hash_hmac'],
+        aggregates: [{ fn: 'uniqExact', column: 'visitor_id', as: 'visitors' }],
+        groupBy: ['identity_hash_hmac'],
+        where: { identity_hash_hmac: inList(['k1:h1', 'k1:h2']) },
+        final: true,
+        orderBy: 'identity_hash_hmac',
+      });
+      expect(perHash.map((r) => [r.identity_hash_hmac, Number(r.visitors)])).toEqual([
+        ['k1:h1', 2],
+        ['k1:h2', 1],
+      ]);
+
+      const [v1] = await scoped.select<{ first_ms: string; last_ms: string }>({
+        table: 'identity_links',
+        columns: [],
+        aggregates: [
+          { fn: 'minEpochMs', column: 'first_seen', as: 'first_ms' },
+          { fn: 'maxEpochMs', column: 'last_seen', as: 'last_ms' },
+        ],
+        where: { visitor_id: { op: '=', value: 'v1', type: 'String' } },
+        final: true,
+      });
+      // FINAL keeps the later row for (v1, h1): 11:00 IST = 05:30 UTC
+      expect(parseClickHouseInt64(v1!.first_ms)).toBe(Date.parse('2026-09-28T05:30:00.000Z'));
+      expect(parseClickHouseInt64(v1!.last_ms)).toBe(Date.parse('2026-09-28T05:30:00.000Z'));
+    });
+
+    it('supports count, min and max', async () => {
+      const [row] = await ch(client, tenantScope(storeD), storeD).select<{ n: string }>({
+        table: 'identity_links',
+        columns: [],
+        aggregates: [{ fn: 'count', as: 'n' }],
+        final: true,
+      });
+      expect(Number(row!.n)).toBe(3);
+    });
+
+    it("never returns another tenant's rows for the same hash", async () => {
+      const rows = await ch(client, tenantScope(storeD), storeD).select<{ visitor_id: string }>({
+        table: 'identity_links',
+        columns: ['visitor_id'],
+        where: { identity_hash_hmac: inList(['k1:h1']) },
+        final: true,
+      });
+      expect(rows.map((r) => r.visitor_id)).not.toContain('other-tenant');
+    });
+
+    it('rejects malformed requests before running anything', async () => {
+      const scoped = ch(client, tenantScope(storeD), storeD);
+      await expect(scoped.select({ table: 'identity_links', columns: [] })).rejects.toThrow(
+        /at least one column/,
+      );
+      await expect(
+        scoped.select({
+          table: 'identity_links',
+          columns: ['visitor_id'],
+          where: { visitor_id: { op: 'IN', value: ['a'], type: 'String' } },
+        }),
+      ).rejects.toThrow('Array(String)');
+      await expect(
+        scoped.select({
+          table: 'identity_links',
+          columns: ['visitor_id'],
+          where: { visitor_id: { op: '=', value: ['a'], type: 'Array(String)' } },
+        }),
+      ).rejects.toThrow('Array(String)');
+      await expect(
+        scoped.select({
+          table: 'identity_links',
+          columns: [],
+          aggregates: [{ fn: 'min', as: 'x' }],
+        }),
+      ).rejects.toThrow(/needs a column/);
+      await expect(
+        scoped.select({
+          table: 'identity_links',
+          columns: [],
+          aggregates: [{ fn: 'count', as: 'n) FROM x; --' }],
+        }),
+      ).rejects.toThrow(/Unsafe ClickHouse identifier/);
+      await expect(
+        scoped.select({
+          table: 'identity_links',
+          columns: ['visitor_id'],
+          groupBy: ['visitor_id; DROP'],
+        }),
+      ).rejects.toThrow(/Unsafe ClickHouse identifier/);
+    });
+
+    it('a value in an IN list is data, not SQL', async () => {
+      const rows = await ch(client, tenantScope(storeD), storeD).select({
+        table: 'identity_links',
+        columns: ['visitor_id'],
+        where: { identity_hash_hmac: inList(["x') OR 1=1 --"]) },
+        final: true,
+      });
+      expect(rows).toEqual([]);
+    });
+  });
+
   it('insert() refuses a row whose store_id does not match the scoped store', async () => {
     const scoped = ch(client, tenantScope(storeA), storeA);
     await expect(

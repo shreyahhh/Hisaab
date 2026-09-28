@@ -38,6 +38,14 @@ The event-pipeline tests need the local Postgres, ClickHouse and durable Redis
 (`docker compose up`). They isolate the global names (readiness marker, streams) per run and namespace
 every other key by a freshly seeded store id.
 
+## `identity-stitch` (M1-7)
+
+Links each order to the visitor(s) whose journey it belongs to (`docs/architecture/lld/identity-stitching.md`).
+
+- `identity/stitch.ts` — `stitchOrder` and the BullMQ processor. Rule order: the order's own visitor (`orders.visitor_id`, then the `checkout:` key), the phone/email HMAC fallback, retries at +5 and +30 min, then the UTM fallback (`attribution_confidence='low'`, never downgrading a `high`). The suppression gate runs when the job runs, so a delayed attempt for a shopper erased meanwhile does nothing. While `suppress:ready` is missing the worker is paused and a job in flight is delayed, not failed. The last failure of a job goes to `identity-stitch-failed`.
+- `identity/journey.ts` — `findLinkedVisitors` (the shared-identifier guard: > 20 visitors or > 50 orders in 90 days on one hash is ignored) and `resolveJourneyVisitors` (primary first, capped at 10), which attribution will call.
+- Enqueued by the API after an order webhook is applied (attempt 0) and by the `shopify-sync` backfill (attempt 2). It enqueues `attribution-run` jobs, **whose consumer lands with M3-2** — until then they wait.
+
 ## `shopify-sync` (M1-3, M1-3b)
 
 The first queue consumer built. `backfill` starts a Shopify bulk order query; `bulk_result` streams its

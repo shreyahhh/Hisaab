@@ -184,6 +184,30 @@ export const repositoryRegistry: readonly RepositoryDescriptor[] = [
             rawRef: `cross-tenant-test-${storeId}`,
           }),
       },
+      {
+        name: 'getById',
+        scopeKind: 'store',
+        invoke: (db, scope, storeId) =>
+          createOrderRepository(db).getById(scope, storeId, NEVER_MATCHES),
+      },
+      {
+        name: 'linkVisitorIfUnset',
+        scopeKind: 'store',
+        invoke: (db, scope, storeId) =>
+          createOrderRepository(db).linkVisitorIfUnset(scope, storeId, NEVER_MATCHES, 'v'),
+      },
+      {
+        name: 'setAttributionConfidence',
+        scopeKind: 'store',
+        invoke: (db, scope, storeId) =>
+          createOrderRepository(db).setAttributionConfidence(scope, storeId, NEVER_MATCHES, 'low'),
+      },
+      {
+        name: 'countOrdersByIdentityHash',
+        scopeKind: 'store',
+        invoke: (db, scope, storeId) =>
+          createOrderRepository(db).countOrdersByIdentityHash(scope, storeId, 'k1:x', new Date()),
+      },
     ],
   },
   {

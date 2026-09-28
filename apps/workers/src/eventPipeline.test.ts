@@ -326,6 +326,38 @@ describe('processEventBatch', () => {
     expect(stored).not.toMatch(/@|\+91/);
   });
 
+  it('a GID-form order id from the pixel links the numeric order; an unusable one links nothing', async () => {
+    await db.insert(schema.orders).values({
+      storeId: storeId(),
+      externalOrderId: '7002',
+      createdAtPlatform: new Date(),
+      totalAmountPaise: 50000,
+      currency: 'INR',
+      paymentMethod: 'prepaid',
+    });
+    const gid = ev('checkout_completed', 71, {
+      visitor_id: 'visitor-gid',
+      properties: {
+        checkout_token: 'tok',
+        order_id: 'gid://shopify/Order/7002',
+        total_amount_paise: 1,
+      },
+    });
+    const junk = ev('checkout_completed', 72, {
+      visitor_id: 'visitor-junk',
+      properties: { checkout_token: 'tok', order_id: 'not-an-order', total_amount_paise: 1 },
+    });
+    const result = await processEventBatch(deps(), [raw(gid), raw(junk)]);
+
+    expect(result.counts.ordersLinked).toBe(1);
+    expect(await redis.get(`checkout:${storeId()}:7002`)).toBe('visitor-gid');
+    expect(await redis.keys(`checkout:${storeId()}:*not*`)).toEqual([]);
+    const order = (await db.select().from(schema.orders)).find(
+      (o) => o.storeId === storeId() && o.externalOrderId === '7002',
+    );
+    expect(order!.visitorId).toBe('visitor-gid');
+  });
+
   it('drops events of an erased visitor and of a withdrawn visitor, but never a consent event of a withdrawn one', async () => {
     const erased = 'visitor-erased';
     const withdrawn = 'visitor-withdrawn';

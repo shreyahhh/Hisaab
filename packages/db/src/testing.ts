@@ -68,3 +68,11 @@ export async function cleanupTestTenant(tenant: TestTenant): Promise<void> {
   await db.delete(organizations).where(eq(organizations.id, tenant.organizationId)); // cascades: stores, dpa_acceptances, memberships, invites, integrations, ad_accounts, orders, ...
   await db.delete(users).where(eq(users.id, tenant.userId));
 }
+
+/** Test-only: flips `stores.child_directed` for a seeded store (no repository method sets it yet). */
+export async function setStoreChildDirected(
+  storeId: string,
+  childDirected: boolean,
+): Promise<void> {
+  await db.update(stores).set({ childDirected }).where(eq(stores.id, storeId));
+}

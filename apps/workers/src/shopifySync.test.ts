@@ -9,6 +9,7 @@ import {
   type ShopifyCredentials,
   type ShopifyOrderSnapshot,
 } from '@truepath/integrations';
+import { storeContext } from '@truepath/privacy';
 import { createTestCredentialsCipher, createTestIdentityHasher } from '@truepath/privacy/testing';
 import type { ShopifySyncJob, TenantScope } from '@truepath/shared';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -69,8 +70,20 @@ function fakeAdapter(options: FakeAdapterOptions = {}) {
   return { adapter, startBulkOrders, refresh, bulkOperation, streamBulkOrders };
 }
 
-function depsFor(adapter: ShopifyAdapter): ShopifySyncDeps {
-  return { db, adapter, cipher, hasher };
+// No shopper is erased and no stitch queue is real unless a test says so.
+const noSuppression = { zscore: async () => null };
+function depsFor(adapter: ShopifyAdapter, over: Partial<ShopifySyncDeps> = {}): ShopifySyncDeps {
+  return {
+    db,
+    adapter,
+    cipher,
+    hasher,
+    redis: noSuppression,
+    identityStitchQueue: {
+      addBulk: vi.fn(async () => []),
+    } as unknown as ShopifySyncDeps['identityStitchQueue'],
+    ...over,
+  };
 }
 
 async function connectStore(tenant: { organizationId: string; storeId: string; userId: string }) {
@@ -505,6 +518,129 @@ describe('shopify-sync processor — mode: bulk_result (shopify-integration.md �
     ).rejects.toThrow('no bulkOperationId');
     await process(bulkJob('00000000-0000-0000-0000-000000000000'));
     expect(bulkOperation).not.toHaveBeenCalled();
+  });
+});
+
+describe('shopify-sync processor — bulk_result: identity stitching and erased identities (M1-7)', () => {
+  const bulkJob = (storeId: string) =>
+    job({ storeId, mode: 'bulk_result', bulkOperationId: COMPLETED.id });
+
+  it('enqueues attempt 2 of the stitch chain for every applied order, and none for a skipped non-INR one', async () => {
+    const tenant = await seedTestTenant('shopify-sync-bulk-stitch');
+    try {
+      await connectStore(tenant);
+      const { adapter } = fakeAdapter({
+        bulkOperation: vi.fn().mockResolvedValue(COMPLETED),
+        lines: [
+          orderLine({ externalOrderId: '7001' }),
+          orderLine({ externalOrderId: '7002', currency: 'USD' }),
+          orderLine({ externalOrderId: '7003' }),
+        ],
+      });
+      const addBulk = vi.fn(async (..._a: unknown[]) => [] as never);
+
+      await createShopifySyncProcessor(
+        depsFor(adapter, { identityStitchQueue: { addBulk } as never }),
+      )(bulkJob(tenant.storeId));
+
+      const rows = await ordersOf(tenant.storeId);
+      expect(rows.map((r) => r.externalOrderId).sort()).toEqual(['7001', '7003']);
+      expect(addBulk).toHaveBeenCalledTimes(1);
+      const jobs = addBulk.mock.calls[0]![0] as Array<{
+        name: string;
+        data: { storeId: string; orderId: string; attempt: number };
+        opts: { jobId: string; attempts: number };
+      }>;
+      expect(jobs.map((j) => j.data.orderId).sort()).toEqual(rows.map((r) => r.id).sort());
+      for (const j of jobs) {
+        expect(j.name).toBe('stitch');
+        expect(j.data).toMatchObject({ storeId: tenant.storeId, attempt: 2 });
+        expect(j.opts).toMatchObject({ jobId: `stitch:${j.data.orderId}:2`, attempts: 5 });
+      }
+    } finally {
+      await cleanupTestTenant(tenant);
+    }
+  });
+
+  it('a re-run of the same result re-enqueues the same job ids (BullMQ dedupes them)', async () => {
+    const tenant = await seedTestTenant('shopify-sync-bulk-stitch-rerun');
+    try {
+      await connectStore(tenant);
+      const { adapter } = fakeAdapter({
+        bulkOperation: vi.fn().mockResolvedValue(COMPLETED),
+        lines: [orderLine({ externalOrderId: '7101' })],
+      });
+      const addBulk = vi.fn(async (..._a: unknown[]) => [] as never);
+      const process = createShopifySyncProcessor(
+        depsFor(adapter, { identityStitchQueue: { addBulk } as never }),
+      );
+      await process(bulkJob(tenant.storeId));
+      await process(bulkJob(tenant.storeId));
+      const ids = addBulk.mock.calls.map(
+        (c) => (c[0] as Array<{ opts: { jobId: string } }>)[0]!.opts.jobId,
+      );
+      expect(ids).toHaveLength(2);
+      expect(ids[0]).toBe(ids[1]);
+    } finally {
+      await cleanupTestTenant(tenant);
+    }
+  });
+
+  it('enqueues in chunks of 500', async () => {
+    const tenant = await seedTestTenant('shopify-sync-bulk-stitch-chunks');
+    try {
+      await connectStore(tenant);
+      const lines = Array.from({ length: 501 }, (_, i) =>
+        orderLine({ externalOrderId: String(20000 + i) }),
+      );
+      const { adapter } = fakeAdapter({
+        bulkOperation: vi.fn().mockResolvedValue(COMPLETED),
+        lines,
+      });
+      const addBulk = vi.fn(async (..._a: unknown[]) => [] as never);
+      await createShopifySyncProcessor(
+        depsFor(adapter, { identityStitchQueue: { addBulk } as never }),
+      )(bulkJob(tenant.storeId));
+      expect(addBulk.mock.calls.map((c) => (c[0] as unknown[]).length)).toEqual([500, 1]);
+    } finally {
+      await cleanupTestTenant(tenant);
+    }
+    // 501 real Postgres applies: well over the 5 s default when the whole suite runs in parallel.
+  }, 60_000);
+
+  it("stores an erased shopper's backfilled order without their hashes, but keeps the sale", async () => {
+    const tenant = await seedTestTenant('shopify-sync-bulk-erased');
+    try {
+      await connectStore(tenant);
+      const phone = '+918123456799';
+      const erasedHash = hasher.hashPhone(storeContext(tenant.storeId), phone)!;
+      const { adapter } = fakeAdapter({
+        bulkOperation: vi.fn().mockResolvedValue(COMPLETED),
+        lines: [
+          orderLine({ externalOrderId: '7201', phone, email: 'gone@example.com' }),
+          orderLine({ externalOrderId: '7202', phone: '+918123456798' }),
+        ],
+      });
+      const erasedOnly = {
+        zscore: async (key: string, member: string) =>
+          key.includes(tenant.storeId) && key.endsWith(':erased:identity') && member === erasedHash
+            ? String(Math.floor(Date.now() / 1000) + 10_000)
+            : null,
+      };
+
+      await createShopifySyncProcessor(depsFor(adapter, { redis: erasedOnly }))(
+        bulkJob(tenant.storeId),
+      );
+
+      const rows = await ordersOf(tenant.storeId);
+      const erased = rows.find((r) => r.externalOrderId === '7201')!;
+      expect(erased.phoneHashHmac).toBeNull();
+      expect(erased.emailHashHmac).toBeNull();
+      expect(erased.totalAmountPaise).toBe(129900);
+      expect(rows.find((r) => r.externalOrderId === '7202')!.phoneHashHmac).toMatch(/^k1:/);
+    } finally {
+      await cleanupTestTenant(tenant);
+    }
   });
 });
 

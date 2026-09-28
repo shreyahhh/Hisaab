@@ -8,9 +8,11 @@ import { createDb } from '@truepath/db';
 import { createShopifyAdapter } from '@truepath/integrations';
 import { createCredentialsCipher, createIdentityHasher } from '@truepath/privacy';
 import {
+  ATTRIBUTION_RUN_QUEUE,
   clickhouseEnvSchema,
   credentialsKeyEnvSchema,
   DSR_QUEUE,
+  IDENTITY_STITCH_QUEUE,
   identityKeyEnvSchema,
   loadDotEnvIfPresent,
   loadEnv,
@@ -20,17 +22,21 @@ import {
   SHOPIFY_SYNC_QUEUE,
   shopifyEnvSchema,
   uuidV7,
+  type AttributionRunJob,
   type DsrJob,
+  type IdentityStitchJob,
 } from '@truepath/shared';
 import { processEventBatch } from './eventBatch.js';
 import { EventConsumer } from './eventConsumer.js';
+import { attachDeadLetter } from './deadLetter.js';
+import { createIdentityStitchProcessor } from './identity/stitch.js';
 import { createShopifySyncProcessor } from './shopifySync.js';
 import { StoreContextCache } from './storeEventContext.js';
 import { SuppressionRebuilder } from './suppressionRebuild.js';
 
-// Workers (HLD §8): shopify-sync (M1-3) and event-workers (M1-6, the `stream:events-raw` consumer
-// group) are built; ad-sync-meta, ad-sync-google-ads, shiprocket-sync, identity-stitch,
-// attribution-run, capi-dispatch, order-status-reconcile, retention and dsr land in later milestones
+// Workers (HLD §8): shopify-sync (M1-3), event-workers (M1-6, the `stream:events-raw` consumer group)
+// and identity-stitch (M1-7) are built; ad-sync-meta, ad-sync-google-ads, shiprocket-sync,
+// attribution-run (enqueued to by identity-stitch; its consumer is M3-2), capi-dispatch, order-status-reconcile, retention and dsr land in later milestones
 // (the `dsr` queue is enqueued to by event-workers but has no consumer until M4-2). No cache-Redis
 // connection — that instance is only used by the API (report cache) and Better Auth rate limiting.
 export const workersEnvSchema = postgresEnvSchema
@@ -59,9 +65,20 @@ function main(): void {
   // a connection that expects the normal retry-then-fail behaviour.
   const connection = new Redis(env.REDIS_DURABLE_URL, { maxRetriesPerRequest: null });
 
+  // Everything else runs on `redis` (pipelines, acks, key reads); `reader` only ever runs the blocking
+  // XREADGROUP of event-workers.
+  const clickhouse = createClickHouseClient(env);
+  const redis = new Redis(env.REDIS_DURABLE_URL);
+  const reader = new Redis(env.REDIS_DURABLE_URL, { maxRetriesPerRequest: null });
+  const log = (line: Record<string, unknown>): void => console.log(JSON.stringify(line));
+
+  const dsrQueue = new Queue<DsrJob>(DSR_QUEUE, { connection });
+  const identityStitchQueue = new Queue<IdentityStitchJob>(IDENTITY_STITCH_QUEUE, { connection });
+  const attributionQueue = new Queue<AttributionRunJob>(ATTRIBUTION_RUN_QUEUE, { connection });
+
   const worker = new Worker(
     SHOPIFY_SYNC_QUEUE,
-    createShopifySyncProcessor({ db, adapter, cipher, hasher }),
+    createShopifySyncProcessor({ db, adapter, cipher, hasher, redis, identityStitchQueue }),
     { connection },
   );
 
@@ -78,12 +95,32 @@ function main(): void {
 
   console.log(`apps/workers: shopify-sync worker listening (NODE_ENV=${env.NODE_ENV})`);
 
-  // event-workers (M1-6): the `stream:events-raw` consumer group. `reader` only ever runs the blocking
-  // XREADGROUP; `redis` does everything else (pipelines, acks, reclaim).
-  const clickhouse = createClickHouseClient(env);
-  const redis = new Redis(env.REDIS_DURABLE_URL);
-  const reader = new Redis(env.REDIS_DURABLE_URL, { maxRetriesPerRequest: null });
-  const dsrQueue = new Queue<DsrJob>(DSR_QUEUE, { connection });
+  // identity-stitch (M1-7): links each order to its visitor(s), then hands it to attribution (whose
+  // consumer lands with M3-2). A job's last failure is copied to `identity-stitch-failed` (HLD §8).
+  const stitchWorker = new Worker<IdentityStitchJob>(
+    IDENTITY_STITCH_QUEUE,
+    createIdentityStitchProcessor(
+      {
+        db,
+        redis,
+        clickhouse,
+        hasher,
+        now: () => new Date(),
+        stitchQueue: identityStitchQueue,
+        attributionQueue,
+      },
+      log,
+    ),
+    { connection },
+  );
+  attachDeadLetter(
+    stitchWorker,
+    new Queue<IdentityStitchJob>(`${IDENTITY_STITCH_QUEUE}-failed`, { connection }),
+    log,
+  );
+  console.log('apps/workers: identity-stitch worker listening');
+
+  // event-workers (M1-6): the `stream:events-raw` consumer group.
   const stores = new StoreContextCache(db);
   const consumer = new EventConsumer(
     {
@@ -105,23 +142,24 @@ function main(): void {
           memo,
         ),
       // Counts and error names only: nothing here may carry an entry, identifier or error message.
-      log: (line) => console.log(JSON.stringify(line)),
+      log,
     },
     { consumer: `event-workers:${hostname()}-${process.pid}` },
   );
 
   // Keeps `suppress:ready` present (HLD §8): rebuilds the suppression sets from Postgres at startup and
   // whenever the marker goes missing. While it is missing the event consumer waits on its own, and the
-  // shopify-sync queue is paused here (`true`: don't wait for active jobs, which would delay the rebuild).
+  // BullMQ workers are paused here (`true`: don't wait for active jobs, which would delay the rebuild).
   const rebuilder = new SuppressionRebuilder({
     db,
     redis,
-    log: (line) => console.log(JSON.stringify(line)),
+    log,
     onUnavailable: async () => {
-      await worker.pause(true);
+      await Promise.all([worker.pause(true), stitchWorker.pause(true)]);
     },
     onReady: () => {
       worker.resume();
+      stitchWorker.resume();
     },
   });
 
