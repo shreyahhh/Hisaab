@@ -45,6 +45,8 @@ export interface ShopifyDeps {
   readonly dashboardUrl: string;
   /** HLD §8 `shopify-sync` queue — the callback enqueues `mode:'backfill'` on a successful connect. */
   readonly shopifySyncQueue: Queue<ShopifySyncJob>;
+  /** Public Collector base URL baked into the pixel's settings (M1-4). Unset → the pixel isn't installed. */
+  readonly collectorUrl?: string;
 }
 
 export interface AppDeps {
@@ -176,6 +178,8 @@ export function buildApp(deps: AppDeps): FastifyInstance {
       appUrl: deps.shopify.appUrl,
       dashboardUrl: deps.shopify.dashboardUrl,
       shopifySyncQueue: deps.shopify.shopifySyncQueue,
+      ...(deps.shopify.collectorUrl ? { collectorUrl: deps.shopify.collectorUrl } : {}),
+      dpaVersion: deps.dpaVersion,
     });
   });
 

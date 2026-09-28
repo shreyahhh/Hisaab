@@ -4,6 +4,5 @@ Embedded admin app for install/settings, and the Web Pixel extension that does c
 client-side event capture (SPEC §7.1, ADR-0008, `docs/architecture/lld/shopify-integration.md`,
 `collector.md`).
 
-This is a **workspace stub only** as of M0-1: just enough (`package.json`, empty `src/`) for the
-workspace path and turbo pipeline to exist. The real app is generated with the official Shopify
-app template/CLI at M1-1, which will replace these files rather than build on them.
+The embedded admin app is still a **workspace stub** (issue #30: scaffold it with the Shopify CLI once the
+Partner app is wired). The Web Pixel extension is real: see [`extensions/truepath-pixel`](extensions/truepath-pixel/README.md).

@@ -37,6 +37,19 @@ export interface BackfillStatePatch {
   readonly error_code?: string;
 }
 
+/**
+ * Top-level, non-secret keys of `integrations.settings` for a Shopify integration (shopify-
+ * integration.md §2.7). `store_key` is public by design (it is in the pixel's settings); the pixel
+ * signing *secret* is never here — it lives in `encrypted_credentials`.
+ */
+export interface ShopifySettingsPatch {
+  readonly store_key?: string;
+  readonly pixel_id?: string;
+  readonly pixel_status?: 'installed' | 'failed' | 'not_configured';
+  /** Shopify userError codes only (e.g. INVALID_SETTINGS), comma-joined — never a message. */
+  readonly pixel_error_codes?: string;
+}
+
 export interface IntegrationRepository {
   /** Creates the store's Shopify integration on first connect, or updates it on re-auth. */
   upsertShopify(scope: Scope, input: UpsertShopifyIntegrationInput): Promise<IntegrationRow>;
@@ -70,6 +83,16 @@ export interface IntegrationRepository {
     scope: Scope,
     storeId: string,
     patch: BackfillStatePatch,
+  ): Promise<IntegrationRow | null>;
+  /**
+   * Merges `patch` into the store's Shopify `settings` (top-level keys only, atomically), leaving
+   * every other key — `backfill`, `cod_mapping`, … — untouched. No-op (null) without an active
+   * Shopify integration.
+   */
+  patchShopifySettings(
+    scope: Scope,
+    storeId: string,
+    patch: ShopifySettingsPatch,
   ): Promise<IntegrationRow | null>;
 }
 
@@ -186,6 +209,24 @@ export function createIntegrationRepository(db: Db): IntegrationRepository {
       return rows[0] ?? null;
     },
 
+    async patchShopifySettings(scope, storeId, patch) {
+      assertStoreInScope(scope, storeId);
+      const [row] = await db
+        .update(integrations)
+        .set({
+          settings: sql`coalesce(${integrations.settings}, '{}'::jsonb) || ${JSON.stringify(patch)}::jsonb`,
+        })
+        .where(
+          and(
+            eq(integrations.storeId, storeId),
+            eq(integrations.provider, 'shopify'),
+            eq(integrations.status, 'active'),
+          ),
+        )
+        .returning();
+      return row ?? null;
+    },
+
     async patchShopifyBackfillState(scope, storeId, patch) {
       assertStoreInScope(scope, storeId);
       const patchJson = JSON.stringify(patch);
@@ -197,7 +238,9 @@ export function createIntegrationRepository(db: Db): IntegrationRepository {
             '{backfill}',
             coalesce(${integrations.settings} -> 'backfill', '{}'::jsonb) || ${patchJson}::jsonb
           )`,
-          ...(patch.status === 'done' ? { lastSyncedAt: sql`now()` } : {}),
+          // The JS clock, like `upsertShopify`'s own stamp: mixing it with the database's `now()` in one
+          // column made the ordering depend on clock skew between the two hosts.
+          ...(patch.status === 'done' ? { lastSyncedAt: new Date() } : {}),
         })
         .where(
           and(

@@ -10,6 +10,7 @@ import type {
   ShopifyHealthStatus,
   ShopifyOrderSnapshot,
   ShopifyShopInfo,
+  WebPixelSettings,
 } from './types.js';
 
 // Shopify OAuth + webhook-verification adapter (shopify-integration.md §2.7, §4.1, §4.2). Field
@@ -27,6 +28,18 @@ export class ShopifyUnauthorizedError extends Error {
   constructor() {
     super('Shopify order query returned 401');
     this.name = 'ShopifyUnauthorizedError';
+  }
+}
+
+/**
+ * A `webPixelCreate`/`webPixelUpdate` `userErrors` failure. Carries only Shopify's error *codes*
+ * (e.g. INVALID_SETTINGS, or NO_EXTENSION when the pixel extension isn't deployed) — never its
+ * messages, which can echo the settings and so the signing secret.
+ */
+export class ShopifyPixelError extends Error {
+  constructor(readonly codes: readonly string[]) {
+    super(`Shopify web pixel mutation failed: ${codes.join(',') || 'unknown'}`);
+    this.name = 'ShopifyPixelError';
   }
 }
 
@@ -93,6 +106,16 @@ export interface ShopifyAdapter {
    * by the caller — it is a network read.
    */
   streamBulkOrders(url: string): AsyncGenerator<ShopifyBulkOrderLine, void, void>;
+  /**
+   * Creates the app's Web Pixel with `settings`, or updates it if one already exists (shopify-
+   * integration.md §4.1 step 6) — safe to call on every (re)connect and on key rotation. Requires the
+   * pixel extension to be deployed to the app; if it isn't, throws {@link ShopifyPixelError}.
+   */
+  upsertWebPixel(
+    shop: string,
+    creds: ShopifyCredentials,
+    settings: WebPixelSettings,
+  ): Promise<{ pixelId: string }>;
 }
 
 const TokenResponse = z.object({
@@ -495,6 +518,101 @@ async function* streamBulkOrders(url: string): AsyncGenerator<ShopifyBulkOrderLi
   }
 }
 
+const PixelUserErrors = z.array(z.object({ code: z.string().nullable().optional() }));
+
+const WebPixelMutationResponse = z.object({
+  data: z.object({
+    webPixelCreate: z
+      .object({
+        userErrors: PixelUserErrors,
+        webPixel: z.object({ id: z.string().min(1) }).nullable(),
+      })
+      .optional(),
+    webPixelUpdate: z
+      .object({
+        userErrors: PixelUserErrors,
+        webPixel: z.object({ id: z.string().min(1) }).nullable(),
+      })
+      .optional(),
+    webPixel: z
+      .object({ id: z.string().min(1) })
+      .nullable()
+      .optional(),
+  }),
+});
+
+async function adminGraphql(
+  shop: string,
+  creds: ShopifyCredentials,
+  query: string,
+  variables?: Record<string, unknown>,
+): Promise<z.infer<typeof WebPixelMutationResponse>['data']> {
+  const response = await fetch(`https://${shop}/admin/api/${SHOPIFY_API_VERSION}/graphql.json`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'X-Shopify-Access-Token': creds.accessToken },
+    body: JSON.stringify({ query, variables }),
+  });
+  if (response.status === 401) throw new ShopifyUnauthorizedError();
+  if (!response.ok) throw new Error(`Shopify GraphQL request returned ${response.status}`);
+  const parsed = WebPixelMutationResponse.safeParse(await response.json());
+  // Never echo the body: a rejected `webPixelCreate` response can contain the submitted settings.
+  if (!parsed.success)
+    throw new Error('Shopify GraphQL request returned an unexpected response shape');
+  return parsed.data.data;
+}
+
+const WEB_PIXEL_CREATE = `
+  mutation($webPixel: WebPixelInput!) {
+    webPixelCreate(webPixel: $webPixel) {
+      userErrors { code }
+      webPixel { id }
+    }
+  }
+`;
+
+const WEB_PIXEL_UPDATE = `
+  mutation($id: ID!, $webPixel: WebPixelInput!) {
+    webPixelUpdate(id: $id, webPixel: $webPixel) {
+      userErrors { code }
+      webPixel { id }
+    }
+  }
+`;
+
+const WEB_PIXEL_QUERY = `{ webPixel { id } }`;
+
+function errorCodes(errors: z.infer<typeof PixelUserErrors>): string[] {
+  return errors.map((e) => e.code ?? 'UNKNOWN');
+}
+
+async function upsertWebPixel(
+  shop: string,
+  creds: ShopifyCredentials,
+  settings: WebPixelSettings,
+): Promise<{ pixelId: string }> {
+  const created = (await adminGraphql(shop, creds, WEB_PIXEL_CREATE, { webPixel: { settings } }))
+    .webPixelCreate;
+  if (created?.webPixel && created.userErrors.length === 0) {
+    return { pixelId: created.webPixel.id };
+  }
+  const codes = errorCodes(created?.userErrors ?? []);
+  if (!codes.includes('TAKEN')) throw new ShopifyPixelError(codes);
+
+  // The app already has a pixel on this shop: find it and update it in place.
+  const existing = (await adminGraphql(shop, creds, WEB_PIXEL_QUERY)).webPixel;
+  if (!existing) throw new ShopifyPixelError(['TAKEN_BUT_NOT_FOUND']);
+  const updated = (
+    await adminGraphql(shop, creds, WEB_PIXEL_UPDATE, {
+      id: existing.id,
+      webPixel: { settings },
+    })
+  ).webPixelUpdate;
+  if (!updated?.webPixel || updated.userErrors.length > 0) {
+    throw new ShopifyPixelError(errorCodes(updated?.userErrors ?? []));
+  }
+  return { pixelId: updated.webPixel.id };
+}
+
 export function createShopifyAdapter(config: ShopifyAdapterConfig): ShopifyAdapter {
   return {
     provider: 'shopify',
@@ -513,11 +631,14 @@ export function createShopifyAdapter(config: ShopifyAdapterConfig): ShopifyAdapt
       return requestToken(shop, config, { code, expiring: '1' });
     },
 
-    refresh(shop, creds) {
-      return requestToken(shop, config, {
+    async refresh(shop, creds) {
+      const tokens = await requestToken(shop, config, {
         grant_type: 'refresh_token',
         refresh_token: creds.refreshToken,
       });
+      // Anything else stored in the same envelope (the pixel signing keys) is not something Shopify's
+      // token endpoint knows about, so carry it through — a refresh must never silently drop it.
+      return { ...creds, ...tokens };
     },
 
     shopInfo: fetchShopInfo,
@@ -529,6 +650,8 @@ export function createShopifyAdapter(config: ShopifyAdapterConfig): ShopifyAdapt
     bulkOperation,
 
     streamBulkOrders,
+
+    upsertWebPixel,
 
     async healthCheck(shop, creds) {
       try {

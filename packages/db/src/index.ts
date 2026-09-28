@@ -25,6 +25,7 @@ export {
   type BackfillStatePatch,
   type IntegrationRepository,
   type IntegrationRow,
+  type ShopifySettingsPatch,
   type UpsertShopifyIntegrationInput,
 } from './repositories/integrationRepository.js';
 export {

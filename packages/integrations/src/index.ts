@@ -7,11 +7,15 @@ export const PACKAGE_NAME = '@truepath/integrations';
 
 export {
   createShopifyAdapter,
+  ShopifyPixelError,
   ShopifyUnauthorizedError,
   type ShopifyAdapter,
   type ShopifyAdapterConfig,
 } from './shopify/adapter.js';
+export { generateSigningKey, generateStoreKey, nextSigningKid } from './shopify/pixelKeys.js';
 export type {
+  PixelSigningKey,
+  WebPixelSettings,
   ShopifyBulkOperation,
   ShopifyBulkOrderLine,
   ShopifyCredentials,
