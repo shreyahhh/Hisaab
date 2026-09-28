@@ -15,3 +15,4 @@ export * from './dpa.js';
 export * from './shopify.js';
 export * from './jobs.js';
 export * from './collector.js';
+export * from './stream.js';

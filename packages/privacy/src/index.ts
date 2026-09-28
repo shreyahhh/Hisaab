@@ -1,7 +1,7 @@
 // Phone/email normalisers, the keyed-hash helper, log/URL redaction (SPEC §5, HLD §8 "Privacy /
 // DPDP"). Every other module imports these rather than reimplementing them (CLAUDE.md rule 3).
-// See docs/architecture/lld/privacy-dpdp.md. ConsentProvider and the suppression-set client land with
-// the collector (M1-5). The audit-log writer is an interface here; its Postgres implementation is in
+// See docs/architecture/lld/privacy-dpdp.md. ConsentProvider landed with the collector (M1-5); the
+// suppression-set client lands with the workers (M1-6). The audit-log writer is an interface here; its Postgres implementation is in
 // @truepath/db.
 //
 // Not exported here on purpose: `@truepath/privacy/meta-capi` (plain SHA-256 for Meta), which only
@@ -10,6 +10,12 @@
 export const PACKAGE_NAME = '@truepath/privacy';
 
 export { normaliseEmail, normalisePhone } from './normalise.js';
+export {
+  shopifyCustomerPrivacyProvider,
+  type ConsentDecision,
+  type ConsentProvider,
+  type ConsentSignal,
+} from './consent.js';
 export {
   AuditMetadataError,
   isAuditAction,
