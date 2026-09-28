@@ -11,6 +11,11 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "@truepath/shared": "workspace:*"
+    "@truepath/db": "workspace:^",
+    "@truepath/integrations": "workspace:^",
+    "@truepath/privacy": "workspace:^",
+    "@truepath/shared": "workspace:*",
+    "bullmq": "^6.3.9",
+    "ioredis": "^5.4.1"
   }
 }
