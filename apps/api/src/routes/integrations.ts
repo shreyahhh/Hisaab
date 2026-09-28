@@ -1,3 +1,4 @@
+import type { Queue } from 'bullmq';
 import type { FastifyInstance } from 'fastify';
 import type { Redis } from 'ioredis';
 import { resolveMembership } from '@truepath/auth';
@@ -12,6 +13,7 @@ import {
   IntegrationProvider,
   isShopifyShopDomain,
   roleCan,
+  type ShopifySyncJob,
   type TenantScope,
 } from '@truepath/shared';
 import { consumeShopifyOAuthState, issueShopifyOAuthState } from '../shopifyOAuthState.js';
@@ -38,6 +40,8 @@ export interface ShopifyIntegrationDeps {
   readonly appUrl: string;
   /** Where the merchant's browser lands after a successful connect. */
   readonly dashboardUrl: string;
+  /** HLD §8 `shopify-sync` queue (M1-3). */
+  readonly shopifySyncQueue: Queue<ShopifySyncJob>;
 }
 
 function callbackRedirectUri(appUrl: string): string {
@@ -179,6 +183,17 @@ export function registerIntegrationRoutes(
         targetId: integration.id,
         metadata: { provider: 'shopify' },
       });
+
+      // shopify-integration.md §4.1 step 8: 90-day backfill once `read_all_orders` is granted,
+      // else 60. `jobId` dedupes a duplicate connect/re-auth into the same in-flight backfill
+      // rather than starting two concurrent bulk queries for one store (Shopify allows only a
+      // few concurrent bulk operations per shop; this codebase uses exactly one).
+      const days = credentials.scope.split(',').includes('read_all_orders') ? 90 : 60;
+      await shopify.shopifySyncQueue.add(
+        'backfill',
+        { storeId: store.id, mode: 'backfill', days },
+        { jobId: `backfill-${store.id}` }, // BullMQ custom job ids can't contain ':'
+      );
 
       await reply.redirect(`${shopify.dashboardUrl}/stores/${store.id}/connected`);
     },

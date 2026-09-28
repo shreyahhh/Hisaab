@@ -1,9 +1,16 @@
+import { Queue } from 'bullmq';
 import { Redis } from 'ioredis';
 import { createAuth, type Auth } from '@truepath/auth';
 import { createAuditLogRepository, createDb, type Db } from '@truepath/db';
 import { createShopifyAdapter } from '@truepath/integrations';
 import { createTestCredentialsCipher, createTestIdentityHasher } from '@truepath/privacy/testing';
-import { loadDotEnvIfPresent, loadEnv, postgresEnvSchema } from '@truepath/shared';
+import {
+  loadDotEnvIfPresent,
+  loadEnv,
+  postgresEnvSchema,
+  SHOPIFY_SYNC_QUEUE,
+  type ShopifySyncJob,
+} from '@truepath/shared';
 import { createAuditService } from './audit.js';
 import { buildApp, type AppDeps, type ShopifyDeps } from './app.js';
 
@@ -54,6 +61,14 @@ export const TEST_SHOPIFY_APP_URL = 'http://localhost:3000';
 export const TEST_DASHBOARD_URL = 'http://localhost:5173';
 export const TEST_SHOPIFY_OAUTH_STATE_SECRET = 'a'.repeat(32);
 
+// A dedicated connection: BullMQ's own docs require a Queue's ioredis client not share
+// maxRetriesPerRequest settings with unrelated code, and this way closing it (if a test ever
+// needs to) can't affect testRedis.
+const testQueueRedis = new Redis('redis://localhost:6379', { maxRetriesPerRequest: null });
+export const testShopifySyncQueue = new Queue<ShopifySyncJob>(SHOPIFY_SYNC_QUEUE, {
+  connection: testQueueRedis,
+});
+
 export const testShopify: ShopifyDeps = {
   adapter: testShopifyAdapter,
   cipher: testCredentialsCipher,
@@ -62,6 +77,7 @@ export const testShopify: ShopifyDeps = {
   oauthStateSecret: TEST_SHOPIFY_OAUTH_STATE_SECRET,
   appUrl: TEST_SHOPIFY_APP_URL,
   dashboardUrl: TEST_DASHBOARD_URL,
+  shopifySyncQueue: testShopifySyncQueue,
 };
 
 export function buildTestApp(overrides: Partial<AppDeps> = {}) {
