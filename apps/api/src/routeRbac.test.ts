@@ -79,6 +79,41 @@ describe('GET /v1/orgs/:id/audit-log — audit.read (owner/admin only)', () => {
   });
 });
 
+describe('GET /v1/orgs/:id/members — team.manage (owner/admin only)', () => {
+  it('owner can list members, including their own row', async () => {
+    const owner = await seedRealTenant(testAuth, testDb, 'members-owner');
+    cleanupQueue.push(() => cleanupRealTenant(testDb, owner));
+    const viewer = await addRealMember(testAuth, testDb, owner, 'members-viewer', 'viewer');
+    cleanupQueue.push(() => cleanupRealMember(testDb, viewer));
+
+    const res = await app.inject({
+      method: 'GET',
+      url: `/v1/orgs/${owner.organizationId}/members`,
+      headers: cookieHeader(owner),
+    });
+    expect(res.statusCode).toBe(200);
+    const members = res.json().members as Array<{ userId: string; role: string }>;
+    expect(members.map((m) => m.userId)).toEqual(
+      expect.arrayContaining([owner.userId, viewer.userId]),
+    );
+    expect(members.find((m) => m.userId === viewer.userId)?.role).toBe('viewer');
+  });
+
+  it('analyst and viewer are forbidden', async () => {
+    const owner = await seedRealTenant(testAuth, testDb, 'members-analyst-owner');
+    cleanupQueue.push(() => cleanupRealTenant(testDb, owner));
+    const analyst = await addRealMember(testAuth, testDb, owner, 'members-analyst', 'analyst');
+    cleanupQueue.push(() => cleanupRealMember(testDb, analyst));
+
+    const res = await app.inject({
+      method: 'GET',
+      url: `/v1/orgs/${owner.organizationId}/members`,
+      headers: cookieHeader(analyst),
+    });
+    expect(res.statusCode).toBe(403);
+  });
+});
+
 describe('POST /v1/orgs/:id/invites — team.manage (owner/admin), admins cannot invite owners', () => {
   it('owner can invite an admin', async () => {
     const owner = await seedRealTenant(testAuth, testDb, 'invite-owner');

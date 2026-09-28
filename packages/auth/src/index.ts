@@ -12,9 +12,11 @@ export { truncateIp, nullGoogleTokensAfterCreate } from './hooks.js';
 export {
   resolveMembership,
   resolveMembershipsForUser,
+  resolveMembersForOrganization,
   findUserIdByEmail,
   getInvitation,
   type InvitationInfo,
+  type MemberSummary,
   type MembershipInfo,
   type OrganizationMembership,
 } from './scope.js';

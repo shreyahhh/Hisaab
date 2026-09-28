@@ -1,7 +1,7 @@
 import { randomBytes } from 'node:crypto';
 import { describe, expect, it } from 'vitest';
 import { parseEnv } from '@truepath/shared';
-import { apiEnvSchema, placeholder } from './index.js';
+import { apiEnvSchema } from './index.js';
 
 const key = () => randomBytes(32).toString('base64');
 
@@ -25,17 +25,36 @@ function env(overrides: Record<string, string | undefined> = {}): NodeJS.Process
     SHOPIFY_CLIENT_SECRET: 'client-secret',
     SHOPIFY_APP_URL: 'https://api.example.com',
     SHOPIFY_OAUTH_STATE_SECRET: 'a'.repeat(32),
+    BETTER_AUTH_SECRET: 'b'.repeat(32),
+    BETTER_AUTH_URL: 'http://localhost:3000',
+    DASHBOARD_URL: 'http://localhost:5173',
+    GOOGLE_CLIENT_ID: 'google-client-id',
+    GOOGLE_CLIENT_SECRET: 'google-client-secret',
     ...overrides,
   };
 }
 
-describe('apps/api', () => {
-  it('exposes a placeholder as a smoke test for the build/test pipeline', () => {
-    expect(placeholder()).toContain('not yet implemented');
-  });
-});
-
 describe('apps/api boot environment', () => {
+  it('defaults AUTH_ALLOW_INSECURE_COOKIES to false (secure cookies) when unset', () => {
+    const result = parseEnv(apiEnvSchema, env());
+    expect(result.success).toBe(true);
+    if (result.success) expect(result.data.AUTH_ALLOW_INSECURE_COOKIES).toBe(false);
+  });
+
+  it('refuses to start without the Better Auth / Google sign-in config, in any NODE_ENV', () => {
+    for (const NODE_ENV of ['development', 'test', 'production']) {
+      for (const name of [
+        'BETTER_AUTH_SECRET',
+        'BETTER_AUTH_URL',
+        'DASHBOARD_URL',
+        'GOOGLE_CLIENT_ID',
+        'GOOGLE_CLIENT_SECRET',
+      ]) {
+        const result = parseEnv(apiEnvSchema, env({ NODE_ENV, [name]: undefined }));
+        expect(result.success, `${NODE_ENV} without ${name}`).toBe(false);
+      }
+    }
+  });
   it('accepts a complete environment', () => {
     expect(parseEnv(apiEnvSchema, env()).success).toBe(true);
   });

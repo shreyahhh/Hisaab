@@ -38,6 +38,8 @@ export interface IntegrationRepository {
   ): Promise<IntegrationRow | null>;
   /** `app/uninstalled` webhook (store-scoped — the caller has no organization id yet). */
   markUninstalled(scope: Scope, storeId: string): Promise<IntegrationRow | null>;
+  /** `GET /v1/stores/:id/integrations` (SPEC §10, dashboard.md §2.1): every integration for a store, any status. */
+  listByStore(scope: Scope, storeId: string): Promise<IntegrationRow[]>;
 }
 
 /** The only sanctioned way to read/write `integrations` (ADR-0016) — every method requires a Scope. */
@@ -134,6 +136,11 @@ export function createIntegrationRepository(db: Db): IntegrationRepository {
         .where(and(eq(integrations.storeId, storeId), eq(integrations.provider, 'shopify')))
         .returning();
       return row ?? null;
+    },
+
+    async listByStore(scope, storeId) {
+      assertStoreInScope(scope, storeId);
+      return db.select().from(integrations).where(eq(integrations.storeId, storeId));
     },
   };
 }

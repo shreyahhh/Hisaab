@@ -1,5 +1,11 @@
 import { describe, expect, it } from 'vitest';
-import { authEnvSchema, parseEnv, postgresEnvSchema, redisDurableEnvSchema } from './env.js';
+import {
+  authCookieEnvSchema,
+  authEnvSchema,
+  parseEnv,
+  postgresEnvSchema,
+  redisDurableEnvSchema,
+} from './env.js';
 
 describe('parseEnv', () => {
   it('accepts a valid environment', () => {
@@ -56,6 +62,25 @@ describe('parseEnv', () => {
   it('never echoes the source values back in a way that would leak them into a diff of this test', () => {
     // Guard against a future edit accidentally asserting on (and thus logging) a real-looking secret.
     const result = parseEnv(postgresEnvSchema, { DATABASE_URL: 'not-a-url' });
+    expect(result.success).toBe(false);
+  });
+});
+
+describe('authCookieEnvSchema', () => {
+  it('defaults to secure cookies (false) when unset', () => {
+    const result = parseEnv(authCookieEnvSchema, {});
+    expect(result.success).toBe(true);
+    if (result.success) expect(result.data.AUTH_ALLOW_INSECURE_COOKIES).toBe(false);
+  });
+
+  it('parses an explicit "true" as the boolean true', () => {
+    const result = parseEnv(authCookieEnvSchema, { AUTH_ALLOW_INSECURE_COOKIES: 'true' });
+    expect(result.success).toBe(true);
+    if (result.success) expect(result.data.AUTH_ALLOW_INSECURE_COOKIES).toBe(true);
+  });
+
+  it('rejects a value that is neither "true" nor "false"', () => {
+    const result = parseEnv(authCookieEnvSchema, { AUTH_ALLOW_INSECURE_COOKIES: 'yes' });
     expect(result.success).toBe(false);
   });
 });

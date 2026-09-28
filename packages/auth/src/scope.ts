@@ -52,6 +52,36 @@ export async function resolveMembershipsForUser(
   return rows;
 }
 
+export interface MemberSummary {
+  readonly userId: string;
+  readonly email: string;
+  readonly name: string;
+  readonly role: Role;
+}
+
+/**
+ * Lists every member of an organization with enough user info to render a team page (Better
+ * Auth's own `/organization/list-members` is disabled — ADR-0022 — since it returns more than our
+ * own audit-worthy routes need). Same allowed exception as the other lookups in this file: reads
+ * Better Auth's own `memberships`/`users` tables directly.
+ */
+export async function resolveMembersForOrganization(
+  db: Db,
+  organizationId: string,
+): Promise<MemberSummary[]> {
+  const rows = await db
+    .select({
+      userId: schema.memberships.userId,
+      role: schema.memberships.role,
+      email: schema.users.email,
+      name: schema.users.name,
+    })
+    .from(schema.memberships)
+    .innerJoin(schema.users, eq(schema.users.id, schema.memberships.userId))
+    .where(eq(schema.memberships.organizationId, organizationId));
+  return rows;
+}
+
 export interface InvitationInfo {
   readonly id: string;
   readonly organizationId: string;

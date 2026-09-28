@@ -19,14 +19,16 @@ import {
   requireOrgScope,
   requirePermission,
   requireSession,
+  requireStoreScope,
   type TenantScopeDeps,
 } from '../tenantScope.js';
 
 /**
- * `GET /v1/orgs/:id/integrations/shopify/connect`, `GET /v1/integrations/shopify/callback` and
- * `DELETE /v1/orgs/:id/integrations/:integrationId` (ADR-0024, shopify-integration.md §2.1, §4.1).
- * The `DELETE` route is provider-agnostic (it will serve Meta/Google Ads integrations too, from
- * M2); `connect`/`callback` are Shopify-specific for now.
+ * `GET /v1/orgs/:id/integrations/shopify/connect`, `GET /v1/integrations/shopify/callback`,
+ * `DELETE /v1/orgs/:id/integrations/:integrationId` (ADR-0024, shopify-integration.md §2.1, §4.1)
+ * and `GET /v1/stores/:id/integrations` (SPEC §10, dashboard.md §2.1 "Integrations health").
+ * `DELETE`/`GET .../integrations` are provider-agnostic (they will serve Meta/Google Ads
+ * integrations too, from M2); `connect`/`callback` are Shopify-specific for now.
  */
 export interface ShopifyIntegrationDeps {
   readonly adapter: ShopifyAdapter;
@@ -208,6 +210,31 @@ export function registerIntegrationRoutes(
         metadata: { provider: IntegrationProvider.parse(revoked.provider) },
       });
       await reply.code(204).send();
+    },
+  );
+
+  // Never returns encrypted_credentials or scopes' underlying secrets — this response is safe to
+  // render directly on the Integrations settings screen (dashboard.md §4.7).
+  app.get<{ Params: { storeId: string } }>(
+    '/v1/stores/:storeId/integrations',
+    { preHandler: [requireStoreScope(deps), requirePermission('integrations.manage')] },
+    async (request, reply) => {
+      const scope = request.scope!;
+      const rows = await createIntegrationRepository(deps.db).listByStore(
+        scope,
+        request.params.storeId,
+      );
+      await reply.send({
+        integrations: rows.map((row) => ({
+          id: row.id,
+          provider: row.provider,
+          status: row.status,
+          external_account_id: row.externalAccountId,
+          scopes: row.scopes ?? [],
+          last_synced_at: row.lastSyncedAt?.toISOString() ?? null,
+          error: row.error,
+        })),
+      });
     },
   );
 }

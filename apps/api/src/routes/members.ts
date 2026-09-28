@@ -1,8 +1,8 @@
 import { fromNodeHeaders } from 'better-auth/node';
 import type { FastifyInstance } from 'fastify';
-import { resolveMembership } from '@truepath/auth';
+import { resolveMembership, resolveMembersForOrganization } from '@truepath/auth';
 import { can, RoleSchema } from '@truepath/shared';
-import { requireOrgScope, type TenantScopeDeps } from '../tenantScope.js';
+import { requireOrgScope, requirePermission, type TenantScopeDeps } from '../tenantScope.js';
 import { AuthApiError, authCall } from '../authCall.js';
 
 // Better Auth uses a different code for updateMemberRole (demoting the last owner) than for
@@ -20,6 +20,20 @@ const LAST_OWNER_CODES = new Set([
  * - The last owner can't be demoted or removed — Better Auth's own guard, mapped to `409 last_owner`.
  */
 export function registerMemberRoutes(app: FastifyInstance, deps: TenantScopeDeps): void {
+  // GET /v1/orgs/:id/members: not in SPEC's endpoint list, but the Team & roles settings screen
+  // (dashboard.md §4.7, min role admin/owner) needs a way to list who's in the org — Better Auth's
+  // own `/organization/list-members` is disabled (ADR-0022) since it returns more than this needs.
+  // Gated the same as team.manage (owner/admin), matching the route's LLD-documented min role.
+  app.get<{ Params: { id: string } }>(
+    '/v1/orgs/:id/members',
+    { preHandler: [requireOrgScope(deps), requirePermission('team.manage')] },
+    async (request, reply) => {
+      const scope = request.scope!;
+      const members = await resolveMembersForOrganization(deps.db, scope.organizationId);
+      await reply.send({ members });
+    },
+  );
+
   app.put<{ Params: { id: string; userId: string }; Body: { role: string } }>(
     '/v1/orgs/:id/members/:userId',
     { preHandler: [requireOrgScope(deps)] },
