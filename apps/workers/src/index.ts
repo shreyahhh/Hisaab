@@ -26,6 +26,7 @@ import { processEventBatch } from './eventBatch.js';
 import { EventConsumer } from './eventConsumer.js';
 import { createShopifySyncProcessor } from './shopifySync.js';
 import { StoreContextCache } from './storeEventContext.js';
+import { SuppressionRebuilder } from './suppressionRebuild.js';
 
 // Workers (HLD §8): shopify-sync (M1-3) and event-workers (M1-6, the `stream:events-raw` consumer
 // group) are built; ad-sync-meta, ad-sync-google-ads, shiprocket-sync, identity-stitch,
@@ -109,10 +110,32 @@ function main(): void {
     { consumer: `event-workers:${hostname()}-${process.pid}` },
   );
 
-  process.once('SIGTERM', () => consumer.stop());
-  process.once('SIGINT', () => consumer.stop());
+  // Keeps `suppress:ready` present (HLD §8): rebuilds the suppression sets from Postgres at startup and
+  // whenever the marker goes missing. While it is missing the event consumer waits on its own, and the
+  // shopify-sync queue is paused here (`true`: don't wait for active jobs, which would delay the rebuild).
+  const rebuilder = new SuppressionRebuilder({
+    db,
+    redis,
+    log: (line) => console.log(JSON.stringify(line)),
+    onUnavailable: async () => {
+      await worker.pause(true);
+    },
+    onReady: () => {
+      worker.resume();
+    },
+  });
+
+  process.once('SIGTERM', () => {
+    consumer.stop();
+    rebuilder.stop();
+  });
+  process.once('SIGINT', () => {
+    consumer.stop();
+    rebuilder.stop();
+  });
+  rebuilder.start();
   void runEventWorkers(consumer);
-  console.log('apps/workers: event-workers consumer group started');
+  console.log('apps/workers: event-workers consumer group and suppression rebuilder started');
 }
 
 /**

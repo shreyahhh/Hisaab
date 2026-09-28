@@ -25,11 +25,14 @@ Consumes `stream:events-raw` (`docs/architecture/lld/event-pipeline.md`).
     (`consent_records`, `suppressed_identities`, the withdrawal erasure request, `orders.visitor_id`) in one
     transaction per store, then enqueues `dsr` jobs, then the Redis writes (suppression mirror, `checkout:`,
     `dedupe:`).
-  - It fails closed: with `suppress:ready` absent nothing is read or written. **That marker is written by
-    M1-6c** — until then a local pipeline stays paused (set `suppress:ready` by hand to develop against it).
+  - It fails closed: with `suppress:ready` absent nothing is read or written (the marker is written by
+    M1-6c, below).
   - `dsr` jobs are enqueued, but **nothing consumes the `dsr` queue until M4-2**, so a withdrawal's erasure
     does not complete yet.
-- **M1-6c**: the suppression rebuild that writes `suppress:ready`.
+- **M1-6c**: `suppressionRebuild.ts` — reloads the suppression sets from Postgres (`suppressed_identities`)
+  into Redis and then writes `suppress:ready`, at Workers startup and whenever the marker goes missing
+  (checked every 10 s). While it is missing `shopify-sync` is paused. See `privacy-dpdp.md` §4.9. **Not
+  yet done:** republishing the `collector:store:*` configs after a Redis loss (a GitHub issue).
 
 The event-pipeline tests need the local Postgres, ClickHouse and durable Redis
 (`docker compose up`). They isolate the global names (readiness marker, streams) per run and namespace
