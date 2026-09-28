@@ -386,6 +386,14 @@ never appears in the captured log output.
 - A mapping edit → `ShopifySyncJob{mode:'reconcile'}` over the backfill window to re-derive `payment_method`.
 
 ### 4.7 Backfill, bulk results, reconciliation, refresh (`shopify-sync`)
+
+**M1-3 status**: the `shopify-sync` BullMQ queue exists, and the OAuth callback enqueues
+`{mode:'backfill', days}` on every successful connect. Only `startBulkOrders` itself is
+implemented — it submits the bulk query and returns; nothing yet consumes its result. Reading the
+JSONL and applying it (`bulk_result`, below), `reconcile`, `order_refresh`, the auto-extend
+re-enqueue, and the up-to-5-concurrent-queries accounting are **not built** and tracked as
+follow-up issues, not silently dropped.
+
 - **`backfill`**:
   - `startBulkOrders(since = now − days)`, where `days` = 60 without `read_all_orders`, else 90.
   - Up to 5 concurrent bulk queries per shop are allowed from API 2026-01 ([bulk queries](https://shopify.dev/docs/api/usage/bulk-operations/queries)); we use 1.
