@@ -88,6 +88,12 @@ function fakeShopifyAdapter(options: FakeAdapterOptions = {}): ShopifyAdapter {
     async startBulkOrders() {
       return 'gid://shopify/BulkOperation/test';
     },
+    async bulkOperation() {
+      return null;
+    },
+    async *streamBulkOrders() {
+      // no result rows
+    },
   };
 }
 

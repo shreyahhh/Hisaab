@@ -520,3 +520,173 @@ describe('createShopifyAdapter: startBulkOrders', () => {
     );
   });
 });
+
+describe('createShopifyAdapter: bulkOperation', () => {
+  const creds: ShopifyCredentials = {
+    accessToken: 'shpat_abc123',
+    accessTokenExpiresAt: new Date().toISOString(),
+    refreshToken: 'shprt_def456',
+    refreshTokenExpiresAt: new Date().toISOString(),
+    scope: 'read_orders',
+  };
+  const OP_ID = 'gid://shopify/BulkOperation/55';
+
+  it('reads status and result URLs for the operation, sending the token and the id', async () => {
+    let seen: { token: string | null; variables: unknown } = { token: null, variables: null };
+    server.use(
+      http.post(`https://${SHOP}/admin/api/*/graphql.json`, async ({ request }) => {
+        const body = (await request.json()) as { variables: unknown };
+        seen = { token: request.headers.get('x-shopify-access-token'), variables: body.variables };
+        return HttpResponse.json({
+          data: {
+            node: {
+              id: OP_ID,
+              status: 'COMPLETED',
+              errorCode: null,
+              rootObjectCount: '42',
+              url: 'https://storage.example.com/r.jsonl',
+              partialDataUrl: null,
+            },
+          },
+        });
+      }),
+    );
+    const op = await createShopifyAdapter(CONFIG).bulkOperation(SHOP, creds, OP_ID);
+    expect(op).toEqual({
+      id: OP_ID,
+      status: 'COMPLETED',
+      errorCode: null,
+      rootObjectCount: 42, // parsed from Shopify's string-typed UnsignedInt64
+      url: 'https://storage.example.com/r.jsonl',
+      partialDataUrl: null,
+    });
+    expect(seen).toEqual({ token: 'shpat_abc123', variables: { id: OP_ID } });
+  });
+
+  it('returns null when Shopify has no such node', async () => {
+    server.use(
+      http.post(`https://${SHOP}/admin/api/*/graphql.json`, () =>
+        HttpResponse.json({ data: { node: null } }),
+      ),
+    );
+    expect(await createShopifyAdapter(CONFIG).bulkOperation(SHOP, creds, OP_ID)).toBeNull();
+  });
+
+  it('throws ShopifyUnauthorizedError on a 401 and a plain error on other failures or a bad shape', async () => {
+    const adapter = createShopifyAdapter(CONFIG);
+    server.use(
+      http.post(`https://${SHOP}/admin/api/*/graphql.json`, () =>
+        HttpResponse.json({}, { status: 401 }),
+      ),
+    );
+    await expect(adapter.bulkOperation(SHOP, creds, OP_ID)).rejects.toBeInstanceOf(
+      ShopifyUnauthorizedError,
+    );
+    server.use(
+      http.post(`https://${SHOP}/admin/api/*/graphql.json`, () =>
+        HttpResponse.json({}, { status: 500 }),
+      ),
+    );
+    await expect(adapter.bulkOperation(SHOP, creds, OP_ID)).rejects.toThrow('500');
+    server.use(
+      http.post(`https://${SHOP}/admin/api/*/graphql.json`, () =>
+        HttpResponse.json({ data: { node: { id: OP_ID } } }),
+      ),
+    );
+    await expect(adapter.bulkOperation(SHOP, creds, OP_ID)).rejects.toThrow('unexpected response');
+  });
+});
+
+describe('createShopifyAdapter: streamBulkOrders', () => {
+  const RESULT_URL = 'https://storage.example.com/result.jsonl';
+  const NODE = {
+    id: 'gid://shopify/Order/2001',
+    createdAt: '2026-09-10T10:00:00Z',
+    updatedAt: '2026-09-10T10:05:00Z',
+    cancelledAt: null,
+    email: 'shopper@example.com',
+    phone: null,
+    totalPriceSet: { shopMoney: { amount: '499.50', currencyCode: 'INR' } },
+    totalRefundedSet: { shopMoney: { amount: '0.00' } },
+    totalOutstandingSet: { shopMoney: { amount: '499.50' } },
+    paymentGatewayNames: ['Cash on Delivery (COD)'],
+    displayFinancialStatus: 'PENDING',
+    displayFulfillmentStatus: 'UNFULFILLED',
+    discountCodes: [],
+    shippingAddress: { zip: '110001', phone: '+918123456709' },
+  };
+
+  async function collect(url = RESULT_URL) {
+    const lines = [];
+    for await (const line of createShopifyAdapter(CONFIG).streamBulkOrders(url)) lines.push(line);
+    return lines;
+  }
+
+  it('maps each JSONL line to a snapshot, without sending any auth header (the URL is pre-signed)', async () => {
+    let auth: string | null = 'unset';
+    const second = { ...NODE, id: 'gid://shopify/Order/2002' };
+    server.use(
+      http.get(RESULT_URL, ({ request }) => {
+        auth = request.headers.get('x-shopify-access-token');
+        return new HttpResponse(`${JSON.stringify(NODE)}\n${JSON.stringify(second)}\n`);
+      }),
+    );
+    const lines = await collect();
+    expect(auth).toBeNull();
+    expect(lines).toHaveLength(2);
+    expect(lines.map((l) => l.kind)).toEqual(['order', 'order']);
+    const first = lines[0]!;
+    if (first.kind !== 'order') throw new Error('expected an order line');
+    expect(first.snapshot).toMatchObject({
+      externalOrderId: '2001',
+      totalPrice: '499.50',
+      currency: 'INR',
+      shippingAddressZip: '110001',
+      phone: '+918123456709', // falls back to the shipping-address phone, as fetchOrder does
+    });
+  });
+
+  it('yields `invalid` (with no content) for malformed JSON, a wrong shape, and child rows; skips blank lines', async () => {
+    server.use(
+      http.get(
+        RESULT_URL,
+        () =>
+          new HttpResponse(
+            [
+              '{not json',
+              '',
+              JSON.stringify({ id: 'gid://shopify/Order/1' }),
+              JSON.stringify({ ...NODE, __parentId: 'gid://shopify/Order/9' }),
+              JSON.stringify(NODE),
+            ].join('\n'),
+          ),
+      ),
+    );
+    const lines = await collect();
+    expect(lines.map((l) => l.kind)).toEqual(['invalid', 'invalid', 'invalid', 'order']);
+    // An invalid line carries nothing but its kind — the raw line can hold protected customer data.
+    expect(lines[0]).toEqual({ kind: 'invalid' });
+  });
+
+  it('handles CRLF line endings and a final line with no trailing newline', async () => {
+    server.use(
+      http.get(
+        RESULT_URL,
+        () => new HttpResponse(`${JSON.stringify(NODE)}\r\n${JSON.stringify(NODE)}`),
+      ),
+    );
+    expect((await collect()).map((l) => l.kind)).toEqual(['order', 'order']);
+  });
+
+  it('yields nothing for an empty result', async () => {
+    server.use(http.get(RESULT_URL, () => new HttpResponse('')));
+    expect(await collect()).toEqual([]);
+  });
+
+  it('throws on a non-ok download, and refuses a non-https URL before fetching anything', async () => {
+    server.use(http.get(RESULT_URL, () => new HttpResponse(null, { status: 403 })));
+    await expect(collect()).rejects.toThrow('403');
+    await expect(collect('http://storage.example.com/result.jsonl')).rejects.toThrow('not https');
+    await expect(collect('file:///etc/passwd')).rejects.toThrow('not https');
+  });
+});

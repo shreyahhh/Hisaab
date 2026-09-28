@@ -17,6 +17,26 @@ export interface UpsertShopifyIntegrationInput {
   readonly cipher: CredentialsCipher;
 }
 
+/**
+ * `integrations.settings.backfill` (shopify-integration.md §2.7 — non-secret only). Every field is
+ * optional so each step of the backfill lifecycle patches only what it knows; the stored object is
+ * the merge of all patches.
+ */
+export interface BackfillStatePatch {
+  readonly days?: number;
+  readonly status?: 'running' | 'done' | 'failed';
+  readonly bulk_operation_id?: string;
+  readonly started_at?: string;
+  readonly finished_at?: string;
+  readonly orders_applied?: number;
+  /** What Shopify's own `rootObjectCount` said the result held, to reconcile against `orders_applied`. */
+  readonly orders_reported?: number;
+  /** A count only — never the rejected line, which can hold protected customer data. */
+  readonly invalid_lines?: number;
+  /** A short machine code (e.g. a Shopify `errorCode`), never a message that could embed data. */
+  readonly error_code?: string;
+}
+
 export interface IntegrationRepository {
   /** Creates the store's Shopify integration on first connect, or updates it on re-auth. */
   upsertShopify(scope: Scope, input: UpsertShopifyIntegrationInput): Promise<IntegrationRow>;
@@ -40,6 +60,17 @@ export interface IntegrationRepository {
   markUninstalled(scope: Scope, storeId: string): Promise<IntegrationRow | null>;
   /** The store's active integration for a provider (job-scope-friendly — no organization id needed). */
   getActiveByStore(scope: Scope, storeId: string, provider: string): Promise<IntegrationRow | null>;
+  /**
+   * Merges `patch` into the store's Shopify `settings.backfill` (creating it if absent) in one
+   * atomic UPDATE, so two writers patching different fields never lose each other's keys. Stamps
+   * `last_synced_at` when the patch marks the backfill `done`. No-op (null) if the store has no
+   * active Shopify integration.
+   */
+  patchShopifyBackfillState(
+    scope: Scope,
+    storeId: string,
+    patch: BackfillStatePatch,
+  ): Promise<IntegrationRow | null>;
 }
 
 /** The only sanctioned way to read/write `integrations` (ADR-0016) — every method requires a Scope. */
@@ -153,6 +184,30 @@ export function createIntegrationRepository(db: Db): IntegrationRepository {
         )
         .limit(1);
       return rows[0] ?? null;
+    },
+
+    async patchShopifyBackfillState(scope, storeId, patch) {
+      assertStoreInScope(scope, storeId);
+      const patchJson = JSON.stringify(patch);
+      const [row] = await db
+        .update(integrations)
+        .set({
+          settings: sql`jsonb_set(
+            coalesce(${integrations.settings}, '{}'::jsonb),
+            '{backfill}',
+            coalesce(${integrations.settings} -> 'backfill', '{}'::jsonb) || ${patchJson}::jsonb
+          )`,
+          ...(patch.status === 'done' ? { lastSyncedAt: sql`now()` } : {}),
+        })
+        .where(
+          and(
+            eq(integrations.storeId, storeId),
+            eq(integrations.provider, 'shopify'),
+            eq(integrations.status, 'active'),
+          ),
+        )
+        .returning();
+      return row ?? null;
     },
   };
 }

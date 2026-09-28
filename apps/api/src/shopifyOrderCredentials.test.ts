@@ -53,6 +53,10 @@ function fakeAdapter(options: {
     fetchOrder: async (_shop, creds) =>
       options.fetchOrderImpl ? options.fetchOrderImpl(creds) : null,
     startBulkOrders: async () => 'gid://shopify/BulkOperation/test',
+    bulkOperation: async () => null,
+    streamBulkOrders: async function* () {
+      // no result rows
+    },
   };
 }
 

@@ -141,6 +141,7 @@ export function buildApp(deps: AppDeps): FastifyInstance {
       adapter: deps.shopify.adapter,
       hasher: deps.shopify.hasher,
       cipher: deps.shopify.cipher,
+      shopifySyncQueue: deps.shopify.shopifySyncQueue,
     });
   });
 

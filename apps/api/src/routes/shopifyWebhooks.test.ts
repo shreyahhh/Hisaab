@@ -4,7 +4,13 @@ import { createIntegrationRepository, jobScope, schema, type Db } from '@truepat
 import type { ShopifyAdapter, ShopifyOrderSnapshot } from '@truepath/integrations';
 import { eq } from 'drizzle-orm';
 import { afterEach, describe, expect, it } from 'vitest';
-import { buildTestApp, testCredentialsCipher, testDb, testShopify } from '../testApp.js';
+import {
+  buildTestApp,
+  testCredentialsCipher,
+  testDb,
+  testShopify,
+  testShopifySyncQueue,
+} from '../testApp.js';
 
 /** A minimal, schema-valid INR order payload (shopify-integration.md §2.5). */
 function orderWebhookPayload(overrides: Record<string, unknown> = {}) {
@@ -1003,5 +1009,136 @@ describe('POST /webhooks/shopify/order-hints — refunds/fulfillments (M1-2)', (
     } finally {
       await app2.close();
     }
+  });
+});
+
+describe('POST /webhooks/shopify/app — bulk_operations/finish (M1-3b)', () => {
+  const opGid = () => `gid://shopify/BulkOperation/${Math.floor(Math.random() * 1e12)}`;
+
+  async function storeDomain(label: string) {
+    const t = await tenant(label);
+    const [store] = await testDb
+      .select()
+      .from(schema.stores)
+      .where(eq(schema.stores.id, t.storeId));
+    return { t, shopDomain: store!.shopDomain };
+  }
+
+  // The queue is the real local one — remove what a test enqueues so a worker running against the
+  // same Redis never picks up a leftover test job.
+  async function jobFor(gid: string) {
+    const job = await testShopifySyncQueue.getJob(`bulk-result-${gid.split('/').pop()}`);
+    if (job) cleanups.push(async () => void (await job.remove().catch(() => undefined)));
+    return job;
+  }
+
+  it('enqueues a bulk_result job for a finished query operation, tied to the store and operation id', async () => {
+    const { t, shopDomain } = await storeDomain('webhook-bulk-finish');
+    const gid = opGid();
+    const res = await sendWebhook({
+      topic: 'app',
+      shopifyTopic: 'bulk_operations/finish',
+      shopDomain,
+      body: {
+        admin_graphql_api_id: gid,
+        type: 'query',
+        status: 'completed',
+        completed_at: '2026-09-28T09:00:00Z',
+      },
+    });
+    expect(res.statusCode).toBe(200);
+    const job = await jobFor(gid);
+    expect(job?.data).toEqual({ storeId: t.storeId, mode: 'bulk_result', bulkOperationId: gid });
+  });
+
+  it('also enqueues for a failed operation — the worker re-reads the status and records the failure', async () => {
+    const { t, shopDomain } = await storeDomain('webhook-bulk-failed');
+    const gid = opGid();
+    const res = await sendWebhook({
+      topic: 'app',
+      shopifyTopic: 'bulk_operations/finish',
+      shopDomain,
+      body: {
+        admin_graphql_api_id: gid,
+        type: 'query',
+        status: 'failed',
+        error_code: 'ACCESS_DENIED',
+      },
+    });
+    expect(res.statusCode).toBe(200);
+    expect((await jobFor(gid))?.data.storeId).toBe(t.storeId);
+  });
+
+  it('collapses a redelivery (a different webhook id for the same operation) into the one job', async () => {
+    const { shopDomain } = await storeDomain('webhook-bulk-redelivery');
+    const gid = opGid();
+    for (const webhookId of [randomUUID(), randomUUID()]) {
+      const res = await sendWebhook({
+        topic: 'app',
+        shopifyTopic: 'bulk_operations/finish',
+        shopDomain,
+        webhookId,
+        body: { admin_graphql_api_id: gid, type: 'query', status: 'completed' },
+      });
+      expect(res.statusCode).toBe(200);
+    }
+    const jobs = await testShopifySyncQueue.getJobs([
+      'waiting',
+      'delayed',
+      'active',
+      'completed',
+      'failed',
+    ]);
+    const matching = jobs.filter((j) => j.data.bulkOperationId === gid);
+    expect(matching).toHaveLength(1);
+    await jobFor(gid);
+  });
+
+  it('ignores mutation-type operations (not ours)', async () => {
+    const { shopDomain } = await storeDomain('webhook-bulk-mutation');
+    const gid = opGid();
+    const res = await sendWebhook({
+      topic: 'app',
+      shopifyTopic: 'bulk_operations/finish',
+      shopDomain,
+      body: { admin_graphql_api_id: gid, type: 'mutation', status: 'completed' },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(await jobFor(gid)).toBeUndefined();
+  });
+
+  it('acks a malformed payload without enqueueing, logging field paths only', async () => {
+    const { shopDomain } = await storeDomain('webhook-bulk-malformed');
+    const poison = 'poison-value-never-logged';
+    const original = console.error;
+    const logged: string[] = [];
+    console.error = (...args: unknown[]) => logged.push(args.map(String).join(' '));
+    try {
+      const res = await sendWebhook({
+        topic: 'app',
+        shopifyTopic: 'bulk_operations/finish',
+        shopDomain,
+        body: { admin_graphql_api_id: 12345, type: poison, status: 'completed' },
+      });
+      expect(res.statusCode).toBe(200);
+    } finally {
+      console.error = original;
+    }
+    const combined = logged.join('\n');
+    expect(combined).not.toContain(poison);
+    expect(combined).toContain('admin_graphql_api_id');
+    expect(await jobFor('12345')).toBeUndefined();
+  });
+
+  it('does not enqueue for a bulk-finish webhook from an unknown shop', async () => {
+    const gid = opGid();
+    const res = await sendWebhook({
+      topic: 'app',
+      shopifyTopic: 'bulk_operations/finish',
+      shopDomain: 'no-such-shop-anywhere.myshopify.com',
+      body: { admin_graphql_api_id: gid, type: 'query', status: 'completed' },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(await jobFor(gid)).toBeUndefined();
   });
 });

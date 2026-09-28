@@ -65,8 +65,12 @@ export const TEST_SHOPIFY_OAUTH_STATE_SECRET = 'a'.repeat(32);
 // maxRetriesPerRequest settings with unrelated code, and this way closing it (if a test ever
 // needs to) can't affect testRedis.
 const testQueueRedis = new Redis('redis://localhost:6379', { maxRetriesPerRequest: null });
+// The queue keeps its canonical name (HLD §8) but lives under its own BullMQ key prefix, so a real
+// `shopify-sync` worker running against this same local Redis (e.g. `pnpm dev`) can never consume,
+// lock or race the jobs these tests enqueue and then assert on.
 export const testShopifySyncQueue = new Queue<ShopifySyncJob>(SHOPIFY_SYNC_QUEUE, {
   connection: testQueueRedis,
+  prefix: 'bull-test',
 });
 
 export const testShopify: ShopifyDeps = {

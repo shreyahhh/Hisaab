@@ -1,5 +1,6 @@
 import type { FastifyInstance } from 'fastify';
-import type { ZodError } from 'zod';
+import type { Queue } from 'bullmq';
+import { z, type ZodError } from 'zod';
 import {
   createDsrRequestRepository,
   createIntegrationRepository,
@@ -18,13 +19,13 @@ import {
   type ShopifyOrderSnapshot,
 } from '@truepath/integrations';
 import { storeContext, type CredentialsCipher, type IdentityHasher } from '@truepath/privacy';
-import type { TenantScope } from '@truepath/shared';
+import type { ShopifySyncJob, TenantScope } from '@truepath/shared';
 import { fetchOrderWithTokenRefresh } from '../shopifyOrderCredentials.js';
 import type { TenantScopeDeps } from '../tenantScope.js';
 
 // POST /webhooks/shopify/:topic (shopify-integration.md §2.2, §2.4, §4.2-§4.8). M1-1 built
-// app/uninstalled and the three compliance topics; M1-2 adds orders/refunds/fulfillments.
-// bulk_operations/finish is still acknowledged-only (M1-3, backfill).
+// app/uninstalled and the three compliance topics; M1-2 adds orders/refunds/fulfillments; M1-3b adds
+// bulk_operations/finish (enqueues the backfill's `bulk_result` job).
 //
 // HLD §8 exception: this file is the one sanctioned caller of `resolveStoreByShopDomain`
 // (eslint.config.js) — a webhook authenticates by HMAC + shop domain, never a session, so there is
@@ -63,6 +64,7 @@ export interface ShopifyWebhookDeps {
   readonly adapter: ShopifyAdapter;
   readonly hasher: IdentityHasher;
   readonly cipher: CredentialsCipher;
+  readonly shopifySyncQueue: Queue<ShopifySyncJob>;
 }
 
 /** Logs a structured, redacted line — field paths only, never the received value (M1-2 review item 6). */
@@ -312,6 +314,57 @@ async function handleOrderHintWebhook(
   await applyOrderSnapshot(deps, scope, storeId, hasher, snapshot, eventStatus, webhookId);
 }
 
+/**
+ * Shopify's `bulk_operations/finish` payload. Only the fields we act on; `admin_graphql_api_id` is
+ * the operation GID, `type` is `query` (our backfill) or `mutation`. No customer data is in it.
+ */
+const BulkOperationFinishWebhook = z.object({
+  admin_graphql_api_id: z.string().min(1),
+  type: z.string(),
+  status: z.string(),
+});
+
+/**
+ * `bulk_operations/finish` — the backfill query has ended (any terminal status). Enqueues
+ * `bulk_result` and does nothing else: the worker re-reads the operation from Shopify and decides
+ * (apply the result, or record the failure), so this handler needn't trust the webhook's own
+ * `status` and there is a single code path for success and failure. Mutation-type operations are
+ * not ours and are ignored. `jobId` dedupes a redelivered webhook into the one job; it is
+ * `bulk-result-<n>` rather than the LLD's `shopify-bulk:<id>` because BullMQ custom job ids can't
+ * contain ':' (same constraint as the backfill job id in routes/integrations.ts).
+ */
+async function handleBulkOperationFinish(
+  webhook: ShopifyWebhookDeps,
+  storeId: string,
+  shopifyTopic: string,
+  rawBody: Buffer,
+): Promise<void> {
+  let json: unknown;
+  try {
+    json = JSON.parse(rawBody.toString('utf8'));
+  } catch {
+    reportValidationFailure('shopify_bulk_operation_webhook_malformed_json', shopifyTopic, []);
+    return;
+  }
+  const parsed = BulkOperationFinishWebhook.safeParse(json);
+  if (!parsed.success) {
+    reportValidationFailure(
+      'shopify_bulk_operation_webhook_validation_failed',
+      shopifyTopic,
+      zodIssuePaths(parsed.error),
+    );
+    return; // ack — retrying a payload that will never parse doesn't help
+  }
+  if (parsed.data.type !== 'query') return;
+
+  const bulkOperationId = parsed.data.admin_graphql_api_id;
+  await webhook.shopifySyncQueue.add(
+    'bulk_result',
+    { storeId, mode: 'bulk_result', bulkOperationId },
+    { jobId: `bulk-result-${bulkOperationId.split('/').pop() ?? bulkOperationId}` },
+  );
+}
+
 export function registerShopifyWebhookRoutes(
   app: FastifyInstance,
   deps: TenantScopeDeps,
@@ -426,8 +479,9 @@ export function registerShopifyWebhookRoutes(
             rawBody,
             webhookId,
           );
+        } else if (shopifyTopic === 'bulk_operations/finish') {
+          await handleBulkOperationFinish(webhook, resolved.id, shopifyTopic, rawBody);
         }
-        // bulk_operations/finish: acknowledged only — tracked follow-up issue (backfill, M1-3).
 
         // Only reached once the handler above (if any) has completed without throwing — an error
         // propagates past this point instead, so the delivery is never marked done and Shopify's

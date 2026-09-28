@@ -53,3 +53,25 @@ export interface ShopifyOrderSnapshot {
   readonly noteAttributes: readonly { readonly name: string; readonly value: string | null }[];
   readonly discountCodes: readonly string[];
 }
+
+/** Shopify's `BulkOperation` object, narrowed to what `bulk_result` needs (shopify-integration.md §4.7). */
+export interface ShopifyBulkOperation {
+  readonly id: string;
+  /** `CREATED | RUNNING | COMPLETED | FAILED | CANCELED | CANCELING | EXPIRED` — kept a string so a
+   * value Shopify adds later doesn't fail parsing; callers compare against the ones they handle. */
+  readonly status: string;
+  readonly errorCode: string | null;
+  /** How many top-level objects (orders) Shopify says the query produced — what the result file
+   * should contain, so the worker can reconcile it against what it actually applied. */
+  readonly rootObjectCount: number;
+  /** Signed JSONL URL, valid for a week; null until COMPLETED (or when the query matched nothing). */
+  readonly url: string | null;
+  /** Present on FAILED/CANCELED operations that produced some output. */
+  readonly partialDataUrl: string | null;
+}
+
+/** One JSONL line of a bulk orders result: a usable order, or a line that could not be parsed.
+ * Invalid lines carry no content — the raw line may hold protected customer data. */
+export type ShopifyBulkOrderLine =
+  | { readonly kind: 'order'; readonly snapshot: ShopifyOrderSnapshot }
+  | { readonly kind: 'invalid' };
