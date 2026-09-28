@@ -153,8 +153,9 @@ sequenceDiagram
 ```
 
 ### 4.2 Sessionisation (`session_assign_v1`, Lua, atomic per visitor)
-State `session:<store_id>:<visitor_id>` = `{session_id, last_at, campaign_fp}`.
+State `session:<store_id>:<visitor_id>` = `{session_id, last_at, campaign_fp, start_ref}`.
 - `campaign_fp` is a fingerprint of the landing's campaign parameters: `utm_source|utm_medium|utm_campaign|utm_content|utm_term|click id value`, or `''` when none are present.
+- `start_ref` is the external referrer host of the event that started the session (`''` if none). Rule 4 below needs it to tell "the same referrer" from a new one; HLD §8 originally listed only the first three fields (`start_ref` added in M1-6a).
 
 For each event, in `occurred_at` order, a **new session** starts when any of these is true:
 1. no state exists;
@@ -162,7 +163,9 @@ For each event, in `occurred_at` order, a **new session** starts when any of the
 3. the event carries campaign params and their fingerprint differs from `campaign_fp`;
 4. the referrer is external and not ignorable (see §4.3 ignorable hosts), and the previous session was not started by the same referrer host.
 
-Otherwise the event joins the current session. A new session gets a server-generated UUID v7 `session_id`. `last_at = max(last_at, occurred_at)`, and the key expires after 7,200 s.
+Rules 2–4 apply only to an event that is not older than `last_at`; an older one joins the current session (see below). Otherwise the event joins the current session. A new session gets a server-generated UUID v7 `session_id`, supplied to the script as an argument (the script generates nothing).
+
+The pure reference implementation is `assignSession` in `packages/shared/src/session.ts`; the Lua script (`apps/workers/src/sessionAssign.ts`) applies the same rules atomically, and a differential test runs both over random sequences. `last_at = max(last_at, occurred_at)`, and the key expires after 7,200 s.
 
 Consent events never start a session (they carry no landing semantics).
 
@@ -295,9 +298,9 @@ Consent events never start a session (they carry no landing semantics).
 
 ## 9. Open questions
 
-1. **Session split at midnight IST?** GA-style reporting often splits sessions at midnight. SPEC doesn't require it. Proposed: no.
-2. **One touchpoint per session** is assumed, because any new campaign parameter already starts a new session. SPEC §9's "collapse consecutive identical touchpoints within the same session" then only matters for multi-session collapse in the attribution engine. Confirm.
-3. **Payment-gateway ignore list** (§4.3) is a starting set for Indian gateways and checkouts. Should merchants be able to edit it (it isn't in `channel_rules`), or is a platform-maintained list enough for MVP? Proposed: platform-maintained.
+1. *(resolved 2026-09-28: no midnight-IST session split.)*
+2. *(resolved 2026-09-28: one touchpoint per session; SPEC §9's collapse rule only matters across sessions, in the attribution engine.)*
+3. *(resolved 2026-09-28: the payment-gateway ignore list is platform-maintained for MVP — `IGNORABLE_REFERRER_HOSTS` in `packages/shared/src/events.ts`.)*
 4. *(resolved: `fbc` construction per Meta's documented server-side format.)*
 5. *(resolved: `@clickhouse/client` approved; SPEC v0.2 §3.)*
 6. **Consumer count.** Two consumers can process the same visitor concurrently, making sessions slightly imprecise (§4.2). If that matters in practice, shard the stream by visitor hash. That would change the canonical `stream:events-raw` name (an HLD §8 change) and is deferred.

@@ -16,3 +16,6 @@ export * from './shopify.js';
 export * from './jobs.js';
 export * from './collector.js';
 export * from './stream.js';
+export * from './events.js';
+export * from './session.js';
+export * from './uuid.js';
