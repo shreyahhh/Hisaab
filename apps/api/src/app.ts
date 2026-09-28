@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import type { Queue } from 'bullmq';
 import Fastify, { type FastifyInstance } from 'fastify';
 import fastifyCors from '@fastify/cors';
 import type { Redis } from 'ioredis';
@@ -6,6 +7,7 @@ import type { Auth } from '@truepath/auth';
 import { createAuditLogRepository, type Db } from '@truepath/db';
 import type { ShopifyAdapter } from '@truepath/integrations';
 import type { CredentialsCipher, IdentityHasher } from '@truepath/privacy';
+import type { ShopifySyncJob } from '@truepath/shared';
 import { createAuditService, type AuditService } from './audit.js';
 import { registerAuthBridge } from './authBridge.js';
 import { registerAuthErrorHandler, type ErrorReporter } from './errors.js';
@@ -41,6 +43,8 @@ export interface ShopifyDeps {
   /** Our own base URL — builds the one fixed OAuth redirect_uri (ADR-0024). */
   readonly appUrl: string;
   readonly dashboardUrl: string;
+  /** HLD §8 `shopify-sync` queue — the callback enqueues `mode:'backfill'` on a successful connect. */
+  readonly shopifySyncQueue: Queue<ShopifySyncJob>;
 }
 
 export interface AppDeps {
@@ -170,6 +174,7 @@ export function buildApp(deps: AppDeps): FastifyInstance {
       oauthStateSecret: deps.shopify.oauthStateSecret,
       appUrl: deps.shopify.appUrl,
       dashboardUrl: deps.shopify.dashboardUrl,
+      shopifySyncQueue: deps.shopify.shopifySyncQueue,
     });
   });
 

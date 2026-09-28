@@ -10,6 +10,7 @@ import {
   testDb,
   testHasher,
   testRedis,
+  testShopifySyncQueue,
   TEST_DASHBOARD_URL,
   TEST_SHOPIFY_OAUTH_STATE_SECRET,
   testAuth,
@@ -84,6 +85,9 @@ function fakeShopifyAdapter(options: FakeAdapterOptions = {}): ShopifyAdapter {
     async fetchOrder() {
       return null;
     },
+    async startBulkOrders() {
+      return 'gid://shopify/BulkOperation/test';
+    },
   };
 }
 
@@ -97,6 +101,7 @@ function appWith(adapterOptions: FakeAdapterOptions = {}) {
       oauthStateSecret: TEST_SHOPIFY_OAUTH_STATE_SECRET,
       appUrl: 'http://localhost:3000',
       dashboardUrl: TEST_DASHBOARD_URL,
+      shopifySyncQueue: testShopifySyncQueue,
     },
   });
 }
@@ -209,7 +214,45 @@ describe('GET /v1/integrations/shopify/callback', () => {
       expect(auditRow?.action).toBe('integration_connected');
       expect(auditRow?.actorUserId).toBe(t.userId);
 
+      // shopify-integration.md §4.1 step 8: 60 days without read_all_orders (DEFAULT_CREDENTIALS'
+      // scope doesn't include it).
+      const backfillJob = await testShopifySyncQueue.getJob(`backfill-${store!.id}`);
+      expect(backfillJob?.data).toEqual({ storeId: store!.id, mode: 'backfill', days: 60 });
+      await backfillJob?.remove();
+
       await testDb.delete(schema.integrations).where(eq(schema.integrations.id, integration!.id));
+      await testDb.delete(schema.stores).where(eq(schema.stores.id, store!.id));
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('enqueues a 90-day backfill when read_all_orders is a granted scope', async () => {
+    const app = appWith({
+      credentials: {
+        ...DEFAULT_CREDENTIALS,
+        scope: 'read_orders,write_pixels,read_customer_events,read_all_orders',
+      },
+    });
+    try {
+      const t = await tenant('callback-90d');
+      const shop = shopFor('callback-90d');
+      const state = await issueState(t, shop);
+      await app.inject({
+        method: 'GET',
+        url: `/v1/integrations/shopify/callback?shop=${shop}&code=c&state=${encodeURIComponent(state)}`,
+        headers: { cookie: t.cookie },
+      });
+      const [store] = await testDb
+        .select()
+        .from(schema.stores)
+        .where(eq(schema.stores.shopDomain, shop));
+
+      const backfillJob = await testShopifySyncQueue.getJob(`backfill-${store!.id}`);
+      expect(backfillJob?.data).toEqual({ storeId: store!.id, mode: 'backfill', days: 90 });
+      await backfillJob?.remove();
+
+      await testDb.delete(schema.integrations).where(eq(schema.integrations.storeId, store!.id));
       await testDb.delete(schema.stores).where(eq(schema.stores.id, store!.id));
     } finally {
       await app.close();

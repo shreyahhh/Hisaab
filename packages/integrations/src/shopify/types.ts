@@ -1,7 +1,8 @@
 // Shopify adapter types (shopify-integration.md §2.7, SPEC §8's IntegrationAdapter). M1-1 covered
-// OAuth install/uninstall; M1-2 adds order-webhook mapping (fetchOrder, ShopifyOrderSnapshot).
-// upsertWebPixel, startBulkOrders, bulkResultUrl, ordersUpdatedSince and fetchOrderContact still
-// land with M1-3/M1-4.
+// OAuth install/uninstall; M1-2 added order-webhook mapping (fetchOrder, ShopifyOrderSnapshot);
+// M1-3 adds startBulkOrders (begin the backfill bulk query only — see adapter.ts's docstring on it
+// for what's deferred). upsertWebPixel, bulkResultUrl, ordersUpdatedSince and fetchOrderContact
+// still land with M1-3's follow-up / M1-4.
 
 /** Stored only in `integrations.encrypted_credentials` (ADR-0023), never in `settings`. */
 export interface ShopifyCredentials {

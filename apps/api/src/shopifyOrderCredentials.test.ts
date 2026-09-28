@@ -52,6 +52,7 @@ function fakeAdapter(options: {
     verifyWebhook: () => true,
     fetchOrder: async (_shop, creds) =>
       options.fetchOrderImpl ? options.fetchOrderImpl(creds) : null,
+    startBulkOrders: async () => 'gid://shopify/BulkOperation/test',
   };
 }
 

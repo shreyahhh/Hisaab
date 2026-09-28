@@ -432,3 +432,91 @@ describe('createShopifyAdapter: fetchOrder — 401 (expired token)', () => {
     expect(callCount).toBe(1);
   });
 });
+
+describe('createShopifyAdapter: startBulkOrders', () => {
+  const creds: ShopifyCredentials = {
+    accessToken: 'shpat_abc123',
+    accessTokenExpiresAt: new Date().toISOString(),
+    refreshToken: 'shprt_def456',
+    refreshTokenExpiresAt: new Date().toISOString(),
+    scope: 'read_orders',
+  };
+
+  it('submits a bulkOperationRunQuery mutation and returns the bulk operation id', async () => {
+    let receivedToken: string | null = null;
+    let receivedQuery = '';
+    server.use(
+      http.post(`https://${SHOP}/admin/api/*/graphql.json`, async ({ request }) => {
+        receivedToken = request.headers.get('X-Shopify-Access-Token');
+        const body = (await request.json()) as { query?: string };
+        receivedQuery = body.query ?? '';
+        return HttpResponse.json({
+          data: {
+            bulkOperationRunQuery: {
+              bulkOperation: { id: 'gid://shopify/BulkOperation/1', status: 'CREATED' },
+              userErrors: [],
+            },
+          },
+        });
+      }),
+    );
+    const adapter = createShopifyAdapter(CONFIG);
+    const bulkOperationId = await adapter.startBulkOrders(SHOP, creds, '2026-06-01T00:00:00Z');
+
+    expect(receivedToken).toBe('shpat_abc123');
+    expect(receivedQuery).toContain('bulkOperationRunQuery');
+    expect(receivedQuery).toContain('created_at:>=2026-06-01');
+    expect(bulkOperationId).toBe('gid://shopify/BulkOperation/1');
+  });
+
+  it('throws when Shopify returns userErrors instead of a bulk operation', async () => {
+    server.use(
+      http.post(`https://${SHOP}/admin/api/*/graphql.json`, () =>
+        HttpResponse.json({
+          data: {
+            bulkOperationRunQuery: {
+              bulkOperation: null,
+              userErrors: [
+                {
+                  field: ['query'],
+                  message: 'a bulk query operation for this app and shop is already in progress',
+                },
+              ],
+            },
+          },
+        }),
+      ),
+    );
+    const adapter = createShopifyAdapter(CONFIG);
+    await expect(adapter.startBulkOrders(SHOP, creds, '2026-06-01T00:00:00Z')).rejects.toThrow(
+      /already in progress/,
+    );
+  });
+
+  it('throws ShopifyUnauthorizedError on a 401', async () => {
+    server.use(
+      http.post(`https://${SHOP}/admin/api/*/graphql.json`, () =>
+        HttpResponse.json(
+          { errors: [{ message: 'Invalid API key or access token' }] },
+          { status: 401 },
+        ),
+      ),
+    );
+    const adapter = createShopifyAdapter(CONFIG);
+    await expect(
+      adapter.startBulkOrders(SHOP, creds, '2026-06-01T00:00:00Z'),
+    ).rejects.toBeInstanceOf(ShopifyUnauthorizedError);
+  });
+
+  it('throws on a non-ok, non-401 status', async () => {
+    server.use(
+      http.post(`https://${SHOP}/admin/api/*/graphql.json`, () =>
+        HttpResponse.json({}, { status: 500 }),
+      ),
+    );
+    const adapter = createShopifyAdapter(CONFIG);
+    await expect(adapter.startBulkOrders(SHOP, creds, '2026-06-01T00:00:00Z')).rejects.toThrow(
+      '500',
+    );
+  });
+});
