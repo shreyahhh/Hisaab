@@ -1,8 +1,18 @@
+import { fileURLToPath, URL } from 'node:url';
 import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
+import tailwindcss from '@tailwindcss/vite';
 
-// React + Vite dashboard (ADR-0010). TanStack Router/Query/Table, Recharts and Tailwind are
-// added when the onboarding wizard and report screens are built (M3-4), not in this M0-1 scaffold.
+// React + Vite dashboard (ADR-0010). shadcn/ui components (@/components/ui/*) resolve through the
+// `@/*` alias, matching tsconfig.json's paths.
 export default defineConfig({
-  plugins: [react()],
+  plugins: [react(), tailwindcss()],
+  resolve: {
+    alias: {
+      '@': fileURLToPath(new URL('./src', import.meta.url)),
+    },
+  },
+  server: {
+    port: 5173,
+  },
 });
