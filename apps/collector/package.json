@@ -11,6 +11,10 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "@truepath/shared": "workspace:*"
+    "@truepath/privacy": "workspace:^",
+    "@truepath/shared": "workspace:*",
+    "fastify": "^5.1.0",
+    "ioredis": "^5.4.1",
+    "ua-parser-js": "^1"
   }
 }

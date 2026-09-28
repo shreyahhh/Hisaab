@@ -220,6 +220,17 @@ flowchart TD
   M --> N
 ```
 
+### 4.1 M1-5 implementation notes (deliberate refinements of the text above)
+
+- **Stream fields.** Both entry kinds are stored as two fields, `store_id` and `payload` (JSON), so a consumer parses every entry the same way. §2.4 left `suppression_hit`'s fields loose; this settles them (`packages/shared/src/stream.ts`).
+- **Per-IP limit runs first** (before the store lookup), not at step 5: it needs nothing from the request, so it is the cheapest way to shed a flood. The per-store limit is charged **in events** after validation, because the count isn't known earlier.
+- **An identity hit drops the whole batch, earlier events included.** Step 10's "the whole remaining batch" is read strictly: nothing from a device newly identified as erased is stored, so the follow-up purge has less to do.
+- **An `inactive` store** still goes through the script (with no events), so its drop counters are written and the fail-closed rule applies — a store going inactive can't mask an unready suppression set.
+- **The client IP** is Fastify's `request.ip` with `trustProxy` written as "trust hop 0 only" (the ALB): the right-most `X-Forwarded-For` entry. Fastify's types don't accept the hop-count number proxy-addr does.
+- **Geo is not built.** DB-IP Lite is approved (SPEC §3) but reading its `.mmdb` needs a reader library that isn't on the approved list; `geo_state`/`geo_city` are `''` (the value a lookup miss gives) behind the `GeoLookup` interface in `apps/collector/src/geo.ts`.
+- **`ua-parser-js` 1.x** ships no types and `@types/ua-parser-js` isn't approved, so `apps/collector/src/types/ua-parser-js.d.ts` declares the part used.
+- **Test seam.** `CollectDeps.redisKeys` overrides the two global Redis names (`suppress:ready`, `stream:events-raw`); production never sets it. Tests use it so they can't write to, or delete the readiness marker of, a developer's live local pipeline.
+
 ## 5. Failure modes
 
 | Failure | Behaviour | Retry / idempotency |
