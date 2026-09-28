@@ -1,20 +1,30 @@
 import type { FastifyInstance } from 'fastify';
+import type { ZodError } from 'zod';
 import {
   createDsrRequestRepository,
   createIntegrationRepository,
+  createOrderRepository,
   createStoreRepository,
   createWebhookDeliveryRepository,
   jobScope,
   resolveStoreByShopDomain,
 } from '@truepath/db';
-import type { ShopifyAdapter } from '@truepath/integrations';
-import { storeContext, type IdentityHasher } from '@truepath/privacy';
+import {
+  mapOrderSnapshot,
+  snapshotFromOrderWebhook,
+  ShopifyOrderHintWebhook,
+  ShopifyOrderWebhook,
+  type ShopifyAdapter,
+  type ShopifyOrderSnapshot,
+} from '@truepath/integrations';
+import { storeContext, type CredentialsCipher, type IdentityHasher } from '@truepath/privacy';
 import type { TenantScope } from '@truepath/shared';
+import { fetchOrderWithTokenRefresh } from '../shopifyOrderCredentials.js';
 import type { TenantScopeDeps } from '../tenantScope.js';
 
-// POST /webhooks/shopify/:topic (shopify-integration.md §2.2, §2.4, §4.2, §4.8). Only `app/uninstalled`
-// and the three compliance topics do real work in this ticket (M1-1); orders/refunds/fulfillments/
-// bulk_operations are acknowledged (200) and left for M1-2/M1-3 — see the tracked follow-up issue.
+// POST /webhooks/shopify/:topic (shopify-integration.md §2.2, §2.4, §4.2-§4.8). M1-1 built
+// app/uninstalled and the three compliance topics; M1-2 adds orders/refunds/fulfillments.
+// bulk_operations/finish is still acknowledged-only (M1-3, backfill).
 //
 // HLD §8 exception: this file is the one sanctioned caller of `resolveStoreByShopDomain`
 // (eslint.config.js) — a webhook authenticates by HMAC + shop domain, never a session, so there is
@@ -52,6 +62,16 @@ const DSR_SLA_MS = 7 * 24 * 60 * 60 * 1000;
 export interface ShopifyWebhookDeps {
   readonly adapter: ShopifyAdapter;
   readonly hasher: IdentityHasher;
+  readonly cipher: CredentialsCipher;
+}
+
+/** Logs a structured, redacted line — field paths only, never the received value (M1-2 review item 6). */
+function reportValidationFailure(event: string, topic: string, fields: readonly string[]): void {
+  console.error(JSON.stringify({ event, alert: event, topic, fields }));
+}
+
+function zodIssuePaths(error: ZodError): string[] {
+  return [...new Set(error.issues.map((issue) => issue.path.join('.') || '(root)'))];
 }
 
 async function handleAppUninstalled(
@@ -125,6 +145,171 @@ async function handleComplianceWebhook(
     targetId: row.id,
     metadata: { type, trigger: 'shopify_webhook' },
   });
+}
+
+/**
+ * Applies a fully-resolved order snapshot (shopify-integration.md §4.4/§4.5), regardless of whether
+ * it came straight from a REST `orders/*` webhook or from a GraphQL `fetchOrder` call. Currency is
+ * checked *before* any money parsing (M1-2 review item 5): this codebase has no per-row FX handling
+ * anywhere downstream, so a non-INR order is skipped rather than stored with a paise value that
+ * would be silently wrong wherever it's later summed alongside real INR orders. This is a
+ * deliberate MVP limitation (parallel to SPEC §2's non-INR ad-account rejection), not a bug.
+ */
+async function applyOrderSnapshot(
+  deps: TenantScopeDeps,
+  scope: TenantScope,
+  storeId: string,
+  hasher: IdentityHasher,
+  snapshot: ShopifyOrderSnapshot,
+  eventStatus: 'created' | 'updated' | 'cancelled' | 'refund' | 'fulfillment',
+  rawRef: string,
+): Promise<void> {
+  if (snapshot.currency !== 'INR') {
+    console.error(
+      JSON.stringify({
+        event: 'shopify_order_non_inr_skipped',
+        store_id: storeId,
+        currency: snapshot.currency,
+      }),
+    );
+    return;
+  }
+
+  const fields = mapOrderSnapshot(snapshot, storeId, hasher);
+  if (fields.moneySanityExceeded) {
+    // Flagged, not rejected (shopify-integration.md §7) — logged so it surfaces in ops, still stored.
+    console.error(
+      JSON.stringify({ event: 'shopify_order_money_sanity_exceeded', store_id: storeId }),
+    );
+  }
+
+  await createOrderRepository(deps.db).applySnapshot(scope, {
+    storeId,
+    externalOrderId: snapshot.externalOrderId,
+    createdAtPlatform: fields.createdAtPlatform,
+    totalAmountPaise: fields.totalAmountPaise,
+    currency: fields.currency,
+    paymentMethod: fields.paymentMethod,
+    refundedAmountPaise: fields.refundedAmountPaise,
+    financialStatus: fields.financialStatus,
+    fulfilmentStatus: fields.fulfilmentStatus,
+    cancelledAt: fields.cancelledAt,
+    pincodePrefix: fields.pincodePrefix,
+    phoneHashHmac: fields.phoneHashHmac,
+    emailHashHmac: fields.emailHashHmac,
+    landingSite: fields.landingSite,
+    referringSite: fields.referringSite,
+    noteAttributes: fields.noteAttributes,
+    discountCodes: fields.discountCodes,
+    sourceTimestamp: new Date(snapshot.updatedAtPlatform),
+    eventStatus,
+    rawRef,
+  });
+}
+
+const ORDER_EVENT_STATUS_BY_TOPIC: Readonly<
+  Record<(typeof ORDERS_TOPICS)[number], 'created' | 'updated' | 'cancelled'>
+> = {
+  'orders/create': 'created',
+  'orders/updated': 'updated',
+  'orders/cancelled': 'cancelled',
+};
+
+/** `orders/create` | `orders/updated` | `orders/cancelled` — a full snapshot, straight from the payload. */
+async function handleOrderWebhook(
+  deps: TenantScopeDeps,
+  scope: TenantScope,
+  storeId: string,
+  hasher: IdentityHasher,
+  shopifyTopic: (typeof ORDERS_TOPICS)[number],
+  rawBody: Buffer,
+  webhookId: string,
+): Promise<void> {
+  let json: unknown;
+  try {
+    json = JSON.parse(rawBody.toString('utf8'));
+  } catch {
+    reportValidationFailure('shopify_order_webhook_malformed_json', shopifyTopic, []);
+    return;
+  }
+  const parsed = ShopifyOrderWebhook.safeParse(json);
+  if (!parsed.success) {
+    reportValidationFailure(
+      'shopify_order_webhook_validation_failed',
+      shopifyTopic,
+      zodIssuePaths(parsed.error),
+    );
+    return; // ack — retrying a payload that will never parse doesn't help
+  }
+  const snapshot = snapshotFromOrderWebhook(parsed.data);
+  await applyOrderSnapshot(
+    deps,
+    scope,
+    storeId,
+    hasher,
+    snapshot,
+    ORDER_EVENT_STATUS_BY_TOPIC[shopifyTopic],
+    webhookId,
+  );
+}
+
+/**
+ * `refunds/create` | `fulfillments/create` | `fulfillments/update` — a partial hint. Always
+ * refetches the full order via GraphQL (M1-2 review item 1: this network call happens here, before
+ * `applyOrderSnapshot` ever opens a transaction) — this also transparently handles the order not
+ * existing locally yet (an out-of-order delivery), since `fetchOrder` returns the full snapshot
+ * regardless of whether we've seen this order before.
+ */
+async function handleOrderHintWebhook(
+  deps: TenantScopeDeps,
+  scope: TenantScope,
+  storeId: string,
+  shop: string,
+  hasher: IdentityHasher,
+  credentialsDeps: { readonly adapter: ShopifyAdapter; readonly cipher: CredentialsCipher },
+  shopifyTopic: (typeof ORDER_HINTS_TOPICS)[number],
+  rawBody: Buffer,
+  webhookId: string,
+): Promise<void> {
+  let json: unknown;
+  try {
+    json = JSON.parse(rawBody.toString('utf8'));
+  } catch {
+    reportValidationFailure('shopify_order_hint_webhook_malformed_json', shopifyTopic, []);
+    return;
+  }
+  const parsed = ShopifyOrderHintWebhook.safeParse(json);
+  if (!parsed.success) {
+    reportValidationFailure(
+      'shopify_order_hint_webhook_validation_failed',
+      shopifyTopic,
+      zodIssuePaths(parsed.error),
+    );
+    return;
+  }
+
+  const snapshot = await fetchOrderWithTokenRefresh(
+    { db: deps.db, adapter: credentialsDeps.adapter, cipher: credentialsDeps.cipher },
+    scope,
+    storeId,
+    shop,
+    String(parsed.data.order_id),
+  );
+  if (!snapshot) {
+    // Shopify has no such order — shouldn't happen for a refund/fulfillment hint in practice; ack
+    // and skip rather than retry forever (there is nothing to create the row from).
+    console.error(
+      JSON.stringify({
+        event: 'shopify_order_hint_order_not_found',
+        store_id: storeId,
+        topic: shopifyTopic,
+      }),
+    );
+    return;
+  }
+
+  const eventStatus = shopifyTopic === 'refunds/create' ? 'refund' : 'fulfillment';
+  await applyOrderSnapshot(deps, scope, storeId, hasher, snapshot, eventStatus, webhookId);
 }
 
 export function registerShopifyWebhookRoutes(
@@ -211,8 +396,38 @@ export function registerShopifyWebhookRoutes(
             webhookId,
             rawBody,
           );
+        } else if (
+          shopifyTopic === 'orders/create' ||
+          shopifyTopic === 'orders/updated' ||
+          shopifyTopic === 'orders/cancelled'
+        ) {
+          await handleOrderWebhook(
+            deps,
+            scope,
+            resolved.id,
+            webhook.hasher,
+            shopifyTopic,
+            rawBody,
+            webhookId,
+          );
+        } else if (
+          shopifyTopic === 'refunds/create' ||
+          shopifyTopic === 'fulfillments/create' ||
+          shopifyTopic === 'fulfillments/update'
+        ) {
+          await handleOrderHintWebhook(
+            deps,
+            scope,
+            resolved.id,
+            shopDomainHeader.toLowerCase(),
+            webhook.hasher,
+            { adapter: webhook.adapter, cipher: webhook.cipher },
+            shopifyTopic,
+            rawBody,
+            webhookId,
+          );
         }
-        // orders/*, order-hints/*, bulk_operations/finish: acknowledged only — tracked follow-up issue.
+        // bulk_operations/finish: acknowledged only — tracked follow-up issue (backfill, M1-3).
 
         // Only reached once the handler above (if any) has completed without throwing — an error
         // propagates past this point instead, so the delivery is never marked done and Shopify's

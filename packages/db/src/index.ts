@@ -33,6 +33,13 @@ export {
   type DsrRequestRow,
 } from './repositories/dsrRequestRepository.js';
 export {
+  createOrderRepository,
+  type ApplyOrderSnapshotInput,
+  type ApplyOrderSnapshotResult,
+  type OrderRepository,
+  type OrderRow,
+} from './repositories/orderRepository.js';
+export {
   createWebhookDeliveryRepository,
   type RecordWebhookDeliveryInput,
   type WebhookDeliveryKey,

@@ -206,8 +206,13 @@ export const AUDIT_ACTION_OWNERS = {
   consent_default_on_paused: pending('M1-6'),
   consent_default_on_resumed: pending('M1-6'),
   dsr_created: implemented('M1-1 / M1-2 / M4-2', 'apps/api/src/routes/shopifyWebhooks.test.ts'),
-  dsr_completed: pending('M1-2 / M4-2'),
-  dsr_failed: pending('M1-2 / M4-2'),
+  // Narrowed from 'M1-2 / M4-2' during M1-2 review: fulfilment needs identity-stitching's
+  // identity_links (M1-7), ClickHouse events/touchpoints/attribution_results/order_status (no
+  // writer exists before M1-6/M3), an S3 export bucket, and the `dsr` BullMQ worker — none of which
+  // M1-2 builds. M1-2 only implements the compliance-webhook *receipt* (already done in M1-1); see
+  // issue #25 for the actual fulfilment pipeline.
+  dsr_completed: pending('M4-2'),
+  dsr_failed: pending('M4-2'),
   dsr_followup_erasure: pending('M4-2'),
   dsr_export_downloaded: pending('M4-2'),
   report_exported: pending('M3-3'),

@@ -5,6 +5,7 @@ import { createAuditLogRepository } from './auditLogRepository.js';
 import { createDpaAcceptanceRepository } from './dpaAcceptanceRepository.js';
 import { createDsrRequestRepository } from './dsrRequestRepository.js';
 import { createIntegrationRepository } from './integrationRepository.js';
+import { createOrderRepository } from './orderRepository.js';
 import { createStoreRepository } from './storeRepository.js';
 import { createWebhookDeliveryRepository } from './webhookDeliveryRepository.js';
 
@@ -126,6 +127,12 @@ export const repositoryRegistry: readonly RepositoryDescriptor[] = [
         invoke: (db, scope, storeId) =>
           createIntegrationRepository(db).markUninstalled(scope, storeId),
       },
+      {
+        name: 'getActiveByStore',
+        scopeKind: 'store',
+        invoke: (db, scope, storeId) =>
+          createIntegrationRepository(db).getActiveByStore(scope, storeId, 'shopify'),
+      },
     ],
   },
   {
@@ -141,6 +148,38 @@ export const repositoryRegistry: readonly RepositoryDescriptor[] = [
             identityHash: null,
             dueAt: new Date(),
             sourceRef: `cross-tenant-test-${storeId}`,
+          }),
+      },
+    ],
+  },
+  {
+    name: 'OrderRepository',
+    methods: [
+      {
+        name: 'applySnapshot',
+        scopeKind: 'store',
+        invoke: (db, scope, storeId) =>
+          createOrderRepository(db).applySnapshot(scope, {
+            storeId,
+            externalOrderId: `cross-tenant-test-${storeId}`,
+            createdAtPlatform: new Date(),
+            totalAmountPaise: 100,
+            currency: 'INR',
+            paymentMethod: 'prepaid',
+            refundedAmountPaise: null,
+            financialStatus: null,
+            fulfilmentStatus: 'unfulfilled',
+            cancelledAt: null,
+            pincodePrefix: null,
+            phoneHashHmac: null,
+            emailHashHmac: null,
+            landingSite: null,
+            referringSite: null,
+            noteAttributes: [],
+            discountCodes: [],
+            sourceTimestamp: new Date(),
+            eventStatus: 'created',
+            rawRef: `cross-tenant-test-${storeId}`,
           }),
       },
     ],
