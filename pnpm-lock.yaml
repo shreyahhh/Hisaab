@@ -139,6 +139,9 @@ importers:
 
   apps/workers:
     dependencies:
+      '@truepath/clickhouse':
+        specifier: workspace:*
+        version: link:../../packages/clickhouse
       '@truepath/db':
         specifier: workspace:^
         version: link:../../packages/db

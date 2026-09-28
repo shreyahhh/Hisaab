@@ -107,24 +107,27 @@ No additions beyond HLD §8.
 2. Flush when the batch reaches **1,000 entries** or **1.5 s** has passed since its first entry, whichever comes first.
 3. Wait until `suppress:ready` is present; otherwise pause the loop (HLD §8 fail-closed) without reading more.
 4. Group entries by `store_id` and load each store's cached `channel_rules` and shop hosts.
-5. **Suppression re-check** (one pipelined round trip): `ZSCORE` on the erased and withdrawn visitor sets for `HMAC(visitor_id)`, and on the erased identity set for `identity_hash_hmac`. Mark suppressed entries as drop-and-ack. `consent_*` entries skip the withdrawn check.
+5. **Suppression re-check** (one pipelined round trip): `ZSCORE` on the erased and withdrawn visitor sets for `HMAC(visitor_id)` (every read key version), and on the erased identity set for the entry's phone, email and identity hashes. Mark suppressed entries as drop-and-ack. `consent_*` entries skip the withdrawn check.
+   - **Erased identity found here** (an erasure that landed after the Collector's check): the visitor is treated as a `suppression_hit` — erased suppression entry, follow-up purge — and none of its events in the batch are stored (M1-6b).
+   - **Withdrawal in the same batch**: a visitor's non-consent events later than its `consent_withdrawn` in the same batch are dropped too (they would be erased minutes later anyway).
 6. **Dedupe** (one `MGET` of `dedupe:<store_id>:<event_id>`): mark entries whose key is `'done'` as ack-only.
-7. **Enrich**: parse `Landing` from `page_url` and `referrer`. If `fbclid` is present and `fbc` is empty, set `fbc = "fb.1." + <occurred_at ms> + "." + fbclid`. This follows Meta's server-side rule: `subdomainIndex = 1`, and `creationTime` in ms is when the `fbclid` was first seen, i.e. the landing event's `occurred_at` ([fbp and fbc](https://developers.facebook.com/docs/marketing-api/conversions-api/parameters/fbp-and-fbc)).
+7. **Enrich**: parse `Landing` from `page_url` and `referrer`. If `fbclid` is present and `fbc` is empty, set `fbc = "fb.1." + <occurred_at ms> + "." + fbclid`. This follows Meta's server-side rule: `subdomainIndex = 1`, and `creationTime` in ms is when the `fbclid` was first seen, i.e. the landing event's `occurred_at` ([fbp and fbc](https://developers.facebook.com/docs/marketing-api/conversions-api/parameters/fbp-and-fbc)). **Only when the event carries `ad_platform_measurement`** (M1-6b): the Collector strips the pixel's own `fbc` without that purpose, and deriving one here must not sidestep it. Consent events carry no landing semantics: their UTM and click-id columns are stored empty.
 8. **Sessionise** (§4.2): one Lua call per visitor in the batch, with that visitor's entries sorted by `occurred_at`. It returns a `session_id` per event and the events that start a session.
 9. **Build touchpoints**: for each session-start event, call `classify(landing, rules, ctx)` (§4.3) and emit a `touchpoints` row with `event_id = <that event>`.
-10. **ClickHouse writes**: one `INSERT` per table (`events`, `touchpoints`, `identity_links`) for the whole batch, using `@clickhouse/client` with `wait_end_of_query=1`. Not `async_insert`: we need to know the insert committed before `XACK`.
+10. **ClickHouse writes**: one `INSERT` per table (`events`, `touchpoints`, `identity_links`) **per store** in the batch, through the scoped query builder (`ch(client, scope, storeId).insert`, ADR-0016), which sets `wait_end_of_query=1` and `async_insert=0` on every insert. Not `async_insert`: we need to know the insert committed before `XACK`. (Per store rather than per batch, because the builder is scoped to one store; with MVP's store count that is the same handful of inserts.)
 11. **Postgres writes**, in one transaction per store:
     - `consent_records` inserts;
     - `suppressed_identities` inserts;
     - removal of `withdrawn` entries on `consent_granted`;
     - `UPDATE orders SET visitor_id=$v WHERE store_id=$s AND external_order_id=$o AND visitor_id IS NULL` for each `checkout_completed`.
-12. **Redis writes** (pipelined):
+12. **Redis writes** (pipelined, **after step 13**):
     - `ZADD` / `ZREM` mirroring step 11's suppression changes;
     - `SET checkout:<s>:<order_id> <visitor_id> EX 86400`;
     - `SET dedupe:<s>:<event_id> done EX 86400` for every written entry.
-13. **Jobs**:
-    - For each `suppression_hit`, look up `suppressed_identities.dsr_request_id` for the identity and enqueue `DsrJob{…, visitorIds:[visitor_id]}` with `jobId = dsr-followup:<requestId>:<HMAC(visitor_id)>`.
-    - For each `consent_withdrawn`, enqueue `DsrJob{storeId, type:'erasure', requestId}` (60 s delay, `jobId = dsr:<requestId>`).
+13. **Jobs** (run *before* step 12, M1-6b): with the dedupe keys written first, a retry after a failed enqueue would find a withdrawal's consent event already `done`, skip it, and its erasure job would never be enqueued. A retry re-enqueues, and the job ids de-duplicate.
+    - For each `suppression_hit`, look up `suppressed_identities.dsr_request_id` for the identity and enqueue `DsrJob{…, visitorIds:[visitor_id]}` with `jobId = dsr-followup-<requestId>-<suppression row id>`. A hit whose identity has no matching erased entry (possible only across a key rotation, when the hit's hash is under a different key version) is still suppressed but enqueues no purge, and is counted as `suppressionHitsUnmatched`.
+    - For each `consent_withdrawn`, enqueue `DsrJob{storeId, type:'erasure', requestId}` (60 s delay, `jobId = dsr-<requestId>`).
+    - Job ids use `-`, not `:` (M1-6b): BullMQ rejects a custom id containing `:` unless it has exactly three parts, and an id built from the visitor's HMAC would put an identifier into ids that are logged.
 14. `XACK stream:events-raw event-workers <all ids in batch>`, including dropped, ack-only and suppression-hit entries.
 15. Emit metrics: batch size, flush reason, per-step duration, drops by reason (no identifiers as labels).
 
@@ -207,7 +210,8 @@ Consent events never start a session (they carry no landing semantics).
 - Performance Max traffic (a `gclid` with `utm_content` empty) maps at campaign level only, matching `ad_spend_daily`'s synthetic `ad_id='pmax:<campaign_id>'` (HLD §8). The reporting join handles that mapping; this module leaves `ad_id` empty.
 
 ### 4.4 Consent, withdrawal and `suppression_hit` handling
-- `consent_granted` → a `consent_records` row with `state='granted'` and `purposes = consent_purposes`. If a `withdrawn` suppression entry exists for the visitor → `removeWithdrawn`.
+- `consent_granted` → a `consent_records` row with `state='granted'` and `purposes = consent_purposes`. If a `withdrawn` suppression entry exists for the visitor → `removeWithdrawn`, **only when the grant includes `attribution_analytics`** (a marketing-only grant doesn't bring a withdrawn visitor back).
+- The consent event's `notice_version` comes from the stream entry: the Collector sets it on consent events (M1-6b; optional in `StreamEventEntry`, so older entries still validate — a missing one is recorded as `'unknown'`).
 - `consent_withdrawn` → a `consent_records` row with `state='withdrawn'`, a `withdrawn` suppression entry (`expires_at = now + 13 months`), and — in the same Postgres transaction — a `dsr_requests` erasure row with `trigger='consent_withdrawn'`, plus a `DsrJob` enqueued in step 13 ([privacy-dpdp.md §4.5](privacy-dpdp.md#45-withdrawal-triggered-erasure-dpdp-s87)).
 - A partial change (marketing withdrawn, analytics kept) arrives as `consent_granted` with `purposes = ['attribution_analytics']`. Because CAPI reads the *latest* record, this stops CAPI for the visitor.
 - `suppression_hit` → an `erased` visitor suppression row in Postgres (the Collector already `ZADD`ed the hot copy), then the follow-up `DsrJob`. It is never written to `events`.
@@ -234,7 +238,7 @@ Consent events never start a session (they carry no landing semantics).
 | Postgres transaction fails after the ClickHouse insert | No `XACK`; retry the batch. The ClickHouse re-insert collapses (ADR-0017 backstop); Postgres inserts are `ON CONFLICT DO NOTHING`; the `orders` update is guarded by `visitor_id IS NULL` | Safe to repeat |
 | Crash after inserts, before `SET dedupe` | Redelivered after 60 s via `XAUTOCLAIM`, then re-inserted and collapsed at merge | ADR-0017 |
 | Crash before inserts | Redelivered; nothing to undo | — |
-| Redelivered event gets a different `session_id` than the first time (session state moved on) | The last insert wins after the merge, so its session could be assigned differently | Known edge case, rare (crash-dependent); limited to one event |
+| Redelivered event gets a different `session_id` than the first time (session state moved on) | The last insert wins after the merge, so its session could be assigned differently | In-process retries re-use the batch's session assignments (M1-6b), so only a redelivery after a process crash can differ: rare, limited to the events of one batch |
 | Poison entry (schema mismatch, deterministic exception) | Moved to `stream:events-dead` after 5 deliveries; alert | Replay via an ops script after fixing |
 | `suppress:ready` absent | Loop paused (no reads) | Resumes after the rebuild (HLD §8) |
 | Invalid `channel_rules` row | Rule skipped, defaults apply, health-screen notice | Fix via the API |

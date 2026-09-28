@@ -66,6 +66,9 @@ describe('accepted batches (collector.md §4 steps 8-10)', () => {
     expect(page.referrer).toBe('https://l.instagram.com/some/path');
     const consent = entries.find((e) => e.event_name === 'consent_granted')!;
     expect(consent.consent_trigger).toBe('initial_state');
+    // consent_records needs the notice version (P-4), so consent events — and only they — carry it.
+    expect(consent.notice_version).toBe('v1');
+    expect(page.notice_version).toBeUndefined();
   });
 
   it('hashes phone and email: no raw identifier reaches the stream, only versioned HMACs', async () => {

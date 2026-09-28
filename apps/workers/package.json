@@ -12,6 +12,7 @@
     "test": "vitest run"
   },
   "dependencies": {
+    "@truepath/clickhouse": "workspace:*",
     "@truepath/db": "workspace:^",
     "@truepath/integrations": "workspace:^",
     "@truepath/privacy": "workspace:^",

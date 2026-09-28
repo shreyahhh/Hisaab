@@ -199,7 +199,7 @@ Handlers respond `200` after the row is created and the job enqueued, and `401` 
 
 ### 2.4 Queue job payloads (HLD §8)
 
-- `DsrJob{storeId, type:'access'|'erasure'|'correction'|'store_erasure', requestId, visitorIds?}` on queue `dsr`. BullMQ `jobId = dsr:<requestId>`, or `dsr-followup:<requestId>:<visitorHmac>` for follow-ups, so duplicates are dropped.
+- `DsrJob{storeId, type:'access'|'erasure'|'correction'|'store_erasure', requestId, visitorIds?}` on queue `dsr`. BullMQ `jobId = dsr-<requestId>`, or `dsr-followup-<requestId>-<suppression row id>` for follow-ups, so duplicates are dropped. (`-` not `:`: BullMQ rejects a custom job id containing `:` unless it has exactly three parts, and an id built from the visitor's HMAC would put an identifier into logged ids — changed in M1-6b.)
 - `RetentionJob{storeId}` on queue `retention`. The nightly scheduler fans out one job per active store under `SystemScope`; `jobId = retention:<storeId>:<yyyymmdd>`.
 
 ## 3. Data owned
@@ -333,7 +333,7 @@ Decision (batch-1 review): withdrawing **analytics** consent erases that visitor
 
 1. `event-workers`, on `consent_withdrawn`, in the same transaction as the `consent_records` insert:
    - inserts `dsr_requests(type='erasure', identity_hash = hmac(store, visitor_id), requested_by_user_id = null, due_at = now + 24 h, result_summary = {trigger:'consent_withdrawn'})`;
-   - enqueues `DsrJob{storeId, type:'erasure', requestId}` with `delay: 60 000 ms` (a coalescing window) and `jobId = dsr:<requestId>`.
+   - enqueues `DsrJob{storeId, type:'erasure', requestId}` with `delay: 60 000 ms` (a coalescing window) and `jobId = dsr-<requestId>`. The request row is created with `result_summary.source_ref = 'withdrawal:<event_id>'`, so a redelivered batch finds the same request rather than a second one, and the `dsr_created` audit row is written in the same transaction, only when the request is new.
 2. When the worker picks up a withdrawal-triggered request, it also claims up to 500 other pending withdrawal-triggered requests for the same store (`SELECT … FOR UPDATE SKIP LOCKED`) and processes them as one set V of visitors. It issues one delete statement per table instead of one per visitor, so a burst of withdrawals doesn't create a burst of ClickHouse deletes. The claimed requests' own queued jobs then find `status='completed'` and do nothing.
 3. Scope — **one visitor, not a person**. The one-hop identity expansion of §4.3 is not done:
    - ClickHouse: delete `events`, `touchpoints` and `identity_links` where `visitor_id IN V`; delete `attribution_results` for orders with `orders.visitor_id IN V`.
@@ -456,7 +456,7 @@ Where tracking is enabled by default, Shopify runs pixel callbacks until the sho
 | Failure | Detection | Handling | Idempotency |
 |---|---|---|---|
 | Master identity secret missing at boot | startup check | process exits; ECS keeps the old tasks | — |
-| DSR job crashes mid-way | BullMQ stall / attempt count | retry with backoff (2 s base, 5 attempts). Every step is a delete-where or an insert-if-absent, so re-running is safe. After 5 attempts: `status='failed'`, `dsr_failed` audit entry, job in `dsr-failed`, alert | `jobId = dsr:<requestId>` |
+| DSR job crashes mid-way | BullMQ stall / attempt count | retry with backoff (2 s base, 5 attempts). Every step is a delete-where or an insert-if-absent, so re-running is safe. After 5 attempts: `status='failed'`, `dsr_failed` audit entry, job in `dsr-failed`, alert | `jobId = dsr-<requestId>` |
 | ClickHouse mutation never completes | `system.mutations` poll exceeds 30 min | job fails → retry; alert if `due_at − now < 24 h` | the delete is re-issued, which is harmless |
 | Verify step finds rows > 0 | count check | retry the delete once more, then fail with the target named in `result_summary` | — |
 | S3 delete fails | SDK error | retry within the job; lifecycle expiry (30 days) is the backstop | — |
