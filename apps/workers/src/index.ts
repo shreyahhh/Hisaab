@@ -11,6 +11,7 @@ import {
   ATTRIBUTION_RUN_QUEUE,
   clickhouseEnvSchema,
   credentialsKeyEnvSchema,
+  dpaEnvSchema,
   DSR_QUEUE,
   IDENTITY_STITCH_QUEUE,
   identityKeyEnvSchema,
@@ -44,7 +45,10 @@ export const workersEnvSchema = postgresEnvSchema
   .and(redisDurableEnvSchema)
   .and(credentialsKeyEnvSchema)
   .and(identityKeyEnvSchema)
-  .and(shopifyEnvSchema);
+  .and(shopifyEnvSchema)
+  // The DPA version a store's organization must have accepted for its collector config to be `active`
+  // (republished by the suppression rebuild, #56) — the same variable the API requires.
+  .and(dpaEnvSchema);
 
 function main(): void {
   loadDotEnvIfPresent('../../.env');
@@ -154,6 +158,7 @@ function main(): void {
     db,
     redis,
     log,
+    configs: { cipher, dpaVersion: env.DPA_VERSION },
     onUnavailable: async () => {
       await Promise.all([worker.pause(true), stitchWorker.pause(true)]);
     },

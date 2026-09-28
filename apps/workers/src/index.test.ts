@@ -23,6 +23,7 @@ function env(overrides: Record<string, string | undefined> = {}): NodeJS.Process
     SHOPIFY_CLIENT_SECRET: 'client-secret',
     SHOPIFY_APP_URL: 'https://api.example.com',
     SHOPIFY_OAUTH_STATE_SECRET: 'a'.repeat(32),
+    DPA_VERSION: 'v1',
     ...overrides,
   };
 }
@@ -51,6 +52,13 @@ describe('apps/workers boot environment', () => {
         const result = parseEnv(workersEnvSchema, env({ NODE_ENV, [name]: undefined }));
         expect(result.success, `${NODE_ENV} without ${name}`).toBe(false);
       }
+    }
+  });
+
+  it('refuses to start without the DPA version the collector config gates on (#56)', () => {
+    for (const NODE_ENV of ['development', 'test', 'production']) {
+      const result = parseEnv(workersEnvSchema, env({ NODE_ENV, DPA_VERSION: undefined }));
+      expect(result.success, `${NODE_ENV} without DPA_VERSION`).toBe(false);
     }
   });
 

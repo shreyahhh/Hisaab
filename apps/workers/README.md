@@ -31,8 +31,7 @@ Consumes `stream:events-raw` (`docs/architecture/lld/event-pipeline.md`).
     does not complete yet.
 - **M1-6c**: `suppressionRebuild.ts` — reloads the suppression sets from Postgres (`suppressed_identities`)
   into Redis and then writes `suppress:ready`, at Workers startup and whenever the marker goes missing
-  (checked every 10 s). While it is missing `shopify-sync` is paused. See `privacy-dpdp.md` §4.9. **Not
-  yet done:** republishing the `collector:store:*` configs after a Redis loss (a GitHub issue).
+  (checked every 10 s) and republishes every store's `collector:store:*` config (#56). While the marker is missing `shopify-sync` and `identity-stitch` are paused. See `privacy-dpdp.md` §4.9. Needs `DPA_VERSION` in the Workers environment.
 
 The event-pipeline tests need the local Postgres, ClickHouse and durable Redis
 (`docker compose up`). They isolate the global names (readiness marker, streams) per run and namespace

@@ -76,3 +76,11 @@ export async function setStoreChildDirected(
 ): Promise<void> {
   await db.update(stores).set({ childDirected }).where(eq(stores.id, storeId));
 }
+
+/** Test-only: records the merchant's India opt-in confirmation (the collector config's second gate). */
+export async function confirmIndiaOptIn(storeId: string): Promise<void> {
+  await db
+    .update(stores)
+    .set({ privacyConfig: { checklist: { india_opt_in_confirmed_at: new Date().toISOString() } } })
+    .where(eq(stores.id, storeId));
+}

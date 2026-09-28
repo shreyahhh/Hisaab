@@ -67,10 +67,19 @@ const deps = (over: Record<string, unknown> = {}) => ({
   ...over,
 });
 
+// `suppression_rebuilt` rows are platform-wide, and other test files rebuild concurrently (against their
+// own stores). This file's rebuilds always cover its two seeded stores and four active entries, so that
+// count signature picks out exactly its own rows.
 const rebuiltAuditRows = async () =>
-  (await db.select().from(schema.auditLog)).filter(
-    (r) => r.action === 'suppression_rebuilt' && r.createdAt >= startedAt,
-  );
+  (await db.select().from(schema.auditLog)).filter((r) => {
+    const m = r.metadata as { stores?: number; entries?: number };
+    return (
+      r.action === 'suppression_rebuilt' &&
+      r.createdAt >= startedAt &&
+      m.stores === 2 &&
+      m.entries === 4
+    );
+  });
 
 /** A Redis whose named methods are replaced, everything else passing through. */
 function withOverrides(

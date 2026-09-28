@@ -1,9 +1,10 @@
 import type { Redis } from 'ioredis';
 import { z } from 'zod';
 import {
-  createDpaAcceptanceRepository,
   createIntegrationRepository,
   createStoreRepository,
+  noticeVersionOf,
+  publishCollectorConfig as publishConfig,
   type Db,
 } from '@truepath/db';
 import {
@@ -15,13 +16,7 @@ import {
   type ShopifyCredentials,
 } from '@truepath/integrations';
 import type { CredentialsCipher } from '@truepath/privacy';
-import {
-  collectorStoreKey,
-  CollectorStoreConfig,
-  STORE_KEY_PATTERN,
-  type CollectorInactiveReason,
-  type Scope,
-} from '@truepath/shared';
+import { CollectorStoreConfig, STORE_KEY_PATTERN, type Scope } from '@truepath/shared';
 
 // Pixel install and the Collector's per-store config (shopify-integration.md §4.1 steps 5–7, issue
 // #28; collector.md §2.5). Three separable steps, in the order the OAuth callback runs them:
@@ -32,19 +27,6 @@ import {
 //   2. installWebPixel   — best-effort `webPixelCreate`/`Update`. Never throws: the extension may not be
 //                          deployed yet, and that must not fail a merchant's connect.
 //   3. publishCollectorConfig — writes `collector:store:<store_key>` with the store's current gates.
-
-const NOTICE_VERSION_DEFAULT = 'v1'; // until the merchant sets one (privacy settings, SPEC §10)
-
-/** The slice of `stores.privacy_config` (SPEC §6.1) this module reads. Unknown keys are tolerated. */
-const PrivacyConfigSlice = z
-  .object({
-    notice_version: z.string().min(1).max(32).optional(),
-    checklist: z
-      .object({ india_opt_in_confirmed_at: z.string().nullish() })
-      .passthrough()
-      .optional(),
-  })
-  .passthrough();
 
 const SettingsSlice = z
   .object({ store_key: z.string().regex(STORE_KEY_PATTERN).optional() })
@@ -152,62 +134,19 @@ export async function installWebPixel(
   }
 }
 
-function noticeVersionOf(privacyConfig: unknown): string {
-  const parsed = PrivacyConfigSlice.safeParse(privacyConfig);
-  return (parsed.success && parsed.data.notice_version) || NOTICE_VERSION_DEFAULT;
-}
-
 /**
- * Builds and writes `collector:store:<store_key>` from the store's current state (HLD §8):
- * `active` only with the org's DPA accepted at the current version AND the merchant's India opt-in
- * confirmation on record (privacy-dpdp §4.10 / SPEC v0.6 P-1) — until both, the Collector drops
- * everything for the store. Idempotent, so it can be re-run whenever a gate changes (issue #22).
- *
- * Returns the config it wrote, or null if the store has no keys yet (nothing to publish).
+ * Builds and writes `collector:store:<store_key>` from the store's current state (HLD §8) — see
+ * `publishCollectorConfig` in @truepath/db, which the suppression rebuild shares so "active" means
+ * the same thing in both places. This keeps the API's call sites and signature unchanged.
  */
 export async function publishCollectorConfig(
   deps: Pick<PixelDeps, 'db' | 'cipher' | 'redis' | 'dpaVersion'>,
   scope: Scope,
   storeId: string,
 ): Promise<CollectorStoreConfig | null> {
-  const store = await createStoreRepository(deps.db).getById(scope, storeId);
-  const integration = await createIntegrationRepository(deps.db).getActiveByStore(
+  return publishConfig(
+    { db: deps.db, cipher: deps.cipher, sink: deps.redis, dpaVersion: deps.dpaVersion },
     scope,
     storeId,
-    'shopify',
   );
-  if (!store || !integration?.encryptedCredentials) return null;
-
-  const settings = SettingsSlice.safeParse(integration.settings);
-  const credentials = decrypt(deps.cipher, integration.id, integration.encryptedCredentials);
-  const storeKey = settings.success ? settings.data.store_key : undefined;
-  if (!storeKey || !credentials.pixelSigningKeys?.length) return null;
-
-  const dpa = await createDpaAcceptanceRepository(deps.db).findForVersion(
-    scope,
-    store.organizationId,
-    deps.dpaVersion,
-  );
-  const privacy = PrivacyConfigSlice.safeParse(store.privacyConfig);
-  const optInConfirmed =
-    privacy.success && Boolean(privacy.data.checklist?.india_opt_in_confirmed_at);
-
-  let inactiveReason: CollectorInactiveReason | null = null;
-  if (store.status !== 'active') inactiveReason = 'uninstalled';
-  else if (!dpa) inactiveReason = 'dpa_missing';
-  else if (!optInConfirmed) inactiveReason = 'consent_region_unconfirmed';
-
-  const config = CollectorStoreConfig.parse({
-    storeId: store.id,
-    status: inactiveReason === null ? 'active' : 'inactive',
-    inactiveReason,
-    // The shop's own myshopify domain; custom domains are added by the daily Shopify reconcile
-    // (§4.7, deferred with the rest of `reconcile`, issue #41).
-    allowedOrigins: [`https://${store.shopDomain}`],
-    signingKeys: credentials.pixelSigningKeys.map(({ kid, secret }) => ({ kid, secret })),
-    childDirected: store.childDirected,
-    noticeVersion: noticeVersionOf(store.privacyConfig),
-  });
-  await deps.redis.set(collectorStoreKey(storeKey), JSON.stringify(config));
-  return config;
 }
