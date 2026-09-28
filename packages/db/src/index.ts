@@ -48,6 +48,13 @@ export {
   type WebhookDeliveryRepository,
 } from './repositories/webhookDeliveryRepository.js';
 export {
+  createSuppressionRebuildRepository,
+  SystemScopeRequiredError,
+  type ActiveSuppressionRow,
+  type ListActiveSuppressionsOptions,
+  type SuppressionRebuildRepository,
+} from './repositories/suppressionRebuildRepository.js';
+export {
   createChannelRuleRepository,
   type ChannelRuleRepository,
   type ChannelRuleRow,

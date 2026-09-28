@@ -390,11 +390,14 @@ Mechanism (**ADR-0015, Accepted**):
 4. The table-level TTL of 25 months on `events`/`touchpoints` is only a backstop (HLD §8).
 
 ### 4.9 Suppression rebuild
-Covered in HLD §8. This module implements `rebuildAll`:
-1. Stream `suppressed_identities WHERE expires_at > now()` in pages of 10,000.
-2. `ZADD` into the matching `suppress:<store_id>:…` sets (pipelined).
-3. Republish `collector:store:*` configs.
-4. Set `suppress:ready = <timestamp>` and write `suppression_rebuilt` with counts.
+Covered in HLD §8. This module implements `rebuildAll` (M1-6c: `rebuildSuppression` and `SuppressionRebuilder` in `apps/workers/src/suppressionRebuild.ts`):
+1. Create an audited `SystemScope` (reason `suppression_rebuild`, one `system_scope_used` row).
+2. Stream `suppressed_identities WHERE expires_at > now()` in pages of 10,000 (keyset by `id`, `SuppressionRebuildRepository.listActivePage` — requires the `SystemScope`; exempt from the generated cross-tenant harness because its guard is "system only", with its own test).
+3. Replace each `suppress:<store_id>:…` set in one `MULTI` (`DEL` + chunked `ZADD`, score = expiry epoch seconds). Replace-safe: re-running, or two Workers tasks running it at once, ends in the same state. A store with no active entries is not touched (its stale members can only over-suppress and expire by score). A `withdrawn` *identity* row is not a defined state and is skipped.
+4. Write `suppression_rebuilt` `{stores, entries}` (counts only), **then** set `suppress:ready = <timestamp>`. The marker is the last write, so nothing is ever ready without its sets or its audit row; a failure earlier leaves it unset and the whole rebuild is retried.
+5. **Republish `collector:store:*` configs — not done in M1-6c.** The publisher (`publishCollectorConfig`) lives in `apps/api` and needs the DPA version and the Shopify pixel signing keys; extracting it so Workers can call it is a separate change (tracked in a GitHub issue). Until then a Redis loss leaves stores' collector configs missing until they are re-saved, which fails safe (the Collector rejects those pixels) but is an availability gap.
+
+`SuppressionRebuilder` runs the check at Workers startup and every 10 s: marker present → nothing; missing → pause `shopify-sync` (HLD §8; the event consumer waits on its own), rebuild, resume. It logs `suppression_unavailable` (`alert`) once the marker has been missing for more than 60 s.
 
 ### 4.10 DPA gating and privacy settings
 - **Tracking gate** (SPEC v0.6). Core API publishes `collector:store:<store_key>` with `status='active'` only when **all** hold:

@@ -205,7 +205,11 @@ export const AUDIT_ACTION_OWNERS = {
   consent_default_on_warned: pending('M1-6'),
   consent_default_on_paused: pending('M1-6'),
   consent_default_on_resumed: pending('M1-6'),
-  dsr_created: implemented('M1-1 / M1-2 / M4-2', 'apps/api/src/routes/shopifyWebhooks.test.ts'),
+  dsr_created: implemented(
+    'M1-1 / M1-2 / M1-6b / M4-2',
+    'apps/api/src/routes/shopifyWebhooks.test.ts',
+    'packages/db/src/repositories/eventEffectsRepository.test.ts',
+  ),
   // Narrowed from 'M1-2 / M4-2' during M1-2 review: fulfilment needs identity-stitching's
   // identity_links (M1-7), ClickHouse events/touchpoints/attribution_results/order_status (no
   // writer exists before M1-6/M3), an S3 export bucket, and the `dsr` BullMQ worker — none of which
@@ -220,7 +224,7 @@ export const AUDIT_ACTION_OWNERS = {
   audit_log_viewed: implemented('M0-6', 'apps/api/src/auditTrail.test.ts'),
   retention_run: pending('M4-3'),
   system_scope_used: implemented('M0-4', 'packages/db/src/systemScope.test.ts'),
-  suppression_rebuilt: pending('M1-5'),
+  suppression_rebuilt: implemented('M1-6c', 'apps/workers/src/suppressionRebuild.test.ts'),
   breach_created: pending('M4-4'),
   breach_confirmed: pending('M4-4'),
   breach_notified: pending('M4-4'),
