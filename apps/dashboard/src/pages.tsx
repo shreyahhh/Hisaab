@@ -191,8 +191,9 @@ export function AppShell({ children }: { children: React.ReactNode }) {
           </a>
           {!organizationId && orgs.isSuccess && (
             <p className="empty small">
-              No organization yet — sign up creates one automatically once M4 onboarding ships; run
-              the app's signup flow via POST /v1/orgs.
+              No organization yet — there's no onboarding wizard UI until M3-4; run{' '}
+              <code>pnpm dev:seed</code> for a demo one, or create it directly via{' '}
+              <code>POST /v1/orgs</code>.
             </p>
           )}
           {organizationId && !store && stores.isSuccess && (
