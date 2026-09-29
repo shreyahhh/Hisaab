@@ -80,6 +80,8 @@ export interface ScopedSelectOptions {
   readonly final?: boolean;
   readonly where?: Readonly<Record<string, WhereCondition>>;
   readonly orderBy?: string;
+  /** Defaults to ascending. */
+  readonly orderDirection?: 'ASC' | 'DESC';
   readonly limit?: number;
 }
 
@@ -157,7 +159,9 @@ export function ch(client: ClickHouseClient, scope: Scope, storeId: string): Sco
       const groupBy = opts.groupBy?.length
         ? ` GROUP BY ${opts.groupBy.map(assertSafeIdentifier).join(', ')}`
         : '';
-      const orderBy = opts.orderBy ? ` ORDER BY ${assertSafeIdentifier(opts.orderBy)}` : '';
+      const orderBy = opts.orderBy
+        ? ` ORDER BY ${assertSafeIdentifier(opts.orderBy)}${opts.orderDirection === 'DESC' ? ' DESC' : ''}`
+        : '';
       const limit = opts.limit !== undefined ? ` LIMIT ${Math.trunc(opts.limit)}` : '';
       const query = `SELECT ${columns} FROM ${opts.table}${opts.final ? ' FINAL' : ''} WHERE ${whereClauses.join(' AND ')}${groupBy}${orderBy}${limit}`;
 

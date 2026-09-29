@@ -1,4 +1,4 @@
-import { and, eq, sql } from 'drizzle-orm';
+import { and, desc, eq, sql } from 'drizzle-orm';
 import { assertStoreInScope, type Scope } from '@truepath/shared';
 import type { Db } from '../client.js';
 import { dsrRequests } from '../schema/index.js';
@@ -27,6 +27,9 @@ export interface DsrRequestRepository {
     scope: Scope,
     input: CreateDsrRequestFromWebhookInput,
   ): Promise<{ readonly row: DsrRequestRow; readonly created: boolean }>;
+
+  /** The store's most recent DSR requests, newest first — SPEC §10 `GET /v1/stores/:id/privacy/requests`. */
+  listRecentByStore(scope: Scope, storeId: string, limit: number): Promise<DsrRequestRow[]>;
 }
 
 /** The only sanctioned way to write `dsr_requests` from a webhook (ADR-0016). */
@@ -65,6 +68,16 @@ export function createDsrRequestRepository(db: Db): DsrRequestRepository {
       const existing = existingRows[0];
       if (!existing) throw new Error('createFromWebhook: conflicted but no row was found');
       return { row: existing, created: false };
+    },
+
+    async listRecentByStore(scope, storeId, limit) {
+      assertStoreInScope(scope, storeId);
+      return db
+        .select()
+        .from(dsrRequests)
+        .where(eq(dsrRequests.storeId, storeId))
+        .orderBy(desc(dsrRequests.createdAt))
+        .limit(limit);
     },
   };
 }

@@ -110,6 +110,15 @@ export {
   type RecordDpaAcceptanceInput,
 } from './repositories/dpaAcceptanceRepository.js';
 export {
+  createConsentRecordRepository,
+  type ConsentRecordRepository,
+  type ConsentRecordRow,
+} from './repositories/consentRecordRepository.js';
+export {
+  createSuppressedIdentityRepository,
+  type SuppressedIdentityRepository,
+} from './repositories/suppressedIdentityRepository.js';
+export {
   repositoryRegistry,
   type RepositoryDescriptor,
   type RepositoryMethodDescriptor,

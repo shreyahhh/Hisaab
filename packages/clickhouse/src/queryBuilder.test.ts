@@ -336,6 +336,26 @@ describe('ch() — scoped ClickHouse query builder (ADR-0016)', () => {
       expect(parseClickHouseInt64(v1!.last_ms)).toBe(Date.parse('2026-09-28T05:30:00.000Z'));
     });
 
+    it('orderDirection: DESC reverses the default ascending order', async () => {
+      const scoped = ch(client, tenantScope(storeD), storeD);
+      const asc = await scoped.select<{ identity_hash_hmac: string }>({
+        table: 'identity_links',
+        columns: ['identity_hash_hmac'],
+        where: { identity_hash_hmac: inList(['k1:h1', 'k1:h2']) },
+        orderBy: 'identity_hash_hmac',
+      });
+      const desc = await scoped.select<{ identity_hash_hmac: string }>({
+        table: 'identity_links',
+        columns: ['identity_hash_hmac'],
+        where: { identity_hash_hmac: inList(['k1:h1', 'k1:h2']) },
+        orderBy: 'identity_hash_hmac',
+        orderDirection: 'DESC',
+      });
+      expect(desc.map((r) => r.identity_hash_hmac)).toEqual(
+        asc.map((r) => r.identity_hash_hmac).reverse(),
+      );
+    });
+
     it('supports count, min and max', async () => {
       const [row] = await ch(client, tenantScope(storeD), storeD).select<{ n: string }>({
         table: 'identity_links',

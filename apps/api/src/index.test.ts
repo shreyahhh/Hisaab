@@ -25,6 +25,11 @@ function env(overrides: Record<string, string | undefined> = {}): NodeJS.Process
     SHOPIFY_CLIENT_SECRET: 'client-secret',
     SHOPIFY_APP_URL: 'https://api.example.com',
     SHOPIFY_OAUTH_STATE_SECRET: 'a'.repeat(32),
+    BETTER_AUTH_SECRET: 'b'.repeat(32),
+    BETTER_AUTH_URL: 'https://api.example.com',
+    DASHBOARD_URL: 'https://app.example.com',
+    GOOGLE_CLIENT_ID: 'google-client-id',
+    GOOGLE_CLIENT_SECRET: 'google-client-secret',
     ...overrides,
   };
 }
@@ -83,5 +88,27 @@ describe('apps/api boot environment', () => {
         expect(result.success, `${NODE_ENV} without ${name}`).toBe(false);
       }
     }
+  });
+
+  it('refuses to start without the Better Auth config, in any NODE_ENV', () => {
+    for (const NODE_ENV of ['development', 'test', 'production']) {
+      for (const name of [
+        'BETTER_AUTH_SECRET',
+        'BETTER_AUTH_URL',
+        'DASHBOARD_URL',
+        'GOOGLE_CLIENT_ID',
+        'GOOGLE_CLIENT_SECRET',
+      ]) {
+        const result = parseEnv(apiEnvSchema, env({ NODE_ENV, [name]: undefined }));
+        expect(result.success, `${NODE_ENV} without ${name}`).toBe(false);
+      }
+    }
+  });
+
+  it('accepts an optional COLLECTOR_PUBLIC_URL, and rejects a malformed one', () => {
+    expect(
+      parseEnv(apiEnvSchema, env({ COLLECTOR_PUBLIC_URL: 'https://collect.example.com' })).success,
+    ).toBe(true);
+    expect(parseEnv(apiEnvSchema, env({ COLLECTOR_PUBLIC_URL: 'not-a-url' })).success).toBe(false);
   });
 });

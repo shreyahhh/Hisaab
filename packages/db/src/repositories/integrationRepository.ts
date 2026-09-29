@@ -120,6 +120,8 @@ export interface IntegrationRepository {
   markUninstalled(scope: Scope, storeId: string): Promise<IntegrationRow | null>;
   /** The store's active integration for a provider (job-scope-friendly — no organization id needed). */
   getActiveByStore(scope: Scope, storeId: string, provider: string): Promise<IntegrationRow | null>;
+  /** Every integration row (any provider, any status) for the store — the dashboard's Integrations page. */
+  listByStore(scope: Scope, storeId: string): Promise<IntegrationRow[]>;
   /**
    * Merges `patch` into the store's Shopify `settings.backfill` (creating it if absent) in one
    * atomic UPDATE, so two writers patching different fields never lose each other's keys. Stamps
@@ -345,6 +347,11 @@ export function createIntegrationRepository(db: Db): IntegrationRepository {
         )
         .limit(1);
       return rows[0] ?? null;
+    },
+
+    async listByStore(scope, storeId) {
+      assertStoreInScope(scope, storeId);
+      return db.select().from(integrations).where(eq(integrations.storeId, storeId));
     },
 
     async patchShopifySettings(scope, storeId, patch) {

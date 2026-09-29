@@ -14,6 +14,7 @@
     "@fastify/cors": "^10.0.1",
     "@fastify/rate-limit": "^11.2.0",
     "@truepath/auth": "workspace:*",
+    "@truepath/clickhouse": "workspace:*",
     "@truepath/db": "workspace:*",
     "@truepath/integrations": "workspace:^",
     "@truepath/privacy": "workspace:*",

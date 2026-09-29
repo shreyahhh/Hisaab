@@ -158,6 +158,17 @@ export const EXEMPT_ROUTES: readonly RouteExemption[] = [
     url: '/v1/integrations/shopify/callback',
     reason: 'Fastify-generated HEAD mirror of GET /v1/integrations/shopify/callback.',
   },
+  {
+    method: 'GET',
+    url: '/v1/system/status',
+    reason:
+      'Queue depths and the suppress:ready marker carry no store or shopper identifier — any signed-in user may view it (dashboard System status page).',
+  },
+  {
+    method: 'HEAD',
+    url: '/v1/system/status',
+    reason: 'Fastify-generated HEAD mirror of GET /v1/system/status.',
+  },
 ];
 
 export function isExemptRoute(
