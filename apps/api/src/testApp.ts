@@ -1,10 +1,12 @@
 import { Queue } from 'bullmq';
 import { Redis } from 'ioredis';
 import { createAuth, type Auth } from '@truepath/auth';
+import { createClickHouseClient } from '@truepath/clickhouse';
 import { createAuditLogRepository, createDb, type Db } from '@truepath/db';
 import { createShopifyAdapter } from '@truepath/integrations';
 import { createTestCredentialsCipher, createTestIdentityHasher } from '@truepath/privacy/testing';
 import {
+  clickhouseEnvSchema,
   loadDotEnvIfPresent,
   loadEnv,
   postgresEnvSchema,
@@ -20,9 +22,10 @@ import { buildApp, type AppDeps, type ShopifyDeps } from './app.js';
 // tests run against the real local Docker databases, not mocks). Not exported outside this package.
 
 loadDotEnvIfPresent('../../.env');
-const env = loadEnv(postgresEnvSchema);
+const env = loadEnv(postgresEnvSchema.and(clickhouseEnvSchema));
 
 export const testDb: Db = createDb(env.DATABASE_URL);
+export const testClickhouse = createClickHouseClient(env);
 
 export const testAuth: Auth = createAuth({
   db: testDb,
@@ -96,6 +99,7 @@ export const testShopify: ShopifyDeps = {
 export function buildTestApp(overrides: Partial<AppDeps> = {}) {
   return buildApp({
     db: testDb,
+    clickhouse: testClickhouse,
     auth: testAuth,
     trustedOrigin: 'http://localhost:5173',
     rateLimit: { redis: testRedis, hasher: testHasher },

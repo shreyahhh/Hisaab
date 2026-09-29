@@ -4,6 +4,7 @@ import Fastify, { type FastifyInstance } from 'fastify';
 import fastifyCors from '@fastify/cors';
 import type { Redis } from 'ioredis';
 import type { Auth } from '@truepath/auth';
+import type { ClickHouseClient } from '@truepath/clickhouse';
 import { createAuditLogRepository, type Db } from '@truepath/db';
 import type { ShopifyAdapter } from '@truepath/integrations';
 import type { CredentialsCipher, IdentityHasher } from '@truepath/privacy';
@@ -22,13 +23,19 @@ import {
 import { registerRouteRegistry } from './routeRegistry.js';
 import type { TenantScopeDeps } from './tenantScope.js';
 import { registerAuthWrapperRoutes } from './routes/authWrappers.js';
+import { registerChannelRuleRoutes } from './routes/channelRules.js';
 import { registerDpaRoutes } from './routes/dpa.js';
+import { registerDashboardIntegrationRoutes } from './routes/dashboardIntegrations.js';
 import { registerIntegrationRoutes } from './routes/integrations.js';
 import { registerInviteRoutes } from './routes/invites.js';
 import { registerMemberRoutes } from './routes/members.js';
 import { registerMeRoutes } from './routes/me.js';
+import { registerOrderRoutes } from './routes/orders.js';
 import { registerOrgRoutes } from './routes/orgs.js';
+import { registerPrivacyDashboardRoutes } from './routes/privacyDashboard.js';
 import { registerShopifyWebhookRoutes } from './routes/shopifyWebhooks.js';
+import { registerSystemStatusRoutes } from './routes/systemStatus.js';
+import { registerTrackingRoutes } from './routes/tracking.js';
 
 /** Everything the Shopify OAuth (connect/callback/disconnect) and webhook routes need (M1-1). */
 export interface ShopifyDeps {
@@ -53,6 +60,7 @@ export interface ShopifyDeps {
 
 export interface AppDeps {
   readonly db: Db;
+  readonly clickhouse: ClickHouseClient;
   readonly auth: Auth;
   /** Dashboard origin allowed to call this API with credentials (auth-tenancy.md §4.1 CSRF check). */
   readonly trustedOrigin: string;
@@ -185,6 +193,12 @@ export function buildApp(deps: AppDeps): FastifyInstance {
       ...(deps.shopify.collectorUrl ? { collectorUrl: deps.shopify.collectorUrl } : {}),
       dpaVersion: deps.dpaVersion,
     });
+    registerDashboardIntegrationRoutes(scope, tenantDeps);
+    registerOrderRoutes(scope, tenantDeps, { clickhouse: deps.clickhouse });
+    registerTrackingRoutes(scope, tenantDeps, { clickhouse: deps.clickhouse, redis: deps.shopify.redis });
+    registerPrivacyDashboardRoutes(scope, tenantDeps);
+    registerChannelRuleRoutes(scope, tenantDeps);
+    registerSystemStatusRoutes(scope, tenantDeps, { redis: deps.shopify.redis });
   });
 
   app.decorate('appDeps', deps);

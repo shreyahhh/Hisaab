@@ -1,4 +1,4 @@
-import { and, eq, gte, isNull, or, sql } from 'drizzle-orm';
+import { and, desc, eq, gte, isNull, or, sql } from 'drizzle-orm';
 import { assertStoreInScope, type Scope } from '@truepath/shared';
 import type { Db } from '../client.js';
 import { orders, orderStatusEvents } from '../schema/index.js';
@@ -89,6 +89,9 @@ export interface OrderRepository {
     identityHash: string,
     since: Date,
   ): Promise<number>;
+
+  /** The store's most recent orders, newest first — the dashboard's Orders page. */
+  listRecentByStore(scope: Scope, storeId: string, limit: number): Promise<OrderRow[]>;
 }
 
 /** The only sanctioned way to read/write `orders`/`order_status_events` (ADR-0016). */
@@ -274,6 +277,16 @@ export function createOrderRepository(db: Db): OrderRepository {
           ),
         );
       return row?.n ?? 0;
+    },
+
+    async listRecentByStore(scope, storeId, limit) {
+      assertStoreInScope(scope, storeId);
+      return db
+        .select()
+        .from(orders)
+        .where(eq(orders.storeId, storeId))
+        .orderBy(desc(orders.createdAtPlatform))
+        .limit(limit);
     },
   };
 }

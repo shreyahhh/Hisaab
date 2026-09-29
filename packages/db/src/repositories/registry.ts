@@ -5,11 +5,13 @@ import { createAuditLogRepository } from './auditLogRepository.js';
 import { createDpaAcceptanceRepository } from './dpaAcceptanceRepository.js';
 import { createAdAccountRepository } from './adAccountRepository.js';
 import { createChannelRuleRepository } from './channelRuleRepository.js';
+import { createConsentRecordRepository } from './consentRecordRepository.js';
 import { createDsrRequestRepository } from './dsrRequestRepository.js';
 import { createEventEffectsRepository } from './eventEffectsRepository.js';
 import { createIntegrationRepository } from './integrationRepository.js';
 import { createOrderRepository } from './orderRepository.js';
 import { createStoreRepository } from './storeRepository.js';
+import { createSuppressedIdentityRepository } from './suppressedIdentityRepository.js';
 import { createWebhookDeliveryRepository } from './webhookDeliveryRepository.js';
 
 // A resource id that never matches a real row, for scope-assertion-only harness invocations (the
@@ -136,6 +138,11 @@ export const repositoryRegistry: readonly RepositoryDescriptor[] = [
         invoke: (db, scope, storeId) =>
           createIntegrationRepository(db).getActiveByStore(scope, storeId, 'shopify'),
       },
+      {
+        name: 'listByStore',
+        scopeKind: 'store',
+        invoke: (db, scope, storeId) => createIntegrationRepository(db).listByStore(scope, storeId),
+      },
     ],
   },
   {
@@ -152,6 +159,34 @@ export const repositoryRegistry: readonly RepositoryDescriptor[] = [
             dueAt: new Date(),
             sourceRef: `cross-tenant-test-${storeId}`,
           }),
+      },
+      {
+        name: 'listRecentByStore',
+        scopeKind: 'store',
+        invoke: (db, scope, storeId) =>
+          createDsrRequestRepository(db).listRecentByStore(scope, storeId, 20),
+      },
+    ],
+  },
+  {
+    name: 'ConsentRecordRepository',
+    methods: [
+      {
+        name: 'listRecentByStore',
+        scopeKind: 'store',
+        invoke: (db, scope, storeId) =>
+          createConsentRecordRepository(db).listRecentByStore(scope, storeId, 20),
+      },
+    ],
+  },
+  {
+    name: 'SuppressedIdentityRepository',
+    methods: [
+      {
+        name: 'countByStore',
+        scopeKind: 'store',
+        invoke: (db, scope, storeId) =>
+          createSuppressedIdentityRepository(db).countByStore(scope, storeId),
       },
     ],
   },
@@ -208,6 +243,11 @@ export const repositoryRegistry: readonly RepositoryDescriptor[] = [
         scopeKind: 'store',
         invoke: (db, scope, storeId) =>
           createOrderRepository(db).countOrdersByIdentityHash(scope, storeId, 'k1:x', new Date()),
+      },
+      {
+        name: 'listRecentByStore',
+        scopeKind: 'store',
+        invoke: (db, scope, storeId) => createOrderRepository(db).listRecentByStore(scope, storeId, 20),
       },
     ],
   },

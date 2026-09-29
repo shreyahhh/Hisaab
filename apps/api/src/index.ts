@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { Queue } from 'bullmq';
 import { Redis } from 'ioredis';
 import { createAuth } from '@truepath/auth';
+import { createClickHouseClient } from '@truepath/clickhouse';
 import { createAuditLogRepository, createDb } from '@truepath/db';
 import { createShopifyAdapter } from '@truepath/integrations';
 import { createCredentialsCipher, createIdentityHasher } from '@truepath/privacy';
@@ -57,6 +58,7 @@ function main(): void {
   const env = loadEnv(apiEnvSchema);
 
   const db = createDb(env.DATABASE_URL);
+  const clickhouse = createClickHouseClient(env);
   const cipher = createCredentialsCipher(env.credentialsKeys);
   const hasher = createIdentityHasher(env.identityKeys);
   const adapter = createShopifyAdapter({
@@ -107,6 +109,7 @@ function main(): void {
 
   const deps: AppDeps = {
     db,
+    clickhouse,
     auth,
     trustedOrigin: env.DASHBOARD_URL,
     audit: createAuditService(createAuditLogRepository(db)),
