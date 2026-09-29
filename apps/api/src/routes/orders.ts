@@ -2,11 +2,7 @@ import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { ch, type ClickHouseClient } from '@truepath/clickhouse';
 import { createOrderRepository } from '@truepath/db';
-import {
-  requirePermission,
-  requireStoreScope,
-  type TenantScopeDeps,
-} from '../tenantScope.js';
+import { requirePermission, requireStoreScope, type TenantScopeDeps } from '../tenantScope.js';
 
 export interface OrderRouteDeps {
   readonly clickhouse: ClickHouseClient;

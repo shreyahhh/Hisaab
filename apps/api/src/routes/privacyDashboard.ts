@@ -4,11 +4,7 @@ import {
   createDsrRequestRepository,
   createSuppressedIdentityRepository,
 } from '@truepath/db';
-import {
-  requirePermission,
-  requireStoreScope,
-  type TenantScopeDeps,
-} from '../tenantScope.js';
+import { requirePermission, requireStoreScope, type TenantScopeDeps } from '../tenantScope.js';
 
 /**
  * `GET /v1/stores/:id/privacy/consent-stats` and `GET /v1/stores/:id/privacy/requests` (SPEC §10).
@@ -59,7 +55,7 @@ export function registerPrivacyDashboardRoutes(app: FastifyInstance, deps: Tenan
           completed_at: row.completedAt ? row.completedAt.toISOString() : null,
           trigger:
             row.resultSummary && typeof row.resultSummary === 'object'
-              ? (row.resultSummary as Record<string, unknown>)['trigger'] ?? null
+              ? ((row.resultSummary as Record<string, unknown>)['trigger'] ?? null)
               : null,
         })),
         // M4-2 fulfils these rows (export/erasure); until then every request just sits `pending`.

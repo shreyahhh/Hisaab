@@ -1,10 +1,6 @@
 import type { FastifyInstance } from 'fastify';
 import { createChannelRuleRepository } from '@truepath/db';
-import {
-  requirePermission,
-  requireStoreScope,
-  type TenantScopeDeps,
-} from '../tenantScope.js';
+import { requirePermission, requireStoreScope, type TenantScopeDeps } from '../tenantScope.js';
 
 /**
  * `GET /v1/stores/:id/channel-rules` (SPEC §10; the `PUT` half is a settings-write ticket, not this

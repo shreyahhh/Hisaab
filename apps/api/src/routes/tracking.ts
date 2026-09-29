@@ -3,11 +3,7 @@ import type { Redis } from 'ioredis';
 import { z } from 'zod';
 import { ch, type ClickHouseClient } from '@truepath/clickhouse';
 import { statsCollectorKey } from '@truepath/shared';
-import {
-  requirePermission,
-  requireStoreScope,
-  type TenantScopeDeps,
-} from '../tenantScope.js';
+import { requirePermission, requireStoreScope, type TenantScopeDeps } from '../tenantScope.js';
 
 export interface TrackingRouteDeps {
   readonly clickhouse: ClickHouseClient;

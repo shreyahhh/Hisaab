@@ -1,10 +1,6 @@
 import type { FastifyInstance } from 'fastify';
 import { createIntegrationRepository } from '@truepath/db';
-import {
-  requirePermission,
-  requireStoreScope,
-  type TenantScopeDeps,
-} from '../tenantScope.js';
+import { requirePermission, requireStoreScope, type TenantScopeDeps } from '../tenantScope.js';
 
 /**
  * `GET /v1/stores/:storeId/integrations` (SPEC §10). Read-only view of every provider the store

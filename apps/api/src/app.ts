@@ -195,7 +195,10 @@ export function buildApp(deps: AppDeps): FastifyInstance {
     });
     registerDashboardIntegrationRoutes(scope, tenantDeps);
     registerOrderRoutes(scope, tenantDeps, { clickhouse: deps.clickhouse });
-    registerTrackingRoutes(scope, tenantDeps, { clickhouse: deps.clickhouse, redis: deps.shopify.redis });
+    registerTrackingRoutes(scope, tenantDeps, {
+      clickhouse: deps.clickhouse,
+      redis: deps.shopify.redis,
+    });
     registerPrivacyDashboardRoutes(scope, tenantDeps);
     registerChannelRuleRoutes(scope, tenantDeps);
     registerSystemStatusRoutes(scope, tenantDeps, { redis: deps.shopify.redis });

@@ -247,7 +247,8 @@ export const repositoryRegistry: readonly RepositoryDescriptor[] = [
       {
         name: 'listRecentByStore',
         scopeKind: 'store',
-        invoke: (db, scope, storeId) => createOrderRepository(db).listRecentByStore(scope, storeId, 20),
+        invoke: (db, scope, storeId) =>
+          createOrderRepository(db).listRecentByStore(scope, storeId, 20),
       },
     ],
   },
