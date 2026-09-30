@@ -1,8 +1,23 @@
 import type { FastifyInstance } from 'fastify';
 import { truncateIp } from '@truepath/auth';
-import { createAuditLogRepository, createDpaAcceptanceRepository } from '@truepath/db';
+import {
+  createAuditLogRepository,
+  createDpaAcceptanceRepository,
+  createStoreRepository,
+} from '@truepath/db';
+import type { CredentialsCipher } from '@truepath/privacy';
 import { DpaAcceptBodySchema, type DpaAcceptResponse } from '@truepath/shared';
+import type { Redis } from 'ioredis';
+import { publishCollectorConfig } from '../shopifyPixel.js';
 import { requireOrgScope, requirePermission, type TenantScopeDeps } from '../tenantScope.js';
+
+export interface DpaRouteOptions {
+  readonly dpaVersion: string;
+  /** ADR-0023 envelope encryption — needed to read a store's pixel signing keys back out. */
+  readonly cipher: CredentialsCipher;
+  /** Durable Redis — where `collector:store:<store_key>` configs live. */
+  readonly redis: Redis;
+}
 
 /**
  * `POST /v1/orgs/:id/dpa/accept` (SPEC §5.1, §10; auth-tenancy.md §4.5; privacy-dpdp.md §2.2).
@@ -16,13 +31,18 @@ import { requireOrgScope, requirePermission, type TenantScopeDeps } from '../ten
  * already accepted is a no-op that returns the existing record with `200`, and writes no second row
  * or audit entry. The accepting IP is stored truncated to /24 (IPv4) or /48 (IPv6), never in full.
  *
- * Not done here: republishing the Collector store configs so tracking can switch on
- * (privacy-dpdp.md §4.10). The Collector does not exist yet; that lands with M1-5.
+ * After the transaction commits, republishes every store's `collector:store:<store_key>` config
+ * (privacy-dpdp.md §4.10 / issue #22) — until now nothing did this after an accept, so a store whose
+ * only missing gate was the DPA stayed `inactive` until an unrelated suppression rebuild happened to
+ * run. Best-effort and non-blocking: a store with no active Shopify integration yet, or no pixel keys,
+ * is a harmless no-op (`publishCollectorConfig` returns `null`); a Redis error for one store is logged
+ * (ids only) and does not fail the response or block the other stores — the next suppression rebuild
+ * (or the next accept/settings change, once M4-2 adds that endpoint) still catches it up.
  */
 export function registerDpaRoutes(
   app: FastifyInstance,
   deps: TenantScopeDeps,
-  options: { readonly dpaVersion: string },
+  options: DpaRouteOptions,
 ): void {
   app.post<{ Params: { id: string }; Body: unknown }>(
     '/v1/orgs/:id/dpa/accept',
@@ -67,6 +87,35 @@ export function registerDpaRoutes(
         }
         return result;
       });
+
+      const stores = await createStoreRepository(deps.db).listByOrganization(
+        scope,
+        scope.organizationId,
+      );
+      await Promise.all(
+        stores.map(async (store) => {
+          try {
+            await publishCollectorConfig(
+              {
+                db: deps.db,
+                cipher: options.cipher,
+                redis: options.redis,
+                dpaVersion: options.dpaVersion,
+              },
+              scope,
+              store.id,
+            );
+          } catch (error) {
+            console.error(
+              JSON.stringify({
+                event: 'collector_config_republish_failed',
+                store_id: store.id,
+                error_name: error instanceof Error ? error.name : 'unknown',
+              }),
+            );
+          }
+        }),
+      );
 
       const response: DpaAcceptResponse = {
         id: row.id,

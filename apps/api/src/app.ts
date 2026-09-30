@@ -181,7 +181,11 @@ export function buildApp(deps: AppDeps): FastifyInstance {
     registerOrgRoutes(scope, tenantDeps);
     registerInviteRoutes(scope, tenantDeps, limits);
     registerMemberRoutes(scope, tenantDeps);
-    registerDpaRoutes(scope, tenantDeps, { dpaVersion: deps.dpaVersion });
+    registerDpaRoutes(scope, tenantDeps, {
+      dpaVersion: deps.dpaVersion,
+      cipher: deps.shopify.cipher,
+      redis: deps.shopify.redis,
+    });
     registerIntegrationRoutes(scope, tenantDeps, {
       adapter: deps.shopify.adapter,
       cipher: deps.shopify.cipher,

@@ -395,3 +395,51 @@ describe('publishCollectorConfig — the gates on `active` (privacy-dpdp §4.10,
     expect(await publishCollectorConfig(deps, scope, store!.id)).toBeNull();
   });
 });
+
+describe('POST /v1/orgs/:id/dpa/accept republishes the collector config (issue #22)', () => {
+  it('a store stuck on dpa_missing (India opt-in already confirmed) goes active right after accept', async () => {
+    const app = appWith(async () => ({ pixelId: 'gid://shopify/WebPixel/1' }));
+    const t = await tenant('dpa-republish');
+    const result = await connect(app, t, shopFor('dpa-republish'));
+    await testDb
+      .update(schema.stores)
+      .set({
+        privacyConfig: { checklist: { india_opt_in_confirmed_at: '2026-09-28T10:00:00Z' } },
+      })
+      .where(eq(schema.stores.id, result.store.id));
+
+    // Before accept: DPA missing, so still inactive — confirms the fixture is a faithful repro of
+    // "only the DPA gate is missing" rather than accidentally already active.
+    expect(await readConfig(result.settings.store_key!)).toMatchObject({
+      status: 'inactive',
+      inactiveReason: 'dpa_missing',
+    });
+
+    const res = await app.inject({
+      method: 'POST',
+      url: `/v1/orgs/${t.organizationId}/dpa/accept`,
+      headers: { cookie: t.cookie, origin: TEST_DASHBOARD_URL },
+      payload: { dpa_version: TEST_DPA_VERSION },
+    });
+    expect(res.statusCode).toBe(201);
+
+    expect(await readConfig(result.settings.store_key!)).toMatchObject({
+      status: 'active',
+      inactiveReason: null,
+    });
+    await app.close();
+  });
+
+  it('a store with no active Shopify integration is a harmless no-op (nothing to publish yet)', async () => {
+    const t = await tenant('dpa-republish-no-store');
+    const app = buildTestApp();
+    const res = await app.inject({
+      method: 'POST',
+      url: `/v1/orgs/${t.organizationId}/dpa/accept`,
+      headers: { cookie: t.cookie, origin: TEST_DASHBOARD_URL },
+      payload: { dpa_version: TEST_DPA_VERSION },
+    });
+    expect(res.statusCode).toBe(201);
+    await app.close();
+  });
+});
