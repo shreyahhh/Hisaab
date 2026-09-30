@@ -17,7 +17,12 @@ import {
   type TenantScope,
 } from '@truepath/shared';
 import { consumeShopifyOAuthState, issueShopifyOAuthState } from '../shopifyOAuthState.js';
-import { installWebPixel, publishCollectorConfig, resolvePixelKeys } from '../shopifyPixel.js';
+import {
+  deleteCollectorConfig,
+  installWebPixel,
+  publishCollectorConfig,
+  resolvePixelKeys,
+} from '../shopifyPixel.js';
 import {
   requireOrgScope,
   requirePermission,
@@ -240,6 +245,11 @@ export function registerIntegrationRoutes(
       if (!revoked) {
         await reply.code(404).send({ error: 'not_found' });
         return;
+      }
+      // The collector config's signing secret must not outlive the integration (issue #44); only
+      // Shopify integrations have one to begin with.
+      if (revoked.provider === 'shopify') {
+        await deleteCollectorConfig(shopify.redis, revoked.settings);
       }
       await deps.audit.log.write(scope, {
         organizationId: scope.organizationId,
