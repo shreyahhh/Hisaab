@@ -17,8 +17,16 @@ export const SHOPIFY_API_VERSION = '2026-07';
 
 // SPEC §8.1 v0.3 / m0-7-external-setup.md item 2: read_all_orders is requested but not yet
 // approved, so it is not in the base scope string here — it is added once granted (§4.7).
+//
+// read_fulfillments (issue #73): required by Shopify to subscribe to the fulfillments/create and
+// fulfillments/update webhook topics SPEC §8.1 already lists — `shopify app deploy` refuses to
+// create a version without it once those topics are declared in shopify.app.toml. A store connected
+// before this scope was added won't receive those two topics until it reconnects (Shopify only
+// grants a newly-added scope on a fresh OAuth authorization, not retroactively for an existing
+// token) — orders/refunds/app/compliance topics are unaffected, since read_orders already covers them.
 export const SHOPIFY_OAUTH_SCOPES = [
   'read_orders',
+  'read_fulfillments',
   'write_pixels',
   'read_customer_events',
 ] as const;

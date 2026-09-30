@@ -512,7 +512,7 @@ interface IntegrationAdapter {
 ### 8.1 Shopify
 - OAuth install from the Shopify app; scopes minimal: `read_orders`, `read_customers` (only if needed for hashed identifiers), `read_products`, pixel-related scopes as required by Web Pixel extension.
   - **v0.3:**
-    - Scopes are `read_orders`, `write_pixels` and `read_customer_events`, plus `read_all_orders` once approved.
+    - Scopes are `read_orders`, `write_pixels` and `read_customer_events`, plus `read_all_orders` once approved. **v0.6 correction (issue #73):** also `read_fulfillments` — required by Shopify to subscribe to the `fulfillments/create`/`fulfillments/update` webhook topics this section already lists; missing from this line since v0.3, caught when `shopify app deploy` refused to create a version without it.
     - `read_customers` is **not needed**: order-level email/phone and `customerJourneySummary.customerOrderIndex` suffice. **v0.5: `read_products` is dropped.**
     - Protected customer data Level 2 is needed for **email, phone and address** (zip → pincode prefix).
     - New public apps must use expiring offline tokens (1 h access, 90-day refresh).
