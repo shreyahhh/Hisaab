@@ -28,6 +28,10 @@ describe('SHOPIFY_OAUTH_SCOPES', () => {
     expect(SHOPIFY_OAUTH_SCOPES).not.toContain('read_customers');
     expect(SHOPIFY_OAUTH_SCOPES).not.toContain('read_products');
   });
+
+  it('requests read_fulfillments (issue #73: needed for the fulfillments/* webhook topics)', () => {
+    expect(SHOPIFY_OAUTH_SCOPES).toContain('read_fulfillments');
+  });
 });
 
 describe('shopifyEnvSchema', () => {

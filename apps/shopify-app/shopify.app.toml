@@ -13,9 +13,34 @@ name = "Louis Belcher"
 [webhooks]
 api_version = "2026-07"
 
+# Declarative subscriptions (issue #73): Shopify applies these to every shop with the app installed
+# — existing installs included — on the next `shopify app deploy`, no runtime API call needed. Each
+# block's `uri` matches a `:topic` group apps/api/src/routes/shopifyWebhooks.ts already handles
+# (TOPIC_GROUPS); keep the two in sync if a topic is ever added or moved between groups.
+
+[[webhooks.subscriptions]]
+topics = ["orders/create", "orders/updated", "orders/cancelled"]
+uri = "/webhooks/shopify/orders"
+
+[[webhooks.subscriptions]]
+topics = ["refunds/create", "fulfillments/create", "fulfillments/update"]
+uri = "/webhooks/shopify/order-hints"
+
+[[webhooks.subscriptions]]
+topics = ["app/uninstalled", "bulk_operations/finish"]
+uri = "/webhooks/shopify/app"
+
+# Mandatory for every Shopify app (GDPR): customers/data_request, customers/redact, shop/redact.
+[[webhooks.subscriptions]]
+compliance_topics = ["customers/data_request", "customers/redact", "shop/redact"]
+uri = "/webhooks/shopify/compliance"
+
 [access_scopes]
 # Learn more at https://shopify.dev/docs/apps/tools/cli/configuration#access_scopes
-scopes = "read_orders,write_pixels,read_customer_events"
+# read_fulfillments (issue #73): required for the fulfillments/create and fulfillments/update
+# webhook subscriptions below — keep in sync with packages/shared/src/shopify.ts's
+# SHOPIFY_OAUTH_SCOPES, which is what the OAuth authorize URL actually requests.
+scopes = "read_orders,read_fulfillments,write_pixels,read_customer_events"
 optional_scopes = [ ]
 use_legacy_install_flow = false
 
