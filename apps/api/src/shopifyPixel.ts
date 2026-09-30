@@ -10,6 +10,7 @@ import {
 import {
   generateSigningKey,
   generateStoreKey,
+  nextSigningKid,
   ShopifyPixelError,
   type PixelSigningKey,
   type ShopifyAdapter,
@@ -171,4 +172,90 @@ export async function deleteCollectorConfig(
   const parsed = SettingsSlice.safeParse(settings);
   if (!parsed.success || !parsed.data.store_key) return;
   await redis.del(collectorStoreKey(parsed.data.store_key));
+}
+
+/**
+ * Key rotation, step 1 (S-6, issue #45): generates a new signing key alongside whichever one(s) the
+ * store already has, pushes it to the live pixel (`upsertWebPixel` is documented safe to call again
+ * for exactly this), and republishes the collector config with *every* current key accepted — so a
+ * request already in flight, signed with the about-to-retire key, still verifies during the rollout
+ * window. `pixel_status: 'not_configured'` (no `collectorUrl` yet) skips the Shopify push but still
+ * stores and republishes the new key, matching `installWebPixel`'s own "never block on the pixel"
+ * rule. Returns the new key's `kid`, or `null` if the store has no active Shopify integration yet.
+ */
+export async function rotateSigningKey(
+  deps: PixelDeps,
+  scope: Scope,
+  storeId: string,
+): Promise<{ readonly newKid: string } | null> {
+  const integration = await createIntegrationRepository(deps.db).getActiveByStore(
+    scope,
+    storeId,
+    'shopify',
+  );
+  const store = await createStoreRepository(deps.db).getById(scope, storeId);
+  if (!integration?.encryptedCredentials || !store) return null;
+  const settings = SettingsSlice.safeParse(integration.settings);
+  if (!settings.success || !settings.data.store_key) return null;
+
+  const credentials = decrypt(deps.cipher, integration.id, integration.encryptedCredentials);
+  const existingKeys = credentials.pixelSigningKeys ?? [];
+  const newKey = generateSigningKey(nextSigningKid(existingKeys));
+  const credentialsWithNewKey: ShopifyCredentials = {
+    ...credentials,
+    pixelSigningKeys: [...existingKeys, newKey],
+  };
+
+  await createIntegrationRepository(deps.db).upsertShopify(scope, {
+    storeId,
+    externalAccountId: integration.externalAccountId ?? '',
+    credentialsJson: JSON.stringify(credentialsWithNewKey),
+    scopes: integration.scopes ?? [],
+    cipher: deps.cipher,
+  });
+
+  if (deps.collectorUrl) {
+    await deps.adapter.upsertWebPixel(store.shopDomain, credentialsWithNewKey, {
+      storeKey: settings.data.store_key,
+      collectorUrl: deps.collectorUrl,
+      signingKid: newKey.kid,
+      signingSecret: newKey.secret,
+      noticeVersion: noticeVersionOf(store.privacyConfig),
+    });
+  }
+  await publishCollectorConfig(deps, scope, storeId);
+
+  return { newKid: newKey.kid };
+}
+
+/**
+ * Key rotation, step 2: after the rollout window (S-6's rotation procedure), drops every signing key
+ * except the newest, so a retired secret can no longer verify a signature, and republishes the
+ * config so the Collector picks up the narrower set immediately. A no-op if there's nothing to drop
+ * (no active integration, or rotation was never started).
+ */
+export async function completeKeyRotation(
+  deps: PixelDeps,
+  scope: Scope,
+  storeId: string,
+): Promise<void> {
+  const integration = await createIntegrationRepository(deps.db).getActiveByStore(
+    scope,
+    storeId,
+    'shopify',
+  );
+  if (!integration?.encryptedCredentials) return;
+  const credentials = decrypt(deps.cipher, integration.id, integration.encryptedCredentials);
+  const keys = credentials.pixelSigningKeys ?? [];
+  const newest = keys[keys.length - 1];
+  if (keys.length <= 1 || !newest) return;
+
+  await createIntegrationRepository(deps.db).upsertShopify(scope, {
+    storeId,
+    externalAccountId: integration.externalAccountId ?? '',
+    credentialsJson: JSON.stringify({ ...credentials, pixelSigningKeys: [newest] }),
+    scopes: integration.scopes ?? [],
+    cipher: deps.cipher,
+  });
+  await publishCollectorConfig(deps, scope, storeId);
 }
