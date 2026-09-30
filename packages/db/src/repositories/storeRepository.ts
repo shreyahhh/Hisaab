@@ -23,6 +23,12 @@ export class ShopLinkedToAnotherOrganizationError extends Error {
   }
 }
 
+export interface ConfirmIndiaOptInResult {
+  readonly store: StoreRow;
+  /** False the first time a store confirms; true on a repeat (no write happened). */
+  readonly alreadyConfirmed: boolean;
+}
+
 export interface StoreRepository {
   listByOrganization(scope: Scope, organizationId: string): Promise<StoreRow[]>;
   getById(scope: Scope, storeId: string): Promise<StoreRow | null>;
@@ -34,6 +40,20 @@ export interface StoreRepository {
   upsertByShopDomain(scope: Scope, input: UpsertStoreByShopDomainInput): Promise<StoreRow>;
   /** `app/uninstalled` webhook (shopify-integration.md §4.8). Idempotent: returns null if already uninstalled. */
   markUninstalled(scope: Scope, storeId: string): Promise<StoreRow | null>;
+  /**
+   * Sets `privacy_config.checklist.india_opt_in_confirmed_at` (HLD §8 "Consent-region gate" layer 1;
+   * SPEC P-1; issue #72) — the merchant's onboarding confirmation that their consent banner treats
+   * India as opt-in. Merges into the existing `privacy_config` object rather than replacing it (one
+   * home per setting: `notice_version`, `grievance_contact` and `consent_health` are left untouched).
+   * Idempotent: a repeat confirmation is a no-op that returns the existing timestamp.
+   */
+  confirmIndiaOptIn(scope: Scope, storeId: string): Promise<ConfirmIndiaOptInResult | null>;
+}
+
+function asRecord(value: unknown): Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : {};
 }
 
 /** The only sanctioned way to read/write `stores` (ADR-0016) — every method requires a Scope. */
@@ -99,6 +119,34 @@ export function createStoreRepository(db: Db): StoreRepository {
         .where(and(eq(stores.id, storeId), ne(stores.status, 'uninstalled')))
         .returning();
       return rows[0] ?? null;
+    },
+    async confirmIndiaOptIn(scope, storeId) {
+      assertStoreInScope(scope, storeId);
+      return db.transaction(async (tx) => {
+        const rows = await tx.select().from(stores).where(eq(stores.id, storeId)).limit(1);
+        const existing = rows[0];
+        if (!existing) return null;
+
+        const config = asRecord(existing.privacyConfig);
+        const checklist = asRecord(config['checklist']);
+        const already = checklist['india_opt_in_confirmed_at'];
+        if (typeof already === 'string' && already !== '') {
+          return { store: existing, alreadyConfirmed: true };
+        }
+
+        const [updated] = await tx
+          .update(stores)
+          .set({
+            privacyConfig: {
+              ...config,
+              checklist: { ...checklist, india_opt_in_confirmed_at: new Date().toISOString() },
+            },
+          })
+          .where(eq(stores.id, storeId))
+          .returning();
+        if (!updated) throw new Error('confirmIndiaOptIn: update did not return a row');
+        return { store: updated, alreadyConfirmed: false };
+      });
     },
   };
 }

@@ -444,6 +444,67 @@ describe('POST /v1/orgs/:id/dpa/accept republishes the collector config (issue #
   });
 });
 
+describe('POST /v1/stores/:id/privacy/confirm-india-opt-in republishes the collector config (issue #72)', () => {
+  it('a store stuck on consent_region_unconfirmed (DPA already accepted) goes active right after confirming', async () => {
+    const app = appWith(async () => ({ pixelId: 'gid://shopify/WebPixel/1' }));
+    const t = await tenant('optin-republish');
+    const result = await connect(app, t, shopFor('optin-republish'));
+    const scope: TenantScope = {
+      kind: 'tenant',
+      userId: t.userId,
+      organizationId: t.organizationId,
+      role: 'owner',
+      storeIds: new Set([result.store.id]),
+    };
+    await createDpaAcceptanceRepository(testDb).record(scope, {
+      organizationId: t.organizationId,
+      dpaVersion: TEST_DPA_VERSION,
+      acceptedByUserId: t.userId,
+      ipTruncated: null,
+    });
+    // Direct-inserting the DPA row (unlike POST /dpa/accept) does not republish on its own — publish
+    // once here to reach the "only the consent-region gate is missing" starting state.
+    await publishCollectorConfig(
+      { db: testDb, cipher: testCredentialsCipher, redis: testRedis, dpaVersion: TEST_DPA_VERSION },
+      scope,
+      result.store.id,
+    );
+    expect(await readConfig(result.settings.store_key!)).toMatchObject({
+      status: 'inactive',
+      inactiveReason: 'consent_region_unconfirmed',
+    });
+
+    const res = await app.inject({
+      method: 'POST',
+      url: `/v1/stores/${result.store.id}/privacy/confirm-india-opt-in`,
+      headers: { cookie: t.cookie, origin: TEST_DASHBOARD_URL },
+      payload: {},
+    });
+    expect(res.statusCode).toBe(201);
+
+    expect(await readConfig(result.settings.store_key!)).toMatchObject({
+      status: 'active',
+      inactiveReason: null,
+    });
+    await app.close();
+  });
+
+  it('confirming still succeeds for a store with no active Shopify integration (nothing to publish yet)', async () => {
+    const t = await tenant('optin-republish-no-store');
+    const app = buildTestApp();
+    const res = await app.inject({
+      method: 'POST',
+      url: `/v1/stores/${t.storeId}/privacy/confirm-india-opt-in`,
+      headers: { cookie: t.cookie, origin: TEST_DASHBOARD_URL },
+      payload: {},
+    });
+    // seedRealTenant's store has no Shopify integration, but it is a real store the caller owns, so
+    // confirmation still succeeds — publishCollectorConfig is just a harmless no-op (no keys yet).
+    expect(res.statusCode).toBe(201);
+    await app.close();
+  });
+});
+
 describe('rotateSigningKey / completeKeyRotation (S-6, issue #45)', () => {
   async function connectedForRotation(label: string) {
     const upsertWebPixel = vi.fn<ShopifyAdapter['upsertWebPixel']>(async () => ({

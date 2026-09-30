@@ -1,6 +1,8 @@
+import { eq } from 'drizzle-orm';
 import type { SystemScope, TenantScope } from '@truepath/shared';
 import { TenantScopeViolationError } from '@truepath/shared';
 import { describe, expect, it } from 'vitest';
+import { stores } from '../schema/index.js';
 import { createStoreRepository, ShopLinkedToAnotherOrganizationError } from './storeRepository.js';
 import { cleanupTestTenant, db, seedTestTenant } from '../testing.js';
 
@@ -161,6 +163,87 @@ describe('StoreRepository (ADR-0016)', () => {
             shopDomain: `should-not-be-created-${Date.now()}.myshopify.com`,
           }),
         ).rejects.toThrow(TenantScopeViolationError);
+      } finally {
+        await cleanupTestTenant(tenantA);
+        await cleanupTestTenant(tenantB);
+      }
+    });
+  });
+
+  describe('confirmIndiaOptIn (HLD §8 "Consent-region gate" layer 1, issue #72)', () => {
+    it('sets the checklist timestamp on first confirmation', async () => {
+      const tenant = await seedTestTenant('store-repo-optin-first');
+      try {
+        const repo = createStoreRepository(db);
+        const scope = ownerScope(tenant.organizationId, tenant.storeId, tenant.userId);
+
+        const result = await repo.confirmIndiaOptIn(scope, tenant.storeId);
+        expect(result?.alreadyConfirmed).toBe(false);
+        const at = (result?.store.privacyConfig as Record<string, unknown>)['checklist'] as Record<
+          string,
+          unknown
+        >;
+        expect(typeof at['india_opt_in_confirmed_at']).toBe('string');
+        expect(new Date(at['india_opt_in_confirmed_at'] as string).toISOString()).toBe(
+          at['india_opt_in_confirmed_at'],
+        );
+      } finally {
+        await cleanupTestTenant(tenant);
+      }
+    });
+
+    it('is idempotent: a repeat keeps the original timestamp and reports alreadyConfirmed', async () => {
+      const tenant = await seedTestTenant('store-repo-optin-repeat');
+      try {
+        const repo = createStoreRepository(db);
+        const scope = ownerScope(tenant.organizationId, tenant.storeId, tenant.userId);
+
+        const first = await repo.confirmIndiaOptIn(scope, tenant.storeId);
+        const second = await repo.confirmIndiaOptIn(scope, tenant.storeId);
+        expect(second?.alreadyConfirmed).toBe(true);
+        const firstChecklist = (first?.store.privacyConfig as Record<string, unknown>)[
+          'checklist'
+        ] as Record<string, unknown>;
+        const secondChecklist = (second?.store.privacyConfig as Record<string, unknown>)[
+          'checklist'
+        ] as Record<string, unknown>;
+        expect(secondChecklist['india_opt_in_confirmed_at']).toBe(
+          firstChecklist['india_opt_in_confirmed_at'],
+        );
+      } finally {
+        await cleanupTestTenant(tenant);
+      }
+    });
+
+    it('merges into privacy_config without disturbing other keys (one home per setting)', async () => {
+      const tenant = await seedTestTenant('store-repo-optin-merge');
+      try {
+        const repo = createStoreRepository(db);
+        const scope = ownerScope(tenant.organizationId, tenant.storeId, tenant.userId);
+        await db
+          .update(stores)
+          .set({ privacyConfig: { notice_version: 'v9' } })
+          .where(eq(stores.id, tenant.storeId));
+
+        const result = await repo.confirmIndiaOptIn(scope, tenant.storeId);
+        expect(result?.store.privacyConfig).toMatchObject({
+          notice_version: 'v9',
+          checklist: { india_opt_in_confirmed_at: expect.any(String) },
+        });
+      } finally {
+        await cleanupTestTenant(tenant);
+      }
+    });
+
+    it('denies confirmIndiaOptIn for a store outside scope (SPEC §5.10 test 7)', async () => {
+      const tenantA = await seedTestTenant('store-repo-optin-scope-a');
+      const tenantB = await seedTestTenant('store-repo-optin-scope-b');
+      try {
+        const repo = createStoreRepository(db);
+        const scopeA = ownerScope(tenantA.organizationId, tenantA.storeId, tenantA.userId);
+        await expect(repo.confirmIndiaOptIn(scopeA, tenantB.storeId)).rejects.toThrow(
+          TenantScopeViolationError,
+        );
       } finally {
         await cleanupTestTenant(tenantA);
         await cleanupTestTenant(tenantB);

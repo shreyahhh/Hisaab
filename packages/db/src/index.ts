@@ -16,6 +16,7 @@ export { jobScope } from './jobScope.js';
 export {
   createStoreRepository,
   ShopLinkedToAnotherOrganizationError,
+  type ConfirmIndiaOptInResult,
   type StoreRepository,
   type StoreRow,
   type UpsertStoreByShopDomainInput,
