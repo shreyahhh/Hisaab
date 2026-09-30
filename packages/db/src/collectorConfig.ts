@@ -9,6 +9,7 @@ import {
 import type { Db } from './client.js';
 import { createDpaAcceptanceRepository } from './repositories/dpaAcceptanceRepository.js';
 import { createIntegrationRepository } from './repositories/integrationRepository.js';
+import { createOrganizationRepository } from './repositories/organizationRepository.js';
 import { createStoreRepository } from './repositories/storeRepository.js';
 
 // The Collector's per-store config, `collector:store:<store_key>` (HLD §8; collector.md §2.5), built from
@@ -69,8 +70,9 @@ function signingKeysOf(credentialsJson: string): { kid: string; secret: string }
 /**
  * Builds and writes `collector:store:<store_key>` from the store's current state (HLD §8): `active` only
  * with the org's DPA accepted at the current version AND the merchant's India opt-in confirmation on
- * record (privacy-dpdp §4.10 / SPEC v0.6 P-1) — until both, the Collector drops everything for the
- * store. Idempotent, so it can be re-run whenever a gate changes (issue #22) or after a Redis loss.
+ * record (privacy-dpdp §4.10 / SPEC v0.6 P-1) AND the organization not `pending_deletion` (issue #8) —
+ * until all three, the Collector drops everything for the store. Idempotent, so it can be re-run
+ * whenever a gate changes (issue #22) or after a Redis loss.
  *
  * `scope` must cover the store (ADR-0016; callers use a one-store scope, ADR-0026). Returns the config it
  * wrote, or null if the store has no active Shopify integration or no keys yet (nothing to publish).
@@ -105,9 +107,17 @@ export async function publishCollectorConfig(
     store.organizationId,
     deps.dpaVersion,
   );
+  const organization = await createOrganizationRepository(deps.db).getById(
+    scope,
+    store.organizationId,
+  );
 
   let inactiveReason: CollectorInactiveReason | null = null;
   if (store.status !== 'active') inactiveReason = 'uninstalled';
+  // issue #8: an org mid-deletion (or its request already committed but not yet read back here)
+  // stops tracking regardless of DPA/consent state — checked before those gates, not after, since
+  // deletion is the more final reason.
+  else if (organization?.status === 'pending_deletion') inactiveReason = 'org_deletion';
   else if (!dpa) inactiveReason = 'dpa_missing';
   else if (!indiaOptInConfirmed(store.privacyConfig)) inactiveReason = 'consent_region_unconfirmed';
 

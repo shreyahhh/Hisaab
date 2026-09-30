@@ -37,7 +37,7 @@
 | `DELETE /v1/orgs/:id/members/:userId` | owner (admins for analyst/viewer), or self | plugin `removeMember`; last-owner guard |
 | `POST /v1/orgs/:id/dpa/accept` | owner | `dpa_acceptances` (privacy-dpdp §4.10) |
 | `DELETE /v1/orgs/:id` | **owner only** | starts org deletion (§4.6) |
-| **Proposed** `POST /v1/orgs/:id/deletion/cancel` | owner | cancels within the 7-day grace period (Open question 1) |
+| `POST /v1/orgs/:id/deletion/cancel` | owner | cancels within the 7-day grace period (§4.6) |
 
 ### 2.2 Better Auth configuration (`packages/auth`)
 
@@ -201,25 +201,26 @@ sequenceDiagram
 - republish collector configs (privacy-dpdp §4.10) — **not built**: there is no Collector until M1-5.
 
 ### 4.6 Org deletion (approved lifecycle)
-1. **Export first.** The dashboard offers downloads (aggregate report CSVs, plus DSR exports still within their 30-day window) before the confirm step (dashboard §4.7).
-2. `DELETE /v1/orgs/:id` (**owner only**, org name typed as confirmation):
-   - `organizations.status='pending_deletion'`, `metadata.deletion_scheduled_at = now + 7 days`, `metadata.deletion_due_by = now + 30 days`;
-   - every store's collector config becomes `inactive` (no new data);
-   - repeatable sync jobs paused;
-   - all members see a banner;
-   - audit `org_deletion_requested`.
-3. **Grace period (7 days)**: the owner can cancel (Open question 1) → `status='active'`, configs republished, audit `org_deletion_cancelled`.
-4. **After the grace period**: a scheduler under `SystemScope('org_deletion')` runs:
+**Steps 1-3 implemented (issue #8); steps 4-6 are a follow-up, not built by #8** — they overlap with
+the DSR/`store_erasure` fulfilment pipeline (issue #25), which is its own, separately-scoped ticket.
+1. **Export first.** The dashboard offers downloads (aggregate report CSVs, plus DSR exports still within their 30-day window) before the confirm step (dashboard §4.7). *(Dashboard-side; not part of #8.)*
+2. `DELETE /v1/orgs/:id` (**owner only**, org name typed as confirmation) — **implemented**:
+   - `organizations.status='pending_deletion'`, `metadata.deletion_scheduled_at = now + 7 days`, `metadata.deletion_due_by = now + 30 days`, in the same transaction as the audit row;
+   - every store's collector config becomes `inactive` with reason `org_deletion` (`publishCollectorConfig` checks organization status directly, ahead of the DPA/consent gates — HLD §8's "Consent-region gate" comment);
+   - audit `org_deletion_requested`, metadata carrying both timestamps.
+   - **Not implemented**: repeatable sync jobs paused (no per-store repeatable jobs exist yet beyond M1-8's `meta-warmup` test slice); the dashboard banner (frontend).
+3. **Grace period (7 days)**: the owner can cancel via `POST /v1/orgs/:id/deletion/cancel` — **implemented**, resolving Open question 1. `pending_deletion` → `active` only while `now` is before the stored `deletion_scheduled_at` (enforced atomically in the same `UPDATE ... WHERE`, not just checked beforehand); configs republished; audit `org_deletion_cancelled`.
+4. **After the grace period**: a scheduler under `SystemScope('org_deletion')` runs — **not implemented**:
    - `store_erasure` for each store (privacy-dpdp §4.7);
    - token revocation and deletion for every integration;
    - deletion of `memberships` and `invites`;
    - deletion of users with no other memberships, together with their sessions, accounts and auth tokens.
-5. **Completion ≤ 30 days** from the request (SPEC §5.7):
+5. **Completion ≤ 30 days** from the request (SPEC §5.7) — **not implemented**:
    - `organizations` is kept as a tombstone (`status='deleted'`, name replaced by `deleted-<id>`, metadata cleared);
    - `audit_log` is kept ≥ 1 year (S-4);
    - audit `org_deleted` with per-store counts.
    - A daily check alerts if any `pending_deletion` org passes `deletion_due_by`.
-6. The Shopify app must be uninstalled by the merchant (we can't); the confirmation screen says so. `app/uninstalled` and `shop/redact` then arrive and are idempotent against already-erased stores.
+6. The Shopify app must be uninstalled by the merchant (we can't); the confirmation screen says so. `app/uninstalled` and `shop/redact` then arrive and are idempotent against already-erased stores. *(Dashboard-side; not part of #8.)*
 
 ## 5. Failure modes
 
@@ -289,7 +290,7 @@ sequenceDiagram
 **§5.10 compliance tests supported**: test 7 (primary owner) and test 8 (audit on settings, team and org deletion).
 
 ## 9. Open questions
-1. **Cancelling org deletion** needs an endpoint (`POST /v1/orgs/:id/deletion/cancel`, proposed; not in SPEC v0.5). Alternative: cancellation via support only.
+1. ~~**Cancelling org deletion** needs an endpoint~~ — **resolved (issue #8)**: `POST /v1/orgs/:id/deletion/cancel`, matching SPEC v0.6 §10.
 2. **MFA**: Better Auth has a two-factor plugin. Make TOTP required for owners and admins before GA (they can download DSR exports)? Proposed: optional in MVP, required before GA.
 3. **Staff DSRs** (we are the Fiduciary for staff data): self-service "delete my account" (Better Auth supports user deletion) vs support-handled for MVP. Proposed: support-handled with an audit entry.
 4. **Breached-password check** (k-anonymity API) — a new external call; defer.

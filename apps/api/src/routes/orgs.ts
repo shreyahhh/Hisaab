@@ -1,9 +1,18 @@
 import { fromNodeHeaders } from 'better-auth/node';
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
-import { createStoreRepository, InvalidAuditCursorError, MAX_AUDIT_PAGE_SIZE } from '@truepath/db';
-import { AUDIT_ACTIONS } from '@truepath/shared';
+import {
+  createAuditLogRepository,
+  createOrganizationRepository,
+  createStoreRepository,
+  InvalidAuditCursorError,
+  MAX_AUDIT_PAGE_SIZE,
+} from '@truepath/db';
+import type { CredentialsCipher } from '@truepath/privacy';
+import { AUDIT_ACTIONS, type TenantScope } from '@truepath/shared';
+import type { Redis } from 'ioredis';
 import { authCall } from '../authCall.js';
+import { publishCollectorConfig } from '../shopifyPixel.js';
 import {
   requireOrgScope,
   requirePermission,
@@ -21,11 +30,68 @@ const AuditLogQuery = z
   })
   .strict();
 
+const DeleteOrgBodySchema = z.object({ name: z.string().min(1).max(200) }).strict();
+
+export interface OrgDeletionRouteOptions {
+  readonly dpaVersion: string;
+  /** ADR-0023 envelope encryption — needed to republish a store's collector config after a status change. */
+  readonly cipher: CredentialsCipher;
+  /** Durable Redis — where `collector:store:<store_key>` configs live. */
+  readonly redis: Redis;
+}
+
 /**
- * `POST/GET /v1/orgs`, `GET /v1/orgs/:id/stores`, `GET /v1/orgs/:id/audit-log`
- * (SPEC §10; auth-tenancy.md §2.1, §2.4).
+ * Every store's collector config reflects the organization's current status (issue #8;
+ * `publishCollectorConfig` in `@truepath/db` checks it directly). Best-effort and non-blocking, same
+ * as the DPA-accept route's republish: a store with no active Shopify integration yet is a harmless
+ * no-op, and a Redis error for one store is logged (ids only) and doesn't fail the response or block
+ * the other stores — the next suppression rebuild catches it up regardless.
  */
-export function registerOrgRoutes(app: FastifyInstance, deps: TenantScopeDeps): void {
+async function republishCollectorConfigs(
+  deps: TenantScopeDeps,
+  options: OrgDeletionRouteOptions,
+  scope: TenantScope,
+): Promise<void> {
+  const stores = await createStoreRepository(deps.db).listByOrganization(
+    scope,
+    scope.organizationId,
+  );
+  await Promise.all(
+    stores.map(async (store) => {
+      try {
+        await publishCollectorConfig(
+          {
+            db: deps.db,
+            cipher: options.cipher,
+            redis: options.redis,
+            dpaVersion: options.dpaVersion,
+          },
+          scope,
+          store.id,
+        );
+      } catch (error) {
+        console.error(
+          JSON.stringify({
+            event: 'collector_config_republish_failed',
+            store_id: store.id,
+            error_name: error instanceof Error ? error.name : 'unknown',
+          }),
+        );
+      }
+    }),
+  );
+}
+
+/**
+ * `POST/GET /v1/orgs`, `GET /v1/orgs/:id/stores`, `GET /v1/orgs/:id/audit-log`,
+ * `DELETE /v1/orgs/:id`, `POST /v1/orgs/:id/deletion/cancel` (SPEC §10; auth-tenancy.md §2.1, §2.4,
+ * §4.6).
+ */
+export function registerOrgRoutes(
+  app: FastifyInstance,
+  deps: TenantScopeDeps,
+  orgDeletion: OrgDeletionRouteOptions,
+): void {
   app.post<{ Body: { name: string; slug: string } }>('/v1/orgs', async (request, reply) => {
     const session = await requireSession(deps, request, reply);
     if (!session) return;
@@ -126,6 +192,123 @@ export function registerOrgRoutes(app: FastifyInstance, deps: TenantScopeDeps): 
         })),
         next_cursor: page.nextCursor,
       });
+    },
+  );
+
+  // DELETE /v1/orgs/:id (auth-tenancy.md §4.6, issue #8). Owner only (`org.delete`); the org's
+  // current name must be typed as confirmation (the dashboard's export-first step happens before this
+  // call, not here). Sets `pending_deletion` with a 7-day grace period and a 30-day completion
+  // deadline (SPEC §5.7), and deactivates every store's collector config. The actual erasure once the
+  // grace period elapses is a separate scheduler (LLD §4.6 steps 4-5), not built by this ticket — see
+  // the issue tracking it.
+  app.delete<{ Params: { id: string }; Body: unknown }>(
+    '/v1/orgs/:id',
+    { preHandler: [requireOrgScope(deps), requirePermission('org.delete')] },
+    async (request, reply) => {
+      const scope = request.scope!;
+      const body = DeleteOrgBodySchema.safeParse(request.body);
+      if (!body.success) {
+        await reply.code(400).send({ error: 'invalid_body', fields: ['name'] });
+        return;
+      }
+
+      const org = await createOrganizationRepository(deps.db).getById(scope, scope.organizationId);
+      if (!org) {
+        await reply.code(404).send({ error: 'not_found' });
+        return;
+      }
+      if (body.data.name !== org.name) {
+        await reply.code(400).send({ error: 'name_mismatch' });
+        return;
+      }
+      if (org.status !== 'active') {
+        await reply.code(409).send({
+          error: org.status === 'deleted' ? 'org_already_deleted' : 'deletion_already_requested',
+        });
+        return;
+      }
+
+      const now = new Date();
+      const updated = await deps.db.transaction(async (tx) => {
+        const row = await createOrganizationRepository(tx).requestDeletion(
+          scope,
+          scope.organizationId,
+          {
+            now,
+          },
+        );
+        if (row) {
+          const metadata = row.metadata as Record<string, unknown>;
+          await createAuditLogRepository(tx).write(scope, {
+            organizationId: scope.organizationId,
+            actorUserId: scope.userId,
+            actorType: 'user',
+            action: 'org_deletion_requested',
+            targetType: 'organization',
+            targetId: scope.organizationId,
+            metadata: {
+              deletion_scheduled_at: String(metadata.deletion_scheduled_at),
+              deletion_due_by: String(metadata.deletion_due_by),
+            },
+          });
+        }
+        return row;
+      });
+
+      if (!updated) {
+        await reply.code(409).send({ error: 'deletion_already_requested' });
+        return;
+      }
+
+      await republishCollectorConfigs(deps, orgDeletion, scope);
+
+      const metadata = updated.metadata as Record<string, unknown>;
+      await reply.send({
+        status: updated.status,
+        deletion_scheduled_at: metadata.deletion_scheduled_at,
+        deletion_due_by: metadata.deletion_due_by,
+      });
+    },
+  );
+
+  // POST /v1/orgs/:id/deletion/cancel (auth-tenancy.md §4.6 Open question 1, SPEC v0.6 §10). Owner
+  // only, within the 7-day grace period — enforced atomically in `cancelDeletion`'s WHERE clause, not
+  // just checked and then trusted.
+  app.post<{ Params: { id: string } }>(
+    '/v1/orgs/:id/deletion/cancel',
+    { preHandler: [requireOrgScope(deps), requirePermission('org.delete')] },
+    async (request, reply) => {
+      const scope = request.scope!;
+      const now = new Date();
+      const updated = await deps.db.transaction(async (tx) => {
+        const row = await createOrganizationRepository(tx).cancelDeletion(
+          scope,
+          scope.organizationId,
+          {
+            now,
+          },
+        );
+        if (row) {
+          await createAuditLogRepository(tx).write(scope, {
+            organizationId: scope.organizationId,
+            actorUserId: scope.userId,
+            actorType: 'user',
+            action: 'org_deletion_cancelled',
+            targetType: 'organization',
+            targetId: scope.organizationId,
+          });
+        }
+        return row;
+      });
+
+      if (!updated) {
+        await reply.code(409).send({ error: 'not_cancellable' });
+        return;
+      }
+
+      await republishCollectorConfigs(deps, orgDeletion, scope);
+
+      await reply.send({ status: updated.status });
     },
   );
 }

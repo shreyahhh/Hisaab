@@ -10,6 +10,7 @@ import { createDsrRequestRepository } from './dsrRequestRepository.js';
 import { createEventEffectsRepository } from './eventEffectsRepository.js';
 import { createIntegrationRepository } from './integrationRepository.js';
 import { createOrderRepository } from './orderRepository.js';
+import { createOrganizationRepository } from './organizationRepository.js';
 import { createStoreRepository } from './storeRepository.js';
 import { createSuppressedIdentityRepository } from './suppressedIdentityRepository.js';
 import { createWebhookDeliveryRepository } from './webhookDeliveryRepository.js';
@@ -382,6 +383,33 @@ export const repositoryRegistry: readonly RepositoryDescriptor[] = [
             organizationId,
             'cross-tenant-test',
           ),
+      },
+    ],
+  },
+  {
+    name: 'OrganizationRepository',
+    methods: [
+      {
+        name: 'getById',
+        scopeKind: 'organization',
+        invoke: (db, scope, organizationId) =>
+          createOrganizationRepository(db).getById(scope, organizationId),
+      },
+      {
+        name: 'requestDeletion',
+        scopeKind: 'organization',
+        invoke: (db, scope, organizationId) =>
+          createOrganizationRepository(db).requestDeletion(scope, organizationId, {
+            now: new Date(),
+          }),
+      },
+      {
+        name: 'cancelDeletion',
+        scopeKind: 'organization',
+        invoke: (db, scope, organizationId) =>
+          createOrganizationRepository(db).cancelDeletion(scope, organizationId, {
+            now: new Date(),
+          }),
       },
     ],
   },
