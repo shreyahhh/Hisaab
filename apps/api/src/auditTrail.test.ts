@@ -250,12 +250,16 @@ const scenarios: Array<[string, () => Promise<Scenario>]> = [
 ];
 
 // Login outcomes are platform-wide rows, so they are found by time and content, not by organization.
+// issue #57: another suite running in parallel can write a platform row for the same action in the
+// same window, so "exactly one since T" is not reliable on its own — each scenario below also pins
+// down something unique to its own request (login_succeeded's actorUserId; login_failed's
+// target_user_id, already in its metadata) so a concurrent suite's row can never be mistaken for it.
 interface PlatformScenario {
   readonly name: string;
   readonly prepare: () => Promise<{
     send: (app: ReturnType<typeof buildTestApp>) => Promise<{ statusCode: number; body: string }>;
     status: number;
-    expected: { action: string; metadata: unknown };
+    expected: { action: string; metadata: unknown; actorUserId?: string | null };
   }>;
 }
 const platformScenarios: PlatformScenario[] = [
@@ -265,7 +269,7 @@ const platformScenarios: PlatformScenario[] = [
       const u: RealUser = await user('trail-login-ok');
       return {
         status: 200,
-        expected: { action: 'login_succeeded', metadata: {} },
+        expected: { action: 'login_succeeded', metadata: {}, actorUserId: u.userId },
         send: (app) =>
           app.inject({
             method: 'POST',
@@ -343,7 +347,10 @@ describe('an audit row is written for each implemented action', () => {
         expect(res.statusCode).toBe(prepared.status);
         const rows = await platformRows(since, prepared.expected.action);
         const matching = rows.filter(
-          (r) => JSON.stringify(r.metadata) === JSON.stringify(prepared.expected.metadata),
+          (r) =>
+            JSON.stringify(r.metadata) === JSON.stringify(prepared.expected.metadata) &&
+            (prepared.expected.actorUserId === undefined ||
+              r.actorUserId === prepared.expected.actorUserId),
         );
         mine = matching.map((r) => r.id);
         expect(matching).toHaveLength(1);
