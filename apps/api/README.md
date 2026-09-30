@@ -96,8 +96,33 @@ with `current_version`, so an old or unknown text can't satisfy the tracking gat
   Fastify's `trustProxy` set correctly (#3), or every request reports the ALB's address.
 - `400 invalid_body` (with field names), `403 forbidden_role`, `404` for another organization (decided
   before the body is read), `401` without a session; the usual CSRF checks apply.
-- **Not yet:** publishing the Collector store configs so tracking switches on (privacy-dpdp.md §4.10).
-  There is no Collector yet (M1-5). It reads `createDpaAcceptanceRepository(...).findForVersion(...)`.
+- After a real (non-repeat) acceptance, republishes every store's `collector:store:<store_key>` config
+  (issue #22), so a store whose only missing gate was the DPA goes `active` immediately rather than
+  waiting for the next suppression rebuild. Best-effort: a Redis error for one store is logged and
+  does not fail the response.
+
+## India opt-in confirmation (`POST /v1/stores/:id/privacy/confirm-india-opt-in`, issue #72)
+
+Owner or admin (`privacy.settings.write`). The second of the two hard gates `publishCollectorConfig`
+requires before the Collector accepts any event for a store (HLD §8 "Consent-region gate" layer 1;
+SPEC P-1) — the merchant's one-time confirmation that their Shopify consent banner (or consent app)
+treats India as an opt-in region. Point the merchant at `docs/dpdp/README.md` before they confirm.
+
+- No request body. `201 { india_opt_in_confirmed_at }` on the first confirmation; `200` with the same
+  timestamp on a repeat. Sets `stores.privacy_config.checklist.india_opt_in_confirmed_at`, merging into
+  the existing `privacy_config` object rather than replacing it (one home per setting — `notice_version`
+  and `grievance_contact` are untouched).
+  `packages/db/src/repositories/storeRepository.ts`'s `confirmIndiaOptIn` does the write.
+- Writes one `consent_region_confirmed` audit row (empty metadata) on a real confirmation, none on a
+  repeat — same idempotency shape as `POST /v1/orgs/:id/dpa/accept`.
+  Republishes the collector config synchronously afterward, same pattern and same best-effort error
+  handling as the DPA route above.
+- `403 forbidden_role` for analyst/viewer, `404` for a store outside the caller's organization (or one
+  that doesn't exist — indistinguishable, per `requireStoreScope`), `401` without a session; the usual
+  CSRF checks apply.
+- **Not yet:** a dashboard onboarding step that surfaces the guide text and calls this — only the API
+  exists so far. The pending `consentPolicy` Admin API check (HLD §8's pending table) would let this be
+  verified automatically instead of relying solely on merchant self-attestation.
 
 ## Global error handler (`errors.ts`, issue #20)
 

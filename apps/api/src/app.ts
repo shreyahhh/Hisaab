@@ -203,7 +203,11 @@ export function buildApp(deps: AppDeps): FastifyInstance {
       clickhouse: deps.clickhouse,
       redis: deps.shopify.redis,
     });
-    registerPrivacyDashboardRoutes(scope, tenantDeps);
+    registerPrivacyDashboardRoutes(scope, tenantDeps, {
+      dpaVersion: deps.dpaVersion,
+      cipher: deps.shopify.cipher,
+      redis: deps.shopify.redis,
+    });
     registerChannelRuleRoutes(scope, tenantDeps);
     registerSystemStatusRoutes(scope, tenantDeps, { redis: deps.shopify.redis });
   });

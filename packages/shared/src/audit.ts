@@ -201,7 +201,14 @@ export const AUDIT_ACTION_OWNERS = {
   org_deletion_requested: pending('deploy #8 (DELETE /v1/orgs/:id)'),
   org_deletion_cancelled: pending('deploy #8 (DELETE /v1/orgs/:id)'),
   org_deleted: pending('deploy #8 (DELETE /v1/orgs/:id)'),
-  consent_region_confirmed: pending('M4-2'),
+  // Reassigned from 'pending M4-2' to M1 (issue #72): HLD §8's "Consent-region gate" layer 1 is a
+  // hard onboarding block, not a privacy-settings-page feature — no real store could ever leave
+  // consent_region_unconfirmed without it, so M1's own exit criterion (a real store's events flow)
+  // was unreachable until this existed. M4-2 still owns the rest of the privacy-settings page.
+  consent_region_confirmed: implemented(
+    'M1-9 / #72',
+    'apps/api/src/routes/privacyDashboard.test.ts',
+  ),
   consent_default_on_warned: pending('M1-6'),
   consent_default_on_paused: pending('M1-6'),
   consent_default_on_resumed: pending('M1-6'),
