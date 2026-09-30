@@ -116,6 +116,19 @@ export interface ShopifyAdapter {
     creds: ShopifyCredentials,
     settings: WebPixelSettings,
   ): Promise<{ pixelId: string }>;
+  /**
+   * `appUninstall` (GraphQL Admin API, min version 2026-07 — already `SHOPIFY_API_VERSION`): "This
+   * mutation can only be used by apps to uninstall themselves." Irreversible — Shopify docs: "You
+   * can't restore an uninstalled app's configuration or data," and the access token becomes
+   * permanently unusable afterward. Issue #33: called best-effort before wiping stored credentials
+   * on disconnect. Never throws for a Shopify-reported failure (returned as `success: false`); a
+   * network/HTTP failure still throws, same as every other method here — the caller decides how to
+   * treat that (best-effort: log and proceed with revoking our own row regardless).
+   */
+  uninstallApp(
+    shop: string,
+    creds: ShopifyCredentials,
+  ): Promise<{ readonly success: boolean; readonly errorCount: number }>;
 }
 
 const TokenResponse = z.object({
@@ -613,6 +626,47 @@ async function upsertWebPixel(
   return { pixelId: updated.webPixel.id };
 }
 
+const AppUninstallResponse = z.object({
+  data: z.object({
+    appUninstall: z.object({
+      app: z.object({ id: z.string() }).nullable(),
+      userErrors: z.array(z.object({ field: z.array(z.string()).nullable(), message: z.string() })),
+    }),
+  }),
+});
+
+const APP_UNINSTALL_MUTATION = `
+  mutation {
+    appUninstall {
+      app { id }
+      userErrors { field message }
+    }
+  }
+`;
+
+async function uninstallApp(
+  shop: string,
+  creds: ShopifyCredentials,
+): Promise<{ readonly success: boolean; readonly errorCount: number }> {
+  const response = await fetch(`https://${shop}/admin/api/${SHOPIFY_API_VERSION}/graphql.json`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'X-Shopify-Access-Token': creds.accessToken },
+    body: JSON.stringify({ query: APP_UNINSTALL_MUTATION }),
+  });
+  if (response.status === 401) {
+    throw new ShopifyUnauthorizedError();
+  }
+  if (!response.ok) {
+    throw new Error(`Shopify appUninstall mutation returned ${response.status}`);
+  }
+  const parsed = AppUninstallResponse.safeParse(await response.json());
+  if (!parsed.success) {
+    throw new Error('Shopify appUninstall mutation returned an unexpected response shape');
+  }
+  const { app, userErrors } = parsed.data.data.appUninstall;
+  return { success: app !== null && userErrors.length === 0, errorCount: userErrors.length };
+}
+
 export function createShopifyAdapter(config: ShopifyAdapterConfig): ShopifyAdapter {
   return {
     provider: 'shopify',
@@ -652,6 +706,8 @@ export function createShopifyAdapter(config: ShopifyAdapterConfig): ShopifyAdapt
     streamBulkOrders,
 
     upsertWebPixel,
+
+    uninstallApp,
 
     async healthCheck(shop, creds) {
       try {

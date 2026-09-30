@@ -829,3 +829,67 @@ describe('createShopifyAdapter: upsertWebPixel', () => {
     expect((error as Error).message).not.toContain(SETTINGS.signingSecret);
   });
 });
+
+describe('createShopifyAdapter: uninstallApp (issue #33)', () => {
+  const creds: ShopifyCredentials = {
+    accessToken: 'shpat_abc123',
+    accessTokenExpiresAt: new Date().toISOString(),
+    refreshToken: 'shprt_def456',
+    refreshTokenExpiresAt: new Date().toISOString(),
+    scope: 'read_orders',
+  };
+
+  it('returns success:true when Shopify uninstalls the app with no userErrors', async () => {
+    let sentQuery = '';
+    server.use(
+      http.post(`https://${SHOP}/admin/api/*/graphql.json`, async ({ request }) => {
+        sentQuery = ((await request.json()) as { query: string }).query;
+        return HttpResponse.json({
+          data: { appUninstall: { app: { id: 'gid://shopify/App/1' }, userErrors: [] } },
+        });
+      }),
+    );
+    const result = await createShopifyAdapter(CONFIG).uninstallApp(SHOP, creds);
+    expect(result).toEqual({ success: true, errorCount: 0 });
+    expect(sentQuery).toContain('appUninstall');
+  });
+
+  it('returns success:false with the error count on a userErrors response, without throwing', async () => {
+    server.use(
+      http.post(`https://${SHOP}/admin/api/*/graphql.json`, () =>
+        HttpResponse.json({
+          data: {
+            appUninstall: {
+              app: null,
+              userErrors: [{ field: null, message: 'already uninstalled' }],
+            },
+          },
+        }),
+      ),
+    );
+    const result = await createShopifyAdapter(CONFIG).uninstallApp(SHOP, creds);
+    expect(result).toEqual({ success: false, errorCount: 1 });
+  });
+
+  it('throws ShopifyUnauthorizedError on 401 (an already-invalid token) — the caller treats this as best-effort', async () => {
+    server.use(
+      http.post(`https://${SHOP}/admin/api/*/graphql.json`, () =>
+        HttpResponse.json({}, { status: 401 }),
+      ),
+    );
+    await expect(createShopifyAdapter(CONFIG).uninstallApp(SHOP, creds)).rejects.toBeInstanceOf(
+      ShopifyUnauthorizedError,
+    );
+  });
+
+  it('throws a generic error on an unexpected response shape', async () => {
+    server.use(
+      http.post(`https://${SHOP}/admin/api/*/graphql.json`, () =>
+        HttpResponse.json({ nope: true }),
+      ),
+    );
+    await expect(createShopifyAdapter(CONFIG).uninstallApp(SHOP, creds)).rejects.toThrow(
+      'unexpected response shape',
+    );
+  });
+});

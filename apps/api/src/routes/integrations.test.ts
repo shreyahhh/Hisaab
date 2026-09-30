@@ -56,6 +56,11 @@ interface FakeAdapterOptions {
   readonly shopInfoResult?: ShopifyShopInfo;
   readonly exchangeCodeError?: boolean;
   readonly shopInfoError?: boolean;
+  /** Issue #33: records every `uninstallApp(shop, creds)` call the DELETE route makes. */
+  readonly onUninstallApp?: (shop: string, creds: ShopifyCredentials) => void;
+  /** Throws instead of returning, to exercise the DELETE route's best-effort handling. */
+  readonly uninstallAppError?: boolean;
+  readonly uninstallAppResult?: { readonly success: boolean; readonly errorCount: number };
 }
 
 function fakeShopifyAdapter(options: FakeAdapterOptions = {}): ShopifyAdapter {
@@ -98,6 +103,11 @@ function fakeShopifyAdapter(options: FakeAdapterOptions = {}): ShopifyAdapter {
     },
     async upsertWebPixel() {
       return { pixelId: 'gid://shopify/WebPixel/test' };
+    },
+    async uninstallApp(shop, creds) {
+      options.onUninstallApp?.(shop, creds);
+      if (options.uninstallAppError) throw new Error('appUninstall failed');
+      return options.uninstallAppResult ?? { success: true, errorCount: 0 };
     },
   };
 }
@@ -574,6 +584,91 @@ describe('DELETE /v1/orgs/:id/integrations/:integrationId', () => {
     try {
       const t = await tenant('delete-ok');
       const shop = shopFor('delete-ok');
+      const state = await issueState(t, shop);
+      await app.inject({
+        method: 'GET',
+        url: `/v1/integrations/shopify/callback?shop=${shop}&code=c&state=${encodeURIComponent(state)}`,
+        headers: { cookie: t.cookie },
+      });
+      const [store] = await testDb
+        .select()
+        .from(schema.stores)
+        .where(eq(schema.stores.shopDomain, shop));
+      const [integration] = await testDb
+        .select()
+        .from(schema.integrations)
+        .where(eq(schema.integrations.storeId, store!.id));
+
+      const res = await app.inject({
+        method: 'DELETE',
+        url: `/v1/orgs/${t.organizationId}/integrations/${integration!.id}`,
+        headers: { cookie: t.cookie, origin: ORIGIN },
+      });
+      expect(res.statusCode).toBe(204);
+
+      const [revoked] = await testDb
+        .select()
+        .from(schema.integrations)
+        .where(eq(schema.integrations.id, integration!.id));
+      expect(revoked?.status).toBe('revoked');
+      expect(revoked?.encryptedCredentials).toBeNull();
+
+      const disconnectRows = await testDb
+        .select()
+        .from(schema.auditLog)
+        .where(eq(schema.auditLog.targetId, integration!.id));
+      expect(disconnectRows.some((r) => r.action === 'integration_disconnected')).toBe(true);
+
+      await testDb.delete(schema.integrations).where(eq(schema.integrations.id, integration!.id));
+      await testDb.delete(schema.stores).where(eq(schema.stores.id, store!.id));
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('calls Shopify appUninstall best-effort before revoking (issue #33)', async () => {
+    const calls: Array<{ shop: string; creds: ShopifyCredentials }> = [];
+    const app = appWith({ onUninstallApp: (shop, creds) => calls.push({ shop, creds }) });
+    try {
+      const t = await tenant('delete-uninstall-app');
+      const shop = shopFor('delete-uninstall-app');
+      const state = await issueState(t, shop);
+      await app.inject({
+        method: 'GET',
+        url: `/v1/integrations/shopify/callback?shop=${shop}&code=c&state=${encodeURIComponent(state)}`,
+        headers: { cookie: t.cookie },
+      });
+      const [store] = await testDb
+        .select()
+        .from(schema.stores)
+        .where(eq(schema.stores.shopDomain, shop));
+      const [integration] = await testDb
+        .select()
+        .from(schema.integrations)
+        .where(eq(schema.integrations.storeId, store!.id));
+
+      const res = await app.inject({
+        method: 'DELETE',
+        url: `/v1/orgs/${t.organizationId}/integrations/${integration!.id}`,
+        headers: { cookie: t.cookie, origin: ORIGIN },
+      });
+      expect(res.statusCode).toBe(204);
+      expect(calls).toHaveLength(1);
+      expect(calls[0]!.shop).toBe(shop);
+      expect(calls[0]!.creds.accessToken).toBe(DEFAULT_CREDENTIALS.accessToken);
+
+      await testDb.delete(schema.integrations).where(eq(schema.integrations.id, integration!.id));
+      await testDb.delete(schema.stores).where(eq(schema.stores.id, store!.id));
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('still revokes and audits when Shopify appUninstall fails (best-effort, issue #33)', async () => {
+    const app = appWith({ uninstallAppError: true });
+    try {
+      const t = await tenant('delete-uninstall-app-fails');
+      const shop = shopFor('delete-uninstall-app-fails');
       const state = await issueState(t, shop);
       await app.inject({
         method: 'GET',
