@@ -85,14 +85,19 @@ export const EXEMPT_ROUTES: readonly RouteExemption[] = [
     reason: 'Fastify-generated HEAD mirror of GET /healthz.',
   },
   // The Better Auth routes we bridge, one entry each (ADR-0022): the reason comes from the allow-list
-  // itself, so a route can't be exposed without saying why it needs no tenant scope.
+  // itself, so a route can't be exposed without saying why it needs no tenant scope. Fastify mirrors
+  // a HEAD only for a GET route (issue #16's POST routes get no such mirror).
   ...EXPOSED_AUTH_ROUTES.flatMap((route): RouteExemption[] => [
     { method: route.method, url: `${AUTH_BASE_PATH}${route.path}`, reason: route.reason },
-    {
-      method: 'HEAD',
-      url: `${AUTH_BASE_PATH}${route.path}`,
-      reason: `Fastify-generated HEAD mirror of GET ${AUTH_BASE_PATH}${route.path}.`,
-    },
+    ...(route.method === 'GET'
+      ? [
+          {
+            method: 'HEAD' as const,
+            url: `${AUTH_BASE_PATH}${route.path}`,
+            reason: `Fastify-generated HEAD mirror of GET ${AUTH_BASE_PATH}${route.path}.`,
+          },
+        ]
+      : []),
   ]),
   {
     method: 'OPTIONS',
