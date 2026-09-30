@@ -79,6 +79,7 @@ export const AUDIT_ACTIONS = [
   'system_scope_used',
   'suppression_rebuilt',
   'webhook_deliveries_pruned',
+  'attribution_confidence_backfilled',
   'breach_created',
   'breach_confirmed',
   'breach_notified',

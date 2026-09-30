@@ -78,6 +78,13 @@
       "when": 1790799106993,
       "tag": "0010_audit_log_webhook_deliveries_pruned",
       "breakpoints": true
+    },
+    {
+      "idx": 11,
+      "version": "7",
+      "when": 1790801308555,
+      "tag": "0011_audit_log_attribution_confidence_backfilled",
+      "breakpoints": true
     }
   ]
 }

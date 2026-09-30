@@ -1,7 +1,8 @@
-import { and, desc, eq, gte, isNull, or, sql } from 'drizzle-orm';
+import { and, asc, desc, eq, gt, gte, inArray, isNull, or, sql } from 'drizzle-orm';
 import { assertStoreInScope, type Scope } from '@truepath/shared';
 import type { Db } from '../client.js';
 import { orders, orderStatusEvents } from '../schema/index.js';
+import { SystemScopeRequiredError } from './suppressionRebuildRepository.js';
 
 export type OrderRow = typeof orders.$inferSelect;
 
@@ -92,6 +93,21 @@ export interface OrderRepository {
 
   /** The store's most recent orders, newest first — the dashboard's Orders page. */
   listRecentByStore(scope: Scope, storeId: string, limit: number): Promise<OrderRow[]>;
+  /**
+   * Issue #35: one page (ordered by `id`) of orders whose `attribution_confidence` is still `NULL` —
+   * every order created before M1-7's stitching existed. Cross-tenant by nature (a one-time
+   * platform-wide backfill, not one store's data), so it requires a `SystemScope`, same exemption
+   * pattern as `suppressionRebuildRepository`. `storeIds` limits the page to those stores (a targeted
+   * backfill, or a test isolating itself from other stores' rows); omitted, it covers every store.
+   */
+  listMissingAttributionConfidence(
+    scope: Scope,
+    options: {
+      readonly afterId: string | null;
+      readonly limit: number;
+      readonly storeIds?: readonly string[];
+    },
+  ): Promise<readonly { readonly id: string; readonly storeId: string }[]>;
 }
 
 /** The only sanctioned way to read/write `orders`/`order_status_events` (ADR-0016). */
@@ -287,6 +303,22 @@ export function createOrderRepository(db: Db): OrderRepository {
         .where(eq(orders.storeId, storeId))
         .orderBy(desc(orders.createdAtPlatform))
         .limit(limit);
+    },
+
+    async listMissingAttributionConfidence(scope, options) {
+      if (scope.kind !== 'system') throw new SystemScopeRequiredError();
+      const conditions = [isNull(orders.attributionConfidence)];
+      if (options.afterId !== null) conditions.push(gt(orders.id, options.afterId));
+      if (options.storeIds !== undefined) {
+        if (options.storeIds.length === 0) return [];
+        conditions.push(inArray(orders.storeId, [...options.storeIds]));
+      }
+      return db
+        .select({ id: orders.id, storeId: orders.storeId })
+        .from(orders)
+        .where(and(...conditions))
+        .orderBy(asc(orders.id))
+        .limit(options.limit);
     },
   };
 }
