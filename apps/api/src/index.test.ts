@@ -1,7 +1,7 @@
 import { randomBytes } from 'node:crypto';
 import { describe, expect, it } from 'vitest';
 import { parseEnv } from '@truepath/shared';
-import { apiEnvSchema, placeholder } from './index.js';
+import { apiEnvSchema, placeholder, shouldAllowInsecureCookies } from './index.js';
 
 const key = () => randomBytes(32).toString('base64');
 
@@ -37,6 +37,17 @@ function env(overrides: Record<string, string | undefined> = {}): NodeJS.Process
 describe('apps/api', () => {
   it('exposes a placeholder as a smoke test for the build/test pipeline', () => {
     expect(placeholder()).toContain('not yet implemented');
+  });
+});
+
+describe('shouldAllowInsecureCookies (issue #2)', () => {
+  it('is false in production — cookies must be Secure', () => {
+    expect(shouldAllowInsecureCookies('production')).toBe(false);
+  });
+
+  it('is true in development and test, for local plain-HTTP dev', () => {
+    expect(shouldAllowInsecureCookies('development')).toBe(true);
+    expect(shouldAllowInsecureCookies('test')).toBe(true);
   });
 });
 

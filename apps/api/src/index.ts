@@ -53,6 +53,16 @@ export function placeholder(): string {
   return 'apps/api not yet implemented (SPEC §12 M0-4+)';
 }
 
+/**
+ * The boot-time cookie-security decision (issue #2): `createAuth` itself refuses
+ * `allowInsecureCookies: true` when `NODE_ENV=production` (auth-tenancy.md §2.2), so this can never
+ * actually weaken a production deploy — but pulling the decision out as a pure function makes it
+ * something a test can pin down directly, rather than only relying on that throw as a backstop.
+ */
+export function shouldAllowInsecureCookies(nodeEnv: string): boolean {
+  return nodeEnv !== 'production';
+}
+
 function main(): void {
   loadDotEnvIfPresent('../../.env');
   const env = loadEnv(apiEnvSchema);
@@ -84,7 +94,7 @@ function main(): void {
       GOOGLE_CLIENT_SECRET: env.GOOGLE_CLIENT_SECRET,
     },
     redisDurableUrl: env.REDIS_DURABLE_URL,
-    allowInsecureCookies: env.NODE_ENV !== 'production',
+    allowInsecureCookies: shouldAllowInsecureCookies(env.NODE_ENV),
   });
 
   const shopifySyncQueue = new Queue<ShopifySyncJob>(SHOPIFY_SYNC_QUEUE, {
