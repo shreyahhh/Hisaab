@@ -7,7 +7,7 @@ import {
   createStoreRepository,
   ShopLinkedToAnotherOrganizationError,
 } from '@truepath/db';
-import type { ShopifyAdapter } from '@truepath/integrations';
+import type { ShopifyAdapter, ShopifyCredentials } from '@truepath/integrations';
 import type { CredentialsCipher } from '@truepath/privacy';
 import {
   IntegrationProvider,
@@ -237,7 +237,49 @@ export function registerIntegrationRoutes(
     { preHandler: [requireOrgScope(deps), requirePermission('integrations.manage')] },
     async (request, reply) => {
       const scope = request.scope!;
-      const revoked = await createIntegrationRepository(deps.db).revokeForOrganization(
+      const integrationRepo = createIntegrationRepository(deps.db);
+      const existing = await integrationRepo.getByIdForOrganization(
+        scope,
+        scope.organizationId,
+        request.params.integrationId,
+      );
+      if (!existing) {
+        await reply.code(404).send({ error: 'not_found' });
+        return;
+      }
+
+      // Issue #33: call Shopify's appUninstall mutation best-effort *before* wiping our stored
+      // credentials — it is the token that authorizes the call, and appUninstall makes that token
+      // permanently unusable afterward. A failure (already-invalid token, network error, a
+      // Shopify-reported userError) never blocks revoking our own row: our record must not stay
+      // "active" just because Shopify's side failed, and the merchant can always remove the app from
+      // Shopify admin directly regardless.
+      if (existing.provider === 'shopify' && existing.encryptedCredentials) {
+        const store = await createStoreRepository(deps.db).getById(scope, existing.storeId);
+        if (store) {
+          try {
+            const creds = JSON.parse(
+              shopify.cipher.decrypt({ integrationId: existing.id }, existing.encryptedCredentials),
+            ) as ShopifyCredentials;
+            const result = await shopify.adapter.uninstallApp(store.shopDomain, creds);
+            if (!result.success) {
+              request.log.warn({
+                event: 'shopify_app_uninstall_user_errors',
+                integration_id: existing.id,
+                error_count: result.errorCount,
+              });
+            }
+          } catch (error) {
+            request.log.warn({
+              event: 'shopify_app_uninstall_failed',
+              integration_id: existing.id,
+              error_name: error instanceof Error ? error.name : 'unknown_error',
+            });
+          }
+        }
+      }
+
+      const revoked = await integrationRepo.revokeForOrganization(
         scope,
         scope.organizationId,
         request.params.integrationId,

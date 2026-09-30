@@ -58,6 +58,7 @@ function fakeAdapter(options: {
       // no result rows
     },
     upsertWebPixel: async () => ({ pixelId: 'gid://shopify/WebPixel/test' }),
+    uninstallApp: async () => ({ success: true, errorCount: 0 }),
   };
 }
 

@@ -69,6 +69,7 @@ function fakeAdapter(upsertWebPixel: ShopifyAdapter['upsertWebPixel']): ShopifyA
       // none
     },
     upsertWebPixel,
+    uninstallApp: async () => ({ success: true, errorCount: 0 }),
   };
 }
 
