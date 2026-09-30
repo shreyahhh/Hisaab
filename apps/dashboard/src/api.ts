@@ -20,6 +20,10 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
     credentials: 'include',
     headers: {
       ...(init.body ? { 'content-type': 'application/json' } : {}),
+      // Skips ngrok's free-tier browser-warning interstitial (an HTML page with no CORS headers)
+      // when VITE_API_URL points at a tunnel for local Shopify OAuth verification — harmless and
+      // ignored otherwise (docs/m1-verification.md Part A).
+      'ngrok-skip-browser-warning': 'true',
       ...init.headers,
     },
   });
