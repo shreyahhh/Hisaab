@@ -8,7 +8,7 @@ import {
 } from '@truepath/integrations';
 import { CollectorStoreConfig, collectorStoreKey, type TenantScope } from '@truepath/shared';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { publishCollectorConfig } from '../shopifyPixel.js';
+import { completeKeyRotation, publishCollectorConfig, rotateSigningKey } from '../shopifyPixel.js';
 import { issueShopifyOAuthState } from '../shopifyOAuthState.js';
 import {
   buildTestApp,
@@ -441,5 +441,141 @@ describe('POST /v1/orgs/:id/dpa/accept republishes the collector config (issue #
     });
     expect(res.statusCode).toBe(201);
     await app.close();
+  });
+});
+
+describe('rotateSigningKey / completeKeyRotation (S-6, issue #45)', () => {
+  async function connectedForRotation(label: string) {
+    const upsertWebPixel = vi.fn<ShopifyAdapter['upsertWebPixel']>(async () => ({
+      pixelId: 'gid://shopify/WebPixel/1',
+    }));
+    const adapter = fakeAdapter(upsertWebPixel);
+    const app = buildTestApp({
+      shopify: {
+        adapter,
+        cipher: testCredentialsCipher,
+        hasher: testHasher,
+        redis: testRedis,
+        oauthStateSecret: TEST_SHOPIFY_OAUTH_STATE_SECRET,
+        appUrl: 'http://localhost:3000',
+        dashboardUrl: TEST_DASHBOARD_URL,
+        shopifySyncQueue: testShopifySyncQueue,
+        identityStitchQueue: testIdentityStitchQueue,
+        collectorUrl: COLLECTOR_URL,
+      },
+    });
+    const t = await tenant(label);
+    const result = await connect(app, t, shopFor(label));
+    await app.close(); // the HTTP layer isn't needed after connect — the functions under test are called directly
+    upsertWebPixel.mockClear(); // connect() itself calls it once; tests below assert only their own calls
+    const scope: TenantScope = {
+      kind: 'tenant',
+      userId: t.userId,
+      organizationId: t.organizationId,
+      role: 'owner',
+      storeIds: new Set([result.store.id]),
+    };
+    const pixelDeps = {
+      db: testDb,
+      adapter,
+      cipher: testCredentialsCipher,
+      redis: testRedis,
+      collectorUrl: COLLECTOR_URL,
+      dpaVersion: TEST_DPA_VERSION,
+    };
+    return { ...result, scope, pixelDeps, upsertWebPixel };
+  }
+
+  function decryptedKeys(integrationId: string, encrypted: Buffer): readonly { kid: string }[] {
+    const creds = JSON.parse(
+      testCredentialsCipher.decrypt({ integrationId }, encrypted),
+    ) as ShopifyCredentials;
+    return creds.pixelSigningKeys ?? [];
+  }
+
+  it('adds a second key, pushes it to the live pixel, and the config accepts both during rollout', async () => {
+    const c = await connectedForRotation('rotate-add');
+    const before = decryptedKeys(c.integration.id, c.integration.encryptedCredentials!);
+    expect(before).toHaveLength(1);
+    const originalKid = before[0]!.kid;
+
+    const result = await rotateSigningKey(c.pixelDeps, c.scope, c.store.id);
+    expect(result?.newKid).toBe('s2');
+
+    const [updated] = await testDb
+      .select()
+      .from(schema.integrations)
+      .where(eq(schema.integrations.id, c.integration.id));
+    const afterKeys = decryptedKeys(c.integration.id, updated!.encryptedCredentials!);
+    expect(afterKeys.map((k) => k.kid)).toEqual([originalKid, 's2']);
+
+    expect(c.upsertWebPixel).toHaveBeenCalledTimes(1);
+    const settingsArg = c.upsertWebPixel.mock.calls[0]![2] as WebPixelSettings;
+    expect(settingsArg.signingKid).toBe('s2');
+
+    const config = await readConfig(c.settings.store_key!);
+    expect(config?.signingKeys.map((k) => k.kid)).toEqual([originalKid, 's2']);
+  });
+
+  it('without a configured Collector URL, the key is still stored and republished, but Shopify is never called', async () => {
+    const c = await connectedForRotation('rotate-no-collector');
+    const noCollectorDeps = { ...c.pixelDeps, collectorUrl: undefined };
+
+    const result = await rotateSigningKey(noCollectorDeps, c.scope, c.store.id);
+    expect(result?.newKid).toBe('s2');
+    expect(c.upsertWebPixel).not.toHaveBeenCalled();
+
+    const config = await readConfig(c.settings.store_key!);
+    expect(config?.signingKeys.map((k) => k.kid)).toEqual(['s1', 's2']);
+  });
+
+  it('returns null for a store with no active Shopify integration', async () => {
+    const t = await tenant('rotate-no-integration');
+    const scope: TenantScope = {
+      kind: 'tenant',
+      userId: t.userId,
+      organizationId: t.organizationId,
+      role: 'owner',
+      storeIds: new Set([t.storeId]),
+    };
+    const upsertWebPixel = vi.fn(async () => ({ pixelId: 'x' }));
+    const pixelDeps = {
+      db: testDb,
+      adapter: fakeAdapter(upsertWebPixel),
+      cipher: testCredentialsCipher,
+      redis: testRedis,
+      collectorUrl: COLLECTOR_URL,
+      dpaVersion: TEST_DPA_VERSION,
+    };
+    expect(await rotateSigningKey(pixelDeps, scope, t.storeId)).toBeNull();
+    expect(upsertWebPixel).not.toHaveBeenCalled();
+  });
+
+  it('completeKeyRotation drops every key but the newest, and the config narrows immediately', async () => {
+    const c = await connectedForRotation('rotate-complete');
+    await rotateSigningKey(c.pixelDeps, c.scope, c.store.id);
+
+    await completeKeyRotation(c.pixelDeps, c.scope, c.store.id);
+
+    const [updated] = await testDb
+      .select()
+      .from(schema.integrations)
+      .where(eq(schema.integrations.id, c.integration.id));
+    const afterKeys = decryptedKeys(c.integration.id, updated!.encryptedCredentials!);
+    expect(afterKeys.map((k) => k.kid)).toEqual(['s2']);
+
+    const config = await readConfig(c.settings.store_key!);
+    expect(config?.signingKeys.map((k) => k.kid)).toEqual(['s2']);
+  });
+
+  it('completeKeyRotation is a no-op when there is only one key (rotation never started)', async () => {
+    const c = await connectedForRotation('rotate-complete-noop');
+    await completeKeyRotation(c.pixelDeps, c.scope, c.store.id);
+
+    const [updated] = await testDb
+      .select()
+      .from(schema.integrations)
+      .where(eq(schema.integrations.id, c.integration.id));
+    expect(decryptedKeys(c.integration.id, updated!.encryptedCredentials!)).toHaveLength(1);
   });
 });
