@@ -167,3 +167,10 @@ export const META_WARMUP_INTERVAL_MS = 15 * 60_000;
 export function metaWarmupSchedulerId(storeId: string): string {
   return `meta-warmup-${storeId}`;
 }
+
+/**
+ * Issue #32: `shopify_webhook_deliveries` rows are a cross-topic dedup gate, only needed for as long
+ * as Shopify might still retry a delivery (8 attempts over 4 hours). 7 days is a wide margin over
+ * that, matching the ClickHouse retention job's own weekly tolerance (HLD §8, ADR-0015).
+ */
+export const SHOPIFY_WEBHOOK_DELIVERY_RETENTION_DAYS = 7;

@@ -66,8 +66,8 @@ export interface TenantScope {
 }
 
 // auth-tenancy.md §2.3. Cross-tenant jobs (retention, reconcile fan-out, suppression rehydration,
-// key rotation, breach admin, scheduler fan-out, org deletion) construct this explicitly via
-// packages/db's `createSystemScope`, which audits every use (ADR-0016).
+// key rotation, breach admin, scheduler fan-out, org deletion, webhook delivery pruning) construct
+// this explicitly via packages/db's `createSystemScope`, which audits every use (ADR-0016).
 export const SYSTEM_REASONS = [
   'retention',
   'order_status_reconcile',
@@ -78,6 +78,7 @@ export const SYSTEM_REASONS = [
   'breach_admin',
   'scheduler_fanout',
   'org_deletion',
+  'webhook_delivery_prune',
 ] as const;
 export type SystemReason = (typeof SYSTEM_REASONS)[number];
 

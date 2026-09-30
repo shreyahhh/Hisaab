@@ -1,7 +1,8 @@
-import { and, eq } from 'drizzle-orm';
+import { and, eq, inArray, lt } from 'drizzle-orm';
 import { assertStoreInScope, type Scope } from '@truepath/shared';
 import type { Db } from '../client.js';
 import { shopifyWebhookDeliveries } from '../schema/index.js';
+import { SystemScopeRequiredError } from './suppressionRebuildRepository.js';
 
 export interface WebhookDeliveryKey {
   readonly storeId: string;
@@ -30,6 +31,19 @@ export interface WebhookDeliveryRepository {
     scope: Scope,
     input: RecordWebhookDeliveryInput,
   ): Promise<{ readonly isNew: boolean }>;
+  /**
+   * Deletes delivery-dedup rows whose `receivedAt` is older than `olderThan` (issue #32).
+   * Cross-tenant by nature (a single housekeeping sweep, not scoped to one store's data), so it
+   * requires a `SystemScope` — same exemption pattern as
+   * `suppressionRebuildRepository`/`metaWarmupSchedulingRepository`. `storeIds` limits the sweep to
+   * those stores (a targeted prune, or a test isolating itself from other stores' rows); omitted,
+   * it sweeps every store.
+   */
+  pruneOlderThan(
+    scope: Scope,
+    olderThan: Date,
+    storeIds?: readonly string[],
+  ): Promise<{ readonly deleted: number }>;
 }
 
 /** The only sanctioned way to read/write `shopify_webhook_deliveries` (ADR-0016). */
@@ -58,6 +72,22 @@ export function createWebhookDeliveryRepository(db: Db): WebhookDeliveryReposito
         .onConflictDoNothing()
         .returning({ id: shopifyWebhookDeliveries.id });
       return { isNew: inserted.length > 0 };
+    },
+
+    async pruneOlderThan(scope, olderThan, storeIds) {
+      if (scope.kind !== 'system') throw new SystemScopeRequiredError();
+      const condition =
+        storeIds && storeIds.length > 0
+          ? and(
+              lt(shopifyWebhookDeliveries.receivedAt, olderThan),
+              inArray(shopifyWebhookDeliveries.storeId, storeIds),
+            )
+          : lt(shopifyWebhookDeliveries.receivedAt, olderThan);
+      const deleted = await db
+        .delete(shopifyWebhookDeliveries)
+        .where(condition)
+        .returning({ id: shopifyWebhookDeliveries.id });
+      return { deleted: deleted.length };
     },
   };
 }

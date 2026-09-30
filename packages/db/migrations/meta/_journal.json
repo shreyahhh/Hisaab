@@ -71,6 +71,13 @@
       "when": 1790537245286,
       "tag": "0009_order_events_dedupe_and_nullable_attribution_confidence",
       "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "7",
+      "when": 1790799106993,
+      "tag": "0010_audit_log_webhook_deliveries_pruned",
+      "breakpoints": true
     }
   ]
 }
