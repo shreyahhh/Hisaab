@@ -6,8 +6,9 @@ import { stores } from './tenancy.js';
 // `app/uninstalled` and future order/refund/fulfillment topics get the same replay protection the
 // compliance topics already had via `dsr_requests`' own dedupe. Not store_id-prefixed-key Redis (HLD
 // §8's dedup pattern is for the pixel event stream); a Postgres table survives Shopify's retries over
-// hours without needing a TTL policy decision up front. Cleanup of old rows is a follow-up (tracked),
-// since nothing needs to remember a delivery once Shopify's 8x/4h retry window has passed.
+// hours without needing a TTL policy decision up front. Old rows are pruned by
+// `apps/workers/src/webhookDeliveryPrune.ts` (issue #32), invoked via `dev:prune-webhook-deliveries`
+// until a scheduled-job runner exists to call it automatically.
 export const shopifyWebhookDeliveries = pgTable(
   'shopify_webhook_deliveries',
   {

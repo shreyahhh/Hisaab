@@ -78,6 +78,7 @@ export const AUDIT_ACTIONS = [
   'retention_run',
   'system_scope_used',
   'suppression_rebuilt',
+  'webhook_deliveries_pruned',
   'breach_created',
   'breach_confirmed',
   'breach_notified',
