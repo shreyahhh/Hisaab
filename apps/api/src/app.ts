@@ -178,7 +178,11 @@ export function buildApp(deps: AppDeps): FastifyInstance {
     };
     registerAuthWrapperRoutes(scope, tenantDeps, limits);
     registerMeRoutes(scope, tenantDeps);
-    registerOrgRoutes(scope, tenantDeps);
+    registerOrgRoutes(scope, tenantDeps, {
+      dpaVersion: deps.dpaVersion,
+      cipher: deps.shopify.cipher,
+      redis: deps.shopify.redis,
+    });
     registerInviteRoutes(scope, tenantDeps, limits);
     registerMemberRoutes(scope, tenantDeps);
     registerDpaRoutes(scope, tenantDeps, {

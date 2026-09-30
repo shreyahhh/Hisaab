@@ -63,6 +63,11 @@ export {
   type WebhookDeliveryRepository,
 } from './repositories/webhookDeliveryRepository.js';
 export {
+  createOrganizationRepository,
+  type OrganizationRepository,
+  type OrganizationRow,
+} from './repositories/organizationRepository.js';
+export {
   publishCollectorConfig,
   noticeVersionOf,
   type CollectorConfigDeps,
