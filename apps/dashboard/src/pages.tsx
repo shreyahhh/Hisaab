@@ -66,7 +66,12 @@ export function LoginPage() {
       }
     },
     onSuccess: async () => {
-      await qc.invalidateQueries({ queryKey: ['me'] });
+      // A plain invalidate leaves the previous 401 (from before login) sitting in the cache until
+      // the background refetch resolves — HomeRedirect's guard reads that stale error on its very
+      // first render and bounces straight back to /login. Removing the entry instead makes the next
+      // mount start from a genuine "loading" state.
+      qc.removeQueries({ queryKey: ['me'] });
+      qc.removeQueries({ queryKey: ['orgs'] });
       await navigate({ to: '/' });
     },
     onError: (err) => {

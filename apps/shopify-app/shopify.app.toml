@@ -1,0 +1,25 @@
+# Learn more about configuring your app at https://shopify.dev/docs/apps/tools/cli/configuration
+#
+# application_url / auth.redirect_urls below are whatever local ngrok tunnel was active the last
+# time `shopify app deploy` ran (docs/m1-verification.md, issue #67) — they go stale as soon as the
+# tunnel restarts with a new subdomain. Re-run `shopify app deploy` after updating them for a new
+# tunnel; don't rely on this file's URLs being current.
+
+client_id = "6681fe25cb6f3beb8b97d9cdbd41630d"
+application_url = "https://27d6-2401-4900-1f38-375f-349f-6c02-12d6-9c12.ngrok-free.app"
+embedded = true
+name = "Louis Belcher"
+
+[webhooks]
+api_version = "2026-07"
+
+[access_scopes]
+# Learn more at https://shopify.dev/docs/apps/tools/cli/configuration#access_scopes
+scopes = "read_orders,write_pixels,read_customer_events"
+optional_scopes = [ ]
+use_legacy_install_flow = false
+
+[auth]
+redirect_urls = [
+  "https://27d6-2401-4900-1f38-375f-349f-6c02-12d6-9c12.ngrok-free.app/v1/integrations/shopify/callback"
+]

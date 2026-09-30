@@ -4,6 +4,7 @@
 type = "web_pixel_extension"
 name = "TruePath"
 runtime_context = "strict"
+uid = "89922527-0678-3699-dc86-99e2f586b83b920a9954"
 
 # Consent gating (SPEC P-1): Shopify loads this pixel only when the shopper has consented to
 # analytics processing. Marketing consent is NOT required to load — the pixel reports it per batch
