@@ -1,5 +1,6 @@
 import type { FastifyInstance } from 'fastify';
 import type { Queue } from 'bullmq';
+import type { Redis } from 'ioredis';
 import { z, type ZodError } from 'zod';
 import {
   createDsrRequestRepository,
@@ -33,6 +34,7 @@ import {
   type TenantScope,
 } from '@truepath/shared';
 import { fetchOrderWithTokenRefresh } from '../shopifyOrderCredentials.js';
+import { deleteCollectorConfig } from '../shopifyPixel.js';
 import type { TenantScopeDeps } from '../tenantScope.js';
 
 // POST /webhooks/shopify/:topic (shopify-integration.md §2.2, §2.4, §4.2-§4.8). M1-1 built
@@ -77,8 +79,11 @@ export interface ShopifyWebhookDeps {
   readonly hasher: IdentityHasher;
   readonly cipher: CredentialsCipher;
   readonly shopifySyncQueue: Queue<ShopifySyncJob>;
-  /** Durable Redis: read for the erased-identity list when an order is stored (HLD §6b). */
-  readonly redis: SuppressionReader;
+  /**
+   * Durable Redis: read for the erased-identity list when an order is stored (HLD §6b), and `del`
+   * to drop the collector config on `app/uninstalled` (issue #44).
+   */
+  readonly redis: SuppressionReader & Pick<Redis, 'del'>;
   /** HLD §8 `identity-stitch`: an applied order enqueues attempt 0 (identity-stitching.md §2.1). */
   readonly identityStitchQueue: Pick<Queue<IdentityStitchJob>, 'add'>;
 }
@@ -96,13 +101,14 @@ function zodIssuePaths(error: ZodError): string[] {
 }
 
 async function handleAppUninstalled(
-  deps: TenantScopeDeps,
+  deps: TenantScopeDeps & Pick<ShopifyWebhookDeps, 'redis'>,
   scope: TenantScope,
   storeId: string,
 ): Promise<void> {
   const store = await createStoreRepository(deps.db).markUninstalled(scope, storeId);
   const integration = await createIntegrationRepository(deps.db).markUninstalled(scope, storeId);
   if (!store) return; // already uninstalled — Shopify's retries make this idempotent, not an error
+  if (integration) await deleteCollectorConfig(deps.redis, integration.settings);
   await deps.audit.log.write(scope, {
     organizationId: scope.organizationId,
     actorUserId: null,
@@ -485,7 +491,7 @@ export function registerShopifyWebhookRoutes(
         }
 
         if (shopifyTopic === 'app/uninstalled') {
-          await handleAppUninstalled(deps, scope, resolved.id);
+          await handleAppUninstalled({ ...deps, redis: webhook.redis }, scope, resolved.id);
         } else if (
           shopifyTopic === 'customers/data_request' ||
           shopifyTopic === 'customers/redact' ||

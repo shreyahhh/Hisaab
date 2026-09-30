@@ -2,6 +2,7 @@ import { eq } from 'drizzle-orm';
 import { resolveMembership } from '@truepath/auth';
 import { schema } from '@truepath/db';
 import type { ShopifyAdapter, ShopifyCredentials, ShopifyShopInfo } from '@truepath/integrations';
+import { collectorStoreKey } from '@truepath/shared';
 import { afterEach, describe, expect, it } from 'vitest';
 import { issueShopifyOAuthState } from '../shopifyOAuthState.js';
 import {
@@ -607,6 +608,46 @@ describe('DELETE /v1/orgs/:id/integrations/:integrationId', () => {
         .from(schema.auditLog)
         .where(eq(schema.auditLog.targetId, integration!.id));
       expect(disconnectRows.some((r) => r.action === 'integration_disconnected')).toBe(true);
+
+      await testDb.delete(schema.integrations).where(eq(schema.integrations.id, integration!.id));
+      await testDb.delete(schema.stores).where(eq(schema.stores.id, store!.id));
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('deletes the collector:store:<store_key> config (issue #44) so a later reconnect cannot reuse a revoked key', async () => {
+    const app = appWith();
+    try {
+      const t = await tenant('delete-collector-config');
+      const shop = shopFor('delete-collector-config');
+      const state = await issueState(t, shop);
+      await app.inject({
+        method: 'GET',
+        url: `/v1/integrations/shopify/callback?shop=${shop}&code=c&state=${encodeURIComponent(state)}`,
+        headers: { cookie: t.cookie },
+      });
+      const [store] = await testDb
+        .select()
+        .from(schema.stores)
+        .where(eq(schema.stores.shopDomain, shop));
+      const [integration] = await testDb
+        .select()
+        .from(schema.integrations)
+        .where(eq(schema.integrations.storeId, store!.id));
+      const storeKey = (integration!.settings as Record<string, string>).store_key!;
+      const redisKey = collectorStoreKey(storeKey);
+      // The connect flow itself publishes a config (even inactive, DPA/opt-in pending) — confirm it
+      // exists before asserting DELETE removes it, so this is a real repro, not a vacuous pass.
+      expect(await testRedis.get(redisKey)).not.toBeNull();
+
+      const res = await app.inject({
+        method: 'DELETE',
+        url: `/v1/orgs/${t.organizationId}/integrations/${integration!.id}`,
+        headers: { cookie: t.cookie, origin: ORIGIN },
+      });
+      expect(res.statusCode).toBe(204);
+      expect(await testRedis.get(redisKey)).toBeNull();
 
       await testDb.delete(schema.integrations).where(eq(schema.integrations.id, integration!.id));
       await testDb.delete(schema.stores).where(eq(schema.stores.id, store!.id));

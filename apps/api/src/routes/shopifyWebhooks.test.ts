@@ -1,7 +1,7 @@
 import { createHmac, randomUUID } from 'node:crypto';
 import { cleanupTestTenant, seedTestTenant, type TestTenant } from '@truepath/db/testing';
 import { storeContext } from '@truepath/privacy';
-import { storeBoundScope, suppressionSetKey } from '@truepath/shared';
+import { collectorStoreKey, storeBoundScope, suppressionSetKey } from '@truepath/shared';
 import { createIntegrationRepository, jobScope, schema, type Db } from '@truepath/db';
 import type { ShopifyAdapter, ShopifyOrderSnapshot } from '@truepath/integrations';
 import { eq } from 'drizzle-orm';
@@ -279,6 +279,39 @@ describe('POST /webhooks/shopify/app — app/uninstalled', () => {
       .from(schema.auditLog)
       .where(eq(schema.auditLog.targetId, integration.id));
     expect(auditRows.some((r) => r.action === 'integration_disconnected')).toBe(true);
+  });
+
+  it('deletes the collector:store:<store_key> config so the signing secret does not outlive the integration (issue #44)', async () => {
+    const t = await tenant('webhook-uninstall-collector-config');
+    const [store] = await testDb
+      .select()
+      .from(schema.stores)
+      .where(eq(schema.stores.id, t.storeId));
+    await createIntegrationRepository(testDb).upsertShopify(jobScope(t.organizationId, t.storeId), {
+      storeId: t.storeId,
+      externalAccountId: 'gid://shopify/Shop/uninstall-config',
+      credentialsJson: '{"accessToken":"shpat_x"}',
+      scopes: ['read_orders'],
+      cipher: testCredentialsCipher,
+    });
+    const storeKey = 'pk_' + 'a'.repeat(24);
+    await createIntegrationRepository(testDb).patchShopifySettings(
+      jobScope(t.organizationId, t.storeId),
+      t.storeId,
+      { store_key: storeKey },
+    );
+    const key = collectorStoreKey(storeKey);
+    await testRedis.set(key, JSON.stringify({ storeId: t.storeId, status: 'active' }));
+    cleanups.push(async () => void (await testRedis.del(key)));
+
+    const res = await sendWebhook({
+      topic: 'app',
+      shopifyTopic: 'app/uninstalled',
+      shopDomain: store!.shopDomain,
+      body: { id: 1 },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(await testRedis.get(key)).toBeNull();
   });
 
   it('is idempotent: a retried webhook does not write a second audit row', async () => {
