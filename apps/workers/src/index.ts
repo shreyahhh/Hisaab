@@ -42,11 +42,11 @@ import { StoreContextCache } from './storeEventContext.js';
 import { SuppressionRebuilder } from './suppressionRebuild.js';
 
 // Workers (HLD §8): shopify-sync (M1-3), event-workers (M1-6, the `stream:events-raw` consumer group),
-// identity-stitch (M1-7), the `meta-warmup` slice of ad-sync-meta (M1-8) and `dsr` (`erasure` only,
-// issue #25) are built; the rest of ad-sync-meta, ad-sync-google-ads, shiprocket-sync, attribution-run
-// (enqueued to by identity-stitch and `dsr`; its consumer is M3-2), capi-dispatch,
-// order-status-reconcile and retention land in later milestones. No cache-Redis connection — that
-// instance is only used by the API (report cache) and Better Auth rate limiting.
+// identity-stitch (M1-7), the `meta-warmup` slice of ad-sync-meta (M1-8) and `dsr` (`erasure` and
+// `store_erasure`, issue #25) are built; the rest of ad-sync-meta, ad-sync-google-ads,
+// shiprocket-sync, attribution-run (enqueued to by identity-stitch and `dsr`; its consumer is M3-2),
+// capi-dispatch, order-status-reconcile and retention land in later milestones. No cache-Redis
+// connection — that instance is only used by the API (report cache) and Better Auth rate limiting.
 export const workersEnvSchema = postgresEnvSchema
   .and(clickhouseEnvSchema)
   .and(redisDurableEnvSchema)
@@ -131,10 +131,11 @@ function main(): void {
   );
   console.log('apps/workers: identity-stitch worker listening');
 
-  // dsr (issue #25): fulfils `erasure` jobs (webhook, withdrawal and follow-up scopes); `store_erasure`
-  // lands with the third PR, `access`/`correction` have no producer yet. A job's last failure is
-  // copied to `dsr-failed` (HLD §8), and marks the request `status='failed'` (never downgrading an
-  // already-`completed` row — a follow-up purge failing must not un-complete the original erasure).
+  // dsr (issue #25): fulfils `erasure` jobs (webhook, withdrawal and follow-up scopes) and
+  // `store_erasure` (offboarding, §4.7); `access`/`correction` have no producer yet. A job's last
+  // failure is copied to `dsr-failed` (HLD §8), and marks the request `status='failed'` (never
+  // downgrading an already-`completed` row — a follow-up purge failing must not un-complete the
+  // original erasure).
   const dsrWorker = new Worker<DsrJob>(
     DSR_QUEUE,
     createDsrProcessor(

@@ -500,7 +500,7 @@ describe('ch() — scoped ClickHouse query builder (ADR-0016)', () => {
       await ch(client, tenantScope(storeF), storeF).delete({ table: 'order_status' });
       expect(await countFor(storeF)).toBe(0);
       expect(await countFor(storeG)).toBe(1); // storeG's row survives a storeF-scoped delete
-    });
+    }, 20_000);
 
     it('rejects an unknown table name before running anything', async () => {
       const scoped = ch(client, tenantScope(storeG), storeG);

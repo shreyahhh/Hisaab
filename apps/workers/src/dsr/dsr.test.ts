@@ -15,6 +15,7 @@ import { createTestIdentityHasher } from '@truepath/privacy/testing';
 import {
   IDENTITY_GUARD,
   clickhouseEnvSchema,
+  collectorStoreKey,
   loadDotEnvIfPresent,
   loadEnv,
   storeBoundScope,
@@ -491,8 +492,116 @@ describe('processDsr — follow-up erasure after a suppression_hit (§4.4 step 9
   }, 20_000);
 });
 
+describe('processDsr — store_erasure (§4.7, offboarding)', () => {
+  it('deletes every ClickHouse/Postgres row and Redis key for the store, deletes the collector config, and marks the store deleted', async () => {
+    const tenant = await seedTestTenant('dsr-store-erasure');
+    try {
+      const visitorId = 'visitor-store-erasure';
+      const [order] = await db
+        .insert(schema.orders)
+        .values({
+          storeId: tenant.storeId,
+          externalOrderId: 'se-1',
+          createdAtPlatform: NOW,
+          totalAmountPaise: 100000,
+          currency: 'INR',
+          paymentMethod: 'cod',
+          visitorId,
+        })
+        .returning();
+      await seedVisitorRows(tenant, visitorId, order!.id);
+      await db.insert(schema.consentRecords).values({
+        id: randomUUID(),
+        storeId: tenant.storeId,
+        visitorId: visitorHmac(tenant, visitorId),
+        purposes: ['attribution_analytics'],
+        state: 'granted',
+        noticeVersion: 'v1',
+        source: 'pixel_initial_state',
+        occurredAt: NOW,
+      });
+      const storeKey = 'pk_' + 'c'.repeat(24);
+      await db.insert(schema.integrations).values({
+        storeId: tenant.storeId,
+        provider: 'shopify',
+        status: 'revoked',
+        settings: { store_key: storeKey },
+      });
+      await redis.set(collectorStoreKey(storeKey), '{}');
+      await redis.set(`session:${tenant.storeId}:${visitorId}`, '{}');
+      await redis.set(`checkout:${tenant.storeId}:${order!.externalOrderId}`, visitorId);
+      await redis.set(`dedupe:${tenant.storeId}:some-event-id`, 'done');
+
+      const { row } = await dsrRequests.createFromWebhook(storeBoundScope(tenant.storeId), {
+        storeId: tenant.storeId,
+        type: 'store_erasure',
+        identityHash: null,
+        dueAt: new Date(NOW.getTime() + 7 * 86_400_000),
+        sourceRef: 'wh-store-erasure-1',
+      });
+
+      const outcome = await processDsr(
+        deps(),
+        { storeId: tenant.storeId, type: 'store_erasure', requestId: row.id },
+        'job-store-erasure-1',
+      );
+      expect(outcome).toMatchObject({ kind: 'store_erasure', ordersDeleted: 1 });
+
+      expect(await countCh(tenant, 'events', visitorId)).toBe(0);
+      expect(
+        (await db.select().from(schema.orders).where(eq(schema.orders.storeId, tenant.storeId)))
+          .length,
+      ).toBe(0);
+      expect(
+        (
+          await db
+            .select()
+            .from(schema.consentRecords)
+            .where(eq(schema.consentRecords.storeId, tenant.storeId))
+        ).length,
+      ).toBe(0);
+      expect(
+        (
+          await db
+            .select()
+            .from(schema.integrations)
+            .where(eq(schema.integrations.storeId, tenant.storeId))
+        ).length,
+      ).toBe(0);
+      expect(await redis.exists(collectorStoreKey(storeKey))).toBe(0);
+      expect(await redis.exists(`session:${tenant.storeId}:${visitorId}`)).toBe(0);
+      expect(await redis.exists(`checkout:${tenant.storeId}:${order!.externalOrderId}`)).toBe(0);
+      expect(await redis.exists(`dedupe:${tenant.storeId}:some-event-id`)).toBe(0);
+
+      const [storeRow] = await db
+        .select()
+        .from(schema.stores)
+        .where(eq(schema.stores.id, tenant.storeId));
+      expect(storeRow).toMatchObject({ status: 'deleted', privacyConfig: {} });
+
+      const [completed] = await dsrRequests.listRecentByStore(
+        storeBoundScope(tenant.storeId),
+        tenant.storeId,
+        1,
+      );
+      expect(completed).toMatchObject({ id: row.id, status: 'completed' });
+      expect(await auditCountFor(row.id, 'dsr_completed')).toBe(1);
+
+      // Redelivery is a no-op.
+      const redelivered = await processDsr(
+        deps(),
+        { storeId: tenant.storeId, type: 'store_erasure', requestId: row.id },
+        'job-store-erasure-1-retry',
+      );
+      expect(redelivered).toEqual({ kind: 'already_completed' });
+    } finally {
+      await cleanupTestTenant(tenant);
+    }
+  }, 20_000);
+});
+
 describe('processDsr — unimplemented types', () => {
-  it.each(['access', 'correction', 'store_erasure'] as const)('rejects type %s', async (type) => {
+  it.each(['access', 'correction'] as const)('rejects type %s', async (type) => {
     await expect(
       processDsr(deps(), { storeId: A.storeId, type, requestId: randomUUID() }, 'job-x'),
     ).rejects.toThrow(DsrTypeNotImplementedError);

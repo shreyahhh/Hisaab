@@ -8,6 +8,7 @@ import {
   createOrderRepository,
   createStoreRepository,
   createWebhookDeliveryRepository,
+  deleteCollectorConfig,
   jobScope,
   resolveStoreByShopDomain,
 } from '@truepath/db';
@@ -30,13 +31,13 @@ import {
   DSR_JOB_OPTIONS,
   IDENTITY_STITCH_JOB_OPTIONS,
   identityStitchJobId,
+  STORE_ERASURE_DELAY_MS,
   type DsrJob,
   type IdentityStitchJob,
   type ShopifySyncJob,
   type TenantScope,
 } from '@truepath/shared';
 import { fetchOrderWithTokenRefresh } from '../shopifyOrderCredentials.js';
-import { deleteCollectorConfig } from '../shopifyPixel.js';
 import type { TenantScopeDeps } from '../tenantScope.js';
 
 // POST /webhooks/shopify/:topic (shopify-integration.md §2.2, §2.4, §4.2-§4.8). M1-1 built
@@ -89,9 +90,8 @@ export interface ShopifyWebhookDeps {
   /** HLD §8 `identity-stitch`: an applied order enqueues attempt 0 (identity-stitching.md §2.1). */
   readonly identityStitchQueue: Pick<Queue<IdentityStitchJob>, 'add'>;
   /**
-   * HLD §8 `dsr`: `customers/redact` enqueues its erasure job immediately. `store_erasure`
-   * (`shop/redact`) isn't enqueued yet — issue #25's third PR adds that alongside its fulfilment, so
-   * the receipt-only M1-1 behaviour for it is unchanged here.
+   * HLD §8 `dsr`: `customers/redact` enqueues its erasure job immediately; `shop/redact` enqueues
+   * `store_erasure` delayed `STORE_ERASURE_DELAY_MS` (7 days, privacy-dpdp.md §4.7 step 2).
    */
   readonly dsrQueue: Pick<Queue<DsrJob>, 'add'>;
 }
@@ -181,13 +181,20 @@ async function handleComplianceWebhook(
     metadata: { type, trigger: 'shopify_webhook' },
   });
 
-  // `access` isn't enqueued (SPEC v0.5: needs an S3 export bucket, out of this phase); `store_erasure`
-  // isn't enqueued yet either (issue #25's third PR adds it alongside its fulfilment).
+  // `access` isn't enqueued (SPEC v0.5: needs an S3 export bucket, out of this phase).
   if (type === 'erasure') {
     await deps.dsrQueue.add(
       'erasure',
       { storeId, type: 'erasure', requestId: row.id },
       { jobId: `dsr-${row.id}`, ...DSR_JOB_OPTIONS },
+    );
+  } else if (type === 'store_erasure') {
+    // Delayed 7 days (privacy-dpdp.md §4.7 step 2): keeps the export window open, within Shopify's
+    // 30-day deadline.
+    await deps.dsrQueue.add(
+      'store_erasure',
+      { storeId, type: 'store_erasure', requestId: row.id },
+      { jobId: `dsr-${row.id}`, delay: STORE_ERASURE_DELAY_MS, ...DSR_JOB_OPTIONS },
     );
   }
 }

@@ -14,11 +14,12 @@ import {
   runWithdrawalErasure,
   type ErasureDeps,
 } from './erasure.js';
+import { runStoreErasure } from './storeErasure.js';
 
-// The `dsr` queue's BullMQ processor (HLD §8; privacy-dpdp.md §4.4/§4.5). `erasure` is the only type
-// fulfilled here — `store_erasure` lands with issue #25's third PR, `access`/`correction` have no
-// producer yet (SPEC v0.5: access needs an S3 export bucket this phase doesn't build; correction has
-// no caller anywhere in the codebase).
+// The `dsr` queue's BullMQ processor (HLD §8; privacy-dpdp.md §4.4/§4.5/§4.7). `erasure` and
+// `store_erasure` are fulfilled here; `access`/`correction` have no producer yet (SPEC v0.5: access
+// needs an S3 export bucket this phase doesn't build; correction has no caller anywhere in the
+// codebase).
 
 export class DsrTypeNotImplementedError extends Error {
   constructor(type: string) {
@@ -28,7 +29,7 @@ export class DsrTypeNotImplementedError extends Error {
 }
 
 export interface DsrWorkerDeps extends ErasureDeps {
-  readonly redis: ErasureDeps['redis'] & Pick<Redis, 'exists'>;
+  readonly redis: ErasureDeps['redis'] & Pick<Redis, 'exists' | 'scan'>;
   /** The suppression readiness marker; only tests override the default. */
   readonly readyKey?: string;
 }
@@ -41,19 +42,23 @@ export type DsrOutcome =
       readonly ordersAffected: number;
     }
   | { readonly kind: 'followup'; readonly visitorsScoped: number; readonly ordersAffected: number }
+  | { readonly kind: 'store_erasure'; readonly ordersDeleted: number }
   | { readonly kind: 'already_completed' };
 
 /**
- * Dispatches one `erasure` job to the right scope (webhook / withdrawal / follow-up), per the
- * `resultSummary.trigger` the request was created with (erasure.ts's module comment explains why that,
- * not the job payload, is what distinguishes a follow-up from a withdrawal — both carry `visitorIds`).
+ * Dispatches one `erasure`/`store_erasure` job to the right scope (webhook / withdrawal / follow-up /
+ * store-wide), per the `resultSummary.trigger` the request was created with for `erasure` (erasure.ts's
+ * module comment explains why that, not the job payload, is what distinguishes a follow-up from a
+ * withdrawal — both carry `visitorIds`).
  */
 export async function processDsr(
   deps: DsrWorkerDeps,
   job: DsrJob,
   jobId: string,
 ): Promise<DsrOutcome> {
-  if (job.type !== 'erasure') throw new DsrTypeNotImplementedError(job.type);
+  if (job.type !== 'erasure' && job.type !== 'store_erasure') {
+    throw new DsrTypeNotImplementedError(job.type);
+  }
 
   const scope = storeBoundScope(job.storeId);
   const store = await createStoreRepository(deps.db).getById(scope, job.storeId);
@@ -66,6 +71,13 @@ export async function processDsr(
     job.storeId,
     job.requestId,
   );
+
+  if (job.type === 'store_erasure') {
+    if (alreadyCompleted) return { kind: 'already_completed' };
+    const result = await runStoreErasure(deps, job.storeId, row);
+    return { kind: 'store_erasure', ordersDeleted: result.ordersDeleted };
+  }
+
   const trigger = (row.resultSummary as { trigger?: string } | null)?.trigger;
 
   const audit = createAuditLogRepository(deps.db);
