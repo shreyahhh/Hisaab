@@ -1,3 +1,4 @@
+import type { Queue } from 'bullmq';
 import type { FastifyInstance } from 'fastify';
 import {
   createAuditLogRepository,
@@ -6,8 +7,10 @@ import {
   createStoreRepository,
   createSuppressedIdentityRepository,
 } from '@truepath/db';
-import type { CredentialsCipher } from '@truepath/privacy';
+import { storeContext, type CredentialsCipher, type IdentityHasher } from '@truepath/privacy';
+import { DSR_JOB_OPTIONS, type DsrJob } from '@truepath/shared';
 import type { Redis } from 'ioredis';
+import { z } from 'zod';
 import { publishCollectorConfig } from '../shopifyPixel.js';
 import { requirePermission, requireStoreScope, type TenantScopeDeps } from '../tenantScope.js';
 
@@ -17,7 +20,29 @@ export interface PrivacyDashboardRouteOptions {
   readonly cipher: CredentialsCipher;
   /** Durable Redis — where `collector:store:<store_key>` configs live. */
   readonly redis: Redis;
+  /** Hashes the phone/email a merchant submits on `POST .../privacy/requests` (issue #92). */
+  readonly hasher: IdentityHasher;
+  /** HLD §8 `dsr` queue — a merchant-created `erasure`/`correction` request is enqueued immediately. */
+  readonly dsrQueue: Pick<Queue<DsrJob>, 'add'>;
 }
+
+// privacy-dpdp.md §4.3 step 1 / §4.6 step 1: the merchant-initiated DSR request body (SPEC §10).
+// `access` validates but is rejected with a clear error before any row is written — its fulfilment
+// needs an S3 export bucket this phase doesn't provision (issue #91) — rather than creating a request
+// that would sit `pending` forever with nothing to process it.
+const PrivacyRequestBody = z
+  .object({
+    type: z.enum(['access', 'erasure', 'correction']),
+    phone: z.string().min(1).max(32).optional(),
+    email: z.string().min(1).max(320).optional(),
+  })
+  .strict()
+  .refine((b) => (b.phone !== undefined) !== (b.email !== undefined), {
+    message: 'exactly one of phone or email is required',
+  });
+
+/** SPEC §5.7: every DSR request's due_at is 7 days out, merchant- or webhook-initiated alike. */
+const DSR_SLA_MS = 7 * 24 * 60 * 60 * 1000;
 
 /**
  * `GET /v1/stores/:id/privacy/consent-stats` and `GET /v1/stores/:id/privacy/requests` (SPEC §10).
@@ -77,6 +102,76 @@ export function registerPrivacyDashboardRoutes(
         })),
         // M4-2 fulfils these rows (export/erasure); until then every request just sits `pending`.
         note: 'Processing (export/erasure) arrives in M4 — requests are recorded but not yet fulfilled.',
+      });
+    },
+  );
+
+  /**
+   * `POST /v1/stores/:id/privacy/requests` (SPEC §10, issue #92): the merchant enters a shopper's
+   * phone or email; it's hashed immediately (the raw value is never stored) and matched against
+   * ClickHouse/Postgres by `resolveErasureScope`'s one-hop expansion when the job runs, not here.
+   * `erasure` and `correction` are enqueued right away; `access` is rejected before any row is
+   * written (issue #91 — no S3 export bucket yet to fulfil it against).
+   */
+  app.post<{ Params: { storeId: string }; Body: unknown }>(
+    '/v1/stores/:storeId/privacy/requests',
+    { preHandler: [requireStoreScope(deps), requirePermission('privacy.requests')] },
+    async (request, reply) => {
+      const scope = request.scope!;
+      const storeId = request.params.storeId;
+
+      const body = PrivacyRequestBody.safeParse(request.body);
+      if (!body.success) {
+        await reply.code(400).send({ error: 'invalid_body', fields: ['type', 'phone', 'email'] });
+        return;
+      }
+      const { type } = body.data;
+
+      if (type === 'access') {
+        await reply.code(409).send({
+          error: 'access_not_available',
+          detail:
+            'DSR access export needs an export store this environment does not provision yet.',
+        });
+        return;
+      }
+
+      const context = storeContext(storeId);
+      const identityHash =
+        body.data.phone !== undefined
+          ? options.hasher.hashPhone(context, body.data.phone)
+          : options.hasher.hashEmail(context, body.data.email!);
+      if (identityHash === null) {
+        await reply.code(400).send({ error: 'invalid_identifier' });
+        return;
+      }
+
+      const row = await createDsrRequestRepository(deps.db).createFromMerchant(scope, {
+        storeId,
+        type,
+        identityHash,
+        dueAt: new Date(Date.now() + DSR_SLA_MS),
+      });
+      await createAuditLogRepository(deps.db).write(scope, {
+        organizationId: scope.organizationId,
+        actorUserId: scope.userId,
+        actorType: 'user',
+        action: 'dsr_created',
+        targetType: 'dsr_request',
+        targetId: row.id,
+        metadata: { type, trigger: 'merchant' },
+      });
+      await options.dsrQueue.add(
+        type,
+        { storeId, type, requestId: row.id },
+        { jobId: `dsr-${row.id}`, ...DSR_JOB_OPTIONS },
+      );
+
+      await reply.code(201).send({
+        id: row.id,
+        type: row.type,
+        status: row.status,
+        due_at: row.dueAt.toISOString(),
       });
     },
   );

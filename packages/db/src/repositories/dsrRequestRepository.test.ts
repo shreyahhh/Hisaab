@@ -37,6 +37,35 @@ describe('DsrRequestRepository (shopify-integration.md §4.3)', () => {
     }
   });
 
+  it('createFromMerchant: creates a row with trigger=merchant, no dedupe key (issue #92)', async () => {
+    const tenant = await seedTestTenant('dsr-repo-merchant');
+    try {
+      const repo = createDsrRequestRepository(db);
+      const scope = jobScope(tenant.organizationId, tenant.storeId);
+      const row = await repo.createFromMerchant(scope, {
+        storeId: tenant.storeId,
+        type: 'correction',
+        identityHash: 'k1:' + 'd'.repeat(64),
+        dueAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
+      });
+      expect(row.type).toBe('correction');
+      expect(row.status).toBe('pending');
+      expect((row.resultSummary as Record<string, unknown>).trigger).toBe('merchant');
+
+      // Unlike createFromWebhook, two calls with the same identity hash are two separate rows —
+      // there's no sourceRef to dedupe on; each merchant click is a deliberate new request.
+      const second = await repo.createFromMerchant(scope, {
+        storeId: tenant.storeId,
+        type: 'correction',
+        identityHash: 'k1:' + 'd'.repeat(64),
+        dueAt: new Date(),
+      });
+      expect(second.id).not.toBe(row.id);
+    } finally {
+      await cleanupTestTenant(tenant);
+    }
+  });
+
   it('allows a null identity_hash for store_erasure (shop/redact has no shopper identity)', async () => {
     const tenant = await seedTestTenant('dsr-repo-store-erasure');
     try {

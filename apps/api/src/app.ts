@@ -214,6 +214,8 @@ export function buildApp(deps: AppDeps): FastifyInstance {
       dpaVersion: deps.dpaVersion,
       cipher: deps.shopify.cipher,
       redis: deps.shopify.redis,
+      hasher: deps.shopify.hasher,
+      dsrQueue: deps.shopify.dsrQueue,
     });
     registerChannelRuleRoutes(scope, tenantDeps);
     registerSystemStatusRoutes(scope, tenantDeps, { redis: deps.shopify.redis });

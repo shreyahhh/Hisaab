@@ -15,6 +15,13 @@ export interface CreateDsrRequestFromWebhookInput {
   readonly sourceRef: string;
 }
 
+export interface CreateDsrRequestFromMerchantInput {
+  readonly storeId: string;
+  readonly type: 'erasure' | 'correction';
+  readonly identityHash: string;
+  readonly dueAt: Date;
+}
+
 export interface CompleteDsrRequestInput {
   /** Merged into the existing jsonb `result_summary` (preserving `trigger`/`source_ref`) — per-target
    * deleted counts, `guard_rejected_hashes`, etc. Ids/enums/counts only, same rule as audit metadata. */
@@ -45,6 +52,16 @@ export interface DsrRequestRepository {
 
   /** The store's most recent DSR requests, newest first — SPEC §10 `GET /v1/stores/:id/privacy/requests`. */
   listRecentByStore(scope: Scope, storeId: string, limit: number): Promise<DsrRequestRow[]>;
+
+  /**
+   * `POST /v1/stores/:id/privacy/requests` (SPEC §10, issue #92): a merchant-initiated request, one
+   * per call — no dedupe key, unlike `createFromWebhook`, since this is a deliberate authenticated
+   * action rather than a retry-prone webhook delivery. `result_summary.trigger = 'merchant'`.
+   */
+  createFromMerchant(
+    scope: Scope,
+    input: CreateDsrRequestFromMerchantInput,
+  ): Promise<DsrRequestRow>;
 
   /**
    * `pending`/`failed` → `in_progress` (a retry of a previously-failed job resumes it). Idempotent
@@ -137,6 +154,22 @@ export function createDsrRequestRepository(db: Db): DsrRequestRepository {
       const existing = existingRows[0];
       if (!existing) throw new Error('createFromWebhook: conflicted but no row was found');
       return { row: existing, created: false };
+    },
+
+    async createFromMerchant(scope, input) {
+      assertStoreInScope(scope, input.storeId);
+      const [row] = await db
+        .insert(dsrRequests)
+        .values({
+          storeId: input.storeId,
+          type: input.type,
+          identityHash: input.identityHash,
+          dueAt: input.dueAt,
+          resultSummary: { trigger: 'merchant' },
+        })
+        .returning();
+      if (!row) throw new Error('createFromMerchant: insert returned no row');
+      return row;
     },
 
     async listRecentByStore(scope, storeId, limit) {

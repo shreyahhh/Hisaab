@@ -1,7 +1,15 @@
 import { eq } from 'drizzle-orm';
 import { schema } from '@truepath/db';
+import { storeContext } from '@truepath/privacy';
 import { afterAll, afterEach, describe, expect, it } from 'vitest';
-import { buildTestApp, TEST_DASHBOARD_URL, testAuth, testDb } from '../testApp.js';
+import {
+  buildTestApp,
+  TEST_DASHBOARD_URL,
+  testAuth,
+  testDb,
+  testDsrQueue,
+  testHasher,
+} from '../testApp.js';
 import {
   addRealMember,
   cleanupRealMember,
@@ -203,4 +211,134 @@ describe('POST /v1/stores/:id/privacy/confirm-india-opt-in — CSRF checks apply
 
     expect(await auditRows(owner.organizationId)).toHaveLength(0);
   });
+});
+
+// POST /v1/stores/:id/privacy/requests (SPEC §10, issue #92): the merchant-initiated DSR request
+// producer. `erasure`/`correction` are enqueued immediately; `access` is rejected (issue #91 — no
+// S3 export bucket yet). Cross-tenant 404 and CSRF are already covered by crossTenantHarness.test.ts
+// (this route needs no override there: `:storeId` is a recognised param).
+
+const createRequest = (t: { storeId: string; cookie: string }, body: Record<string, unknown>) =>
+  app.inject({
+    method: 'POST',
+    url: `/v1/stores/${t.storeId}/privacy/requests`,
+    headers: asHeaders(t),
+    payload: body,
+  });
+
+const dsrCreatedRows = async (organizationId: string) =>
+  (
+    await testDb
+      .select()
+      .from(schema.auditLog)
+      .where(eq(schema.auditLog.organizationId, organizationId))
+  ).filter((row) => row.action === 'dsr_created');
+
+describe('POST /v1/stores/:id/privacy/requests — creates and enqueues', () => {
+  it('erasure by phone: 201, hashed identity, audit row, and an enqueued dsr job', async () => {
+    const owner = await tenant('privreq-erasure');
+    const phone = '+919876500321';
+
+    const res = await createRequest(owner, { type: 'erasure', phone });
+    expect(res.statusCode).toBe(201);
+    const body = res.json();
+    expect(body).toMatchObject({ type: 'erasure', status: 'pending' });
+
+    const [row] = await testDb
+      .select()
+      .from(schema.dsrRequests)
+      .where(eq(schema.dsrRequests.id, body.id));
+    expect(row?.identityHash).toBe(testHasher.hashPhone(storeContext(owner.storeId), phone));
+    expect((row?.resultSummary as Record<string, unknown>)['trigger']).toBe('merchant');
+
+    const audits = await dsrCreatedRows(owner.organizationId);
+    expect(audits).toHaveLength(1);
+    expect(audits[0]).toMatchObject({
+      actorUserId: owner.userId,
+      targetType: 'dsr_request',
+      targetId: row!.id,
+      metadata: { type: 'erasure', trigger: 'merchant' },
+    });
+
+    const job = await testDsrQueue.getJob(`dsr-${row!.id}`);
+    expect(job?.data).toMatchObject({
+      storeId: owner.storeId,
+      type: 'erasure',
+      requestId: row!.id,
+    });
+  });
+
+  it('correction by email: 201 and a hashed identity', async () => {
+    const owner = await tenant('privreq-correction');
+    const email = 'shopper@example.com';
+
+    const res = await createRequest(owner, { type: 'correction', email });
+    expect(res.statusCode).toBe(201);
+    const body = res.json();
+    expect(body.type).toBe('correction');
+
+    const [row] = await testDb
+      .select()
+      .from(schema.dsrRequests)
+      .where(eq(schema.dsrRequests.id, body.id));
+    expect(row?.identityHash).toBe(testHasher.hashEmail(storeContext(owner.storeId), email));
+
+    const job = await testDsrQueue.getJob(`dsr-${row!.id}`);
+    expect(job?.data).toMatchObject({ type: 'correction', requestId: row!.id });
+  });
+
+  it('access: 409, no row created, nothing enqueued', async () => {
+    const owner = await tenant('privreq-access');
+    const res = await createRequest(owner, { type: 'access', phone: '+919876500322' });
+    expect(res.statusCode).toBe(409);
+    expect(res.json()).toMatchObject({ error: 'access_not_available' });
+
+    const rows = await testDb
+      .select()
+      .from(schema.dsrRequests)
+      .where(eq(schema.dsrRequests.storeId, owner.storeId));
+    expect(rows).toHaveLength(0);
+  });
+
+  it.each([
+    ['neither phone nor email', { type: 'erasure' }],
+    ['both phone and email', { type: 'erasure', phone: '+919876500323', email: 'x@example.com' }],
+    ['an unknown type', { type: 'store_erasure', phone: '+919876500324' }],
+  ] as const)('rejects %s with 400 invalid_body', async (_label, body) => {
+    const owner = await tenant('privreq-invalid');
+    const res = await createRequest(owner, body);
+    expect(res.statusCode).toBe(400);
+    expect(res.json()).toMatchObject({ error: 'invalid_body' });
+  });
+
+  it('rejects an unusable phone (e.g. a dummy number) with 400 invalid_identifier, no row created', async () => {
+    const owner = await tenant('privreq-dummy');
+    const res = await createRequest(owner, { type: 'erasure', phone: '9999999999' });
+    expect(res.statusCode).toBe(400);
+    expect(res.json()).toEqual({ error: 'invalid_identifier' });
+
+    const rows = await testDb
+      .select()
+      .from(schema.dsrRequests)
+      .where(eq(schema.dsrRequests.storeId, owner.storeId));
+    expect(rows).toHaveLength(0);
+  });
+
+  it.each(['analyst', 'viewer'] as const)(
+    'a %s is forbidden (403 forbidden_role) and nothing is recorded',
+    async (role) => {
+      const owner = await tenant(`privreq-role-owner-${role}`);
+      const other = await member(owner, `privreq-role-${role}`, role);
+
+      const res = await createRequest(other, { type: 'erasure', phone: '+919876500325' });
+      expect(res.statusCode).toBe(403);
+      expect(res.json()).toEqual({ error: 'forbidden_role' });
+
+      const rows = await testDb
+        .select()
+        .from(schema.dsrRequests)
+        .where(eq(schema.dsrRequests.storeId, owner.storeId));
+      expect(rows).toHaveLength(0);
+    },
+  );
 });
