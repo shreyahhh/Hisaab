@@ -23,6 +23,8 @@ export interface RateLimitDeps {
   readonly redis: Redis;
   /** Pseudonymises IPs/emails in Redis keys (write version only). */
   readonly hasher: IdentityHasher;
+  /** Defaults to `'rl:'`. Tests give each Vitest worker its own, so parallel workers' counters never collide (issue #11). */
+  readonly nameSpace?: string;
 }
 
 interface Limit {
@@ -56,7 +58,7 @@ export async function registerRateLimit(app: FastifyInstance, deps: RateLimitDep
   await app.register(fastifyRateLimit, {
     global: false,
     redis: deps.redis,
-    nameSpace: 'rl:',
+    nameSpace: deps.nameSpace ?? 'rl:',
     // skipOnError stays false: if the durable Redis is unreachable the request errors instead of
     // going unthrottled (fail closed, like Better Auth's own limiter — auth-tenancy.md §5).
     skipOnError: false,

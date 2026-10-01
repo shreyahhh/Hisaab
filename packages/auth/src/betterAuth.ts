@@ -54,6 +54,8 @@ export interface CreateAuthOptions {
   readonly cookieDomain?: string;
   /** SES wiring lands in a later ticket; defaults to a logging no-op (email.ts). */
   readonly emailSender?: AuthEmailSender;
+  /** Defaults to `'ba:'`. Tests give each Vitest worker its own, so parallel workers' rate-limit/session keys never collide (issue #11). */
+  readonly redisKeyPrefix?: string;
 }
 
 /** Builds the Better Auth instance (ADR-0012, auth-tenancy.md §2.2). */
@@ -152,7 +154,7 @@ export function createAuth(options: CreateAuthOptions) {
       max: 10,
       storage: 'secondary-storage',
     },
-    secondaryStorage: redisStorage({ client: redis, keyPrefix: 'ba:' }),
+    secondaryStorage: redisStorage({ client: redis, keyPrefix: options.redisKeyPrefix ?? 'ba:' }),
     user: { modelName: 'users' },
     account: { modelName: 'auth_accounts' },
     verification: { modelName: 'auth_tokens' },

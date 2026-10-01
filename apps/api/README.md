@@ -23,8 +23,10 @@ from `@truepath/privacy`; nothing here implements its own hashing.
 `login_failed` audit rows record `target_user_id` (the attempted email belongs to a user) or
 `unknown_account: true` — never the email, and no hash of it.
 
-Tests run files one at a time (`vitest.config.ts`): they share one Postgres and one durable Redis
-and assert on global state. `turbo.json` also runs a package's tests after its dependencies' (`test` depends on `^test`), so the db, auth and api suites take turns on the one Postgres instead of racing.
+Test files run in parallel (`vitest.config.ts`) — see "Parallel test isolation" below for how each
+worker gets its own Postgres database and Redis key prefixes. `turbo.json` also runs a package's
+tests after its dependencies' (`test` depends on `^test`), so the db, auth and api suites take turns
+rather than racing at the `turbo run test` level.
 
 ## Calling Better Auth: `authCall`
 
@@ -161,3 +163,68 @@ several API instances, not just within one process.
 
 Overridable in tests via `AppDeps.errorReporter`, the same DI pattern as `AuditService`'s `report`
 option.
+
+## Parallel test isolation (issue #11)
+
+These tests run against real local Postgres, ClickHouse and durable Redis (CLAUDE.md: no mocks for
+anything touching tenancy). They used to run one file at a time
+(`vitest.config.ts: fileParallelism: false`), because several files wrote to genuinely **global**
+state: the platform-wide `audit_log` rows for login/signup (no `organization_id`), and the
+rate-limit buckets on the durable Redis — including the one bucket every unusable login email
+shares (`rateLimit.ts`'s `createEmailLimiter`). Two files running at once could see — or clear —
+each other's rows and counters.
+
+**The fix is per-*worker* isolation, not per-file.** Vitest still runs the files handed to one
+worker one at a time; the only real hazard is two *different* workers' files running at the same
+moment. Giving each worker its own slice of state removes that without touching most individual
+tests at all:
+
+- **Postgres: one database per worker**, not just a schema. `src/testDbSetup.ts` (a Vitest
+  `setupFiles` entry) computes `test_worker_<VITEST_POOL_ID>`, creates that database if it doesn't
+  exist, runs every `packages/db` migration into it, and overwrites `process.env.DATABASE_URL`
+  before any other module in that worker process first imports `@truepath/db/testing` or
+  `./testApp.js` — both read `DATABASE_URL` lazily, at their own first `loadEnv()` call, so
+  whichever value is in `process.env` by then is what every `createDb()` in that worker connects
+  with. A schema-via-`search_path` was tried first and rejected: drizzle-kit's generated migrations
+  hard-code every enum type and FK as `"public".*`, so a different schema can't work without
+  rewriting committed migration files, which CLAUDE.md forbids.
+- **Redis: a per-worker key prefix**, threaded through as a plain constructor option rather than
+  hard-coded, so production is unaffected:
+  - our own rate limiter (`rateLimit.ts`'s `RateLimitDeps.nameSpace`, default `'rl:'`);
+  - Better Auth's secondary storage (`@truepath/auth`'s `CreateAuthOptions.redisKeyPrefix`, default
+    `'ba:'`);
+  - the BullMQ test queues' own `prefix` (already worker-aware, extended from the shared
+    `'bull-test'` to `` `bull-test-${TEST_WORKER_ID}` ``).
+
+  `testApp.ts` exports `TEST_WORKER_ID` and `TEST_RATE_LIMIT_NAMESPACE`; a test that scans Redis by
+  key pattern (`loginAudit.test.ts`, `rateLimit.test.ts`) uses the namespace constant instead of a
+  literal `'rl:'`, so it only ever touches its own worker's keys.
+- **A handful of assertions were genuinely time-window-based, not just slow to fix in spirit.**
+  `created_at` is Postgres's own `defaultNow()`, not the Node process's clock; under the heavier
+  concurrent load every worker's Postgres/Redis/bcrypt work now puts on the shared physical
+  instances, the two clocks can drift by enough that a row this exact call just wrote lands with a
+  `created_at` fractionally *behind* a `before = new Date()` captured a moment earlier in the test —
+  making a `createdAt >= before` filter wrongly miss (or, in one file, wrongly include a leftover
+  row from the same worker's own earlier, uncleaned-up test). `authFailurePaths.test.ts` and
+  `loginAudit.test.ts` snapshot the relevant rows' **ids** before the call and diff against ids seen
+  after, instead — existence-based, so there's no cross-clock comparison to get wrong, and it's
+  immune to any row already sitting in the table.
+- **A couple of tests used the exact same hard-coded IP** (`app.test.ts` and `authBridge.test.ts`
+  both used `10.96.1.1`), which — now that a worker's rate-limit counters are shared across every
+  file it runs, not reset between files — could nudge each other toward the per-IP limit. Fixed by
+  giving each file its own IP range; new tests that don't care what the IP is should keep using
+  `randomIp()`-style generation rather than a fixed literal, to avoid reintroducing this.
+- `testTimeout` is `10_000` (not Vitest's 5 s default): a few tests do real CPU/IO-heavy work
+  (20+ password hashes in `rateLimit.test.ts`, a Postgres `CREATE TRIGGER` in `errorHandler.test.ts`)
+  that comfortably clears 5 s run serially, but can brush against it when every worker's pool is
+  doing similarly heavy work at the same time.
+
+**Verified**, not just reasoned about: 9 consecutive full-suite runs green (695/695) after the fix,
+with every failure seen along the way root-caused against real output (not guessed) before being
+fixed — rate-limit bucket sharing, the `createdAt`/clock-skew bug in both directions, and the fixed-IP
+collision above.
+
+**Still open:** this covers every concrete failure actually reproduced during that verification, not
+a line-by-line audit of all ~25 files for the same classes of bug. A new test that scans Redis by a
+literal pattern, hard-codes an IP, or asserts on a time-window query over global (org-less) state
+should follow the patterns above instead.

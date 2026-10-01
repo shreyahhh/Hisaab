@@ -180,7 +180,10 @@ describe('buildApp — every state-changing request needs the dashboard Origin (
       method: method as 'POST',
       url,
       headers: { 'content-type': 'application/json', ...(origin === undefined ? {} : { origin }) },
-      remoteAddress: '10.96.1.1',
+      // issue #11: distinct from authBridge.test.ts's own fixed IP — this worker's rate-limit
+      // counters are shared across every file it runs, so two files reusing the same literal IP
+      // can push each other toward the per-IP limit.
+      remoteAddress: '10.96.201.1',
       ...(method === 'DELETE' ? {} : { payload: {} }),
     });
 

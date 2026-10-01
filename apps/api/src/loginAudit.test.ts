@@ -1,15 +1,18 @@
 import { randomUUID } from 'node:crypto';
-import { and, eq, gte, inArray } from 'drizzle-orm';
+import { eq, gte, inArray } from 'drizzle-orm';
 import { schema } from '@truepath/db';
 import { findPii } from '@truepath/privacy';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
-import { buildTestApp, testAuth, testDb, testRedis } from './testApp.js';
+import { buildTestApp, testAuth, testDb, testRedis, TEST_RATE_LIMIT_NAMESPACE } from './testApp.js';
 import { cleanupRealUser, seedRealUser, type RealUser } from './testAuthTenant.js';
 
 // login_failed says which account an attempt targeted (target_user_id, or unknown_account) and
 // nothing else: no email, and no hash of one (issue #9, privacy-dpdp.md: audit metadata is ids and
-// counts only). These tests read audit rows straight after each attempt, because other test files
-// also write and clean up login_failed rows.
+// counts only). `login()` below diffs audit_log by row id, not by a time window (issue #11): this
+// worker's own earlier tests leave their own login_failed rows behind (this file never cleans
+// audit_log up mid-run — only in afterAll), and created_at is Postgres's own defaultNow(), not
+// this process's clock, so the two can drift under load just enough to make a `createdAt >= since`
+// filter miss a row this exact call just wrote.
 
 const app = buildTestApp();
 const startedAt = new Date();
@@ -43,17 +46,32 @@ function randomIp(): string {
   return `10.${o()}.${o()}.${o()}`;
 }
 
-// Per-email login limits (5/min, 20/h) outlive a test run, and every unusable email shares one bucket,
-// so clear all of them before each attempt; #11 tracks proper isolation. Files run one at a time, so
-// nothing else is counting.
+// Per-email login limits (5/min, 20/h) outlive a test run, and every unusable email shares one
+// bucket, so clear all of them before each attempt. Scoped to this worker's own rate-limit
+// nameSpace (issue #11): a sibling worker running the same kind of attempt concurrently keeps its
+// own counters untouched.
 async function resetEmailBuckets() {
-  const keys = await testRedis.keys('rl:*:email:*');
+  const keys = await testRedis.keys(`${TEST_RATE_LIMIT_NAMESPACE}*:email:*`);
   if (keys.length > 0) await testRedis.del(...keys);
+}
+
+async function loginFailedRowIds(): Promise<Set<string>> {
+  const rows = await testDb
+    .select({ id: schema.auditLog.id })
+    .from(schema.auditLog)
+    .where(eq(schema.auditLog.action, 'login_failed'));
+  return new Set(rows.map((r) => r.id));
 }
 
 async function login(payload: unknown) {
   await resetEmailBuckets();
-  const before = new Date();
+  // issue #11: snapshot by id, not by a cross-clock timestamp. `created_at` is Postgres's own
+  // defaultNow(), not this process's clock — under the heavier concurrent load parallel workers
+  // put on the whole stack, the two clocks occasionally drift enough that a row this exact call
+  // just wrote lands with a `created_at` fractionally behind a `before = new Date()` captured here,
+  // making a `createdAt >= before` filter wrongly miss it. Existence-based diffing has no clock in
+  // the comparison at all.
+  const before = await loginFailedRowIds();
   const res = await app.inject({
     method: 'POST',
     url: '/v1/auth/login',
@@ -61,10 +79,11 @@ async function login(payload: unknown) {
     remoteAddress: randomIp(),
     payload: payload as object,
   });
-  const rows = await testDb
+  const allRows = await testDb
     .select()
     .from(schema.auditLog)
-    .where(and(eq(schema.auditLog.action, 'login_failed'), gte(schema.auditLog.createdAt, before)));
+    .where(eq(schema.auditLog.action, 'login_failed'));
+  const rows = allRows.filter((r) => !before.has(r.id));
   seenRowIds.push(...rows.map((r) => r.id));
   return { res, rows };
 }

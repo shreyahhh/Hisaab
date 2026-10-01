@@ -1,5 +1,4 @@
 import { randomUUID } from 'node:crypto';
-import { gte } from 'drizzle-orm';
 import { APIError } from 'better-auth/api';
 import { schema } from '@truepath/db';
 import { afterAll, afterEach, describe, expect, it, vi } from 'vitest';
@@ -36,12 +35,20 @@ afterEach(async () => {
 
 const asHeaders = (t: { cookie: string }) => ({ cookie: t.cookie, origin: ORIGIN });
 
-async function auditSince(since: Date) {
-  const rows = await testDb
-    .select()
-    .from(schema.auditLog)
-    .where(gte(schema.auditLog.createdAt, since));
-  return rows.map((r) => r.action);
+// issue #11: a time-window query (`createdAt >= since`) can pick up a *different* test's row —
+// one already sitting in this worker's shared audit_log table from earlier in the file (this file
+// never cleans audit_log up) — if the two land within the same tick, which a loaded, truly
+// parallel suite makes measurably more likely than the old fully-serial one. An existence-based
+// snapshot/diff is immune to that: it only ever reports rows that did not exist before this
+// specific call, regardless of what else is already in the table or when it was written.
+async function auditSnapshot(): Promise<ReadonlySet<string>> {
+  const rows = await testDb.select({ id: schema.auditLog.id }).from(schema.auditLog);
+  return new Set(rows.map((r) => r.id));
+}
+
+async function newAuditActionsSince(before: ReadonlySet<string>): Promise<string[]> {
+  const rows = await testDb.select().from(schema.auditLog);
+  return rows.filter((r) => !before.has(r.id)).map((r) => r.action);
 }
 
 const errorResponse = (status: number, code: string) =>
@@ -64,7 +71,7 @@ async function member(owner: RealTenant, label: string, role: 'admin' | 'analyst
 
 describe('signUpEmail (POST /v1/auth/signup) — returns a 4xx Response', () => {
   it('a rejected sign-up is a 400 with the Better Auth code, and writes no audit row', async () => {
-    const since = new Date();
+    const before = await auditSnapshot();
     const res = await app.inject({
       method: 'POST',
       url: '/v1/auth/signup',
@@ -74,7 +81,7 @@ describe('signUpEmail (POST /v1/auth/signup) — returns a 4xx Response', () => 
     });
     expect(res.statusCode).toBe(400);
     expect(res.json()).toEqual({ error: 'PASSWORD_TOO_SHORT' });
-    expect(await auditSince(since)).toEqual([]);
+    expect(await newAuditActionsSince(before)).toEqual([]);
   });
 });
 
@@ -82,7 +89,7 @@ describe('signInEmail (POST /v1/auth/login) — returns a 4xx Response', () => {
   it('a wrong password is a 401 with the code, one login_failed row and no login_succeeded row', async () => {
     const user = await seedRealUser(testAuth, testDb, 'fail-login');
     cleanups.push(() => cleanupRealUser(testDb, user));
-    const since = new Date();
+    const before = await auditSnapshot();
     const res = await app.inject({
       method: 'POST',
       url: '/v1/auth/login',
@@ -92,12 +99,12 @@ describe('signInEmail (POST /v1/auth/login) — returns a 4xx Response', () => {
     });
     expect(res.statusCode).toBe(401);
     expect(res.json()).toEqual({ error: 'INVALID_EMAIL_OR_PASSWORD' });
-    expect(await auditSince(since)).toEqual(['login_failed']);
+    expect(await newAuditActionsSince(before)).toEqual(['login_failed']);
   });
 
   it('a server error while signing in is a 500, not a failed login', async () => {
     vi.spyOn(testAuth.api, 'signInEmail').mockRejectedValue(new Error('database is down'));
-    const since = new Date();
+    const before = await auditSnapshot();
     const res = await app.inject({
       method: 'POST',
       url: '/v1/auth/login',
@@ -106,7 +113,7 @@ describe('signInEmail (POST /v1/auth/login) — returns a 4xx Response', () => {
       payload: { email: 'someone@example.invalid', password: 'not-the-password-123' },
     });
     expect(res.statusCode).toBe(500);
-    expect(await auditSince(since)).toEqual([]);
+    expect(await newAuditActionsSince(before)).toEqual([]);
   });
 });
 
@@ -117,7 +124,7 @@ describe('signOut (POST /v1/auth/logout) — returns a 4xx Response', () => {
     vi.spyOn(testAuth.api, 'signOut').mockResolvedValue(
       errorResponse(400, 'FAILED_TO_GET_SESSION') as never,
     );
-    const since = new Date();
+    const before = await auditSnapshot();
     const res = await app.inject({
       method: 'POST',
       url: '/v1/auth/logout',
@@ -127,7 +134,7 @@ describe('signOut (POST /v1/auth/logout) — returns a 4xx Response', () => {
     });
     expect(res.statusCode).toBe(400);
     expect(res.json()).toEqual({ error: 'FAILED_TO_GET_SESSION' });
-    expect(await auditSince(since)).toEqual([]);
+    expect(await newAuditActionsSince(before)).toEqual([]);
   });
 });
 
@@ -135,7 +142,7 @@ describe('createInvitation (POST /v1/orgs/:id/invites) — throws', () => {
   it('inviting someone who is already a member is a 400 with the code, and no member_invited row', async () => {
     const owner = await tenant('fail-invite-owner');
     const existing = await member(owner, 'fail-invite-existing', 'viewer');
-    const since = new Date();
+    const before = await auditSnapshot();
     const res = await app.inject({
       method: 'POST',
       url: `/v1/orgs/${owner.organizationId}/invites`,
@@ -144,7 +151,7 @@ describe('createInvitation (POST /v1/orgs/:id/invites) — throws', () => {
     });
     expect(res.statusCode).toBe(400);
     expect(res.json()).toEqual({ error: 'USER_IS_ALREADY_A_MEMBER_OF_THIS_ORGANIZATION' });
-    expect(await auditSince(since)).not.toContain('member_invited');
+    expect(await newAuditActionsSince(before)).not.toContain('member_invited');
   });
 });
 
@@ -152,7 +159,7 @@ describe('acceptInvitation (POST /v1/invites/:token/accept) — throws', () => {
   it('an unknown invitation is a 400 with the code, and no member_invite_accepted row', async () => {
     const user = await seedRealUser(testAuth, testDb, 'fail-accept');
     cleanups.push(() => cleanupRealUser(testDb, user));
-    const since = new Date();
+    const before = await auditSnapshot();
     const res = await app.inject({
       method: 'POST',
       url: `/v1/invites/${randomUUID()}/accept`,
@@ -162,14 +169,14 @@ describe('acceptInvitation (POST /v1/invites/:token/accept) — throws', () => {
     });
     expect(res.statusCode).toBe(400);
     expect(res.json()).toEqual({ error: 'INVITATION_NOT_FOUND' });
-    expect(await auditSince(since)).not.toContain('member_invite_accepted');
+    expect(await newAuditActionsSince(before)).not.toContain('member_invite_accepted');
   });
 });
 
 describe('updateMemberRole (PUT /v1/orgs/:id/members/:userId) — throws', () => {
   it('demoting the sole owner is a 409 last_owner, and no member_role_changed row', async () => {
     const owner = await tenant('fail-role-owner');
-    const since = new Date();
+    const before = await auditSnapshot();
     const res = await app.inject({
       method: 'PUT',
       url: `/v1/orgs/${owner.organizationId}/members/${owner.userId}`,
@@ -178,7 +185,7 @@ describe('updateMemberRole (PUT /v1/orgs/:id/members/:userId) — throws', () =>
     });
     expect(res.statusCode).toBe(409);
     expect(res.json()).toEqual({ error: 'last_owner' });
-    expect(await auditSince(since)).not.toContain('member_role_changed');
+    expect(await newAuditActionsSince(before)).not.toContain('member_role_changed');
   });
 
   it('any other rejection keeps its status and code, and writes no audit row', async () => {
@@ -187,7 +194,7 @@ describe('updateMemberRole (PUT /v1/orgs/:id/members/:userId) — throws', () =>
     vi.spyOn(testAuth.api, 'updateMemberRole').mockRejectedValue(
       new APIError('FORBIDDEN', { code: 'SIMULATED_FAILURE', message: 'simulated' }),
     );
-    const since = new Date();
+    const before = await auditSnapshot();
     const res = await app.inject({
       method: 'PUT',
       url: `/v1/orgs/${owner.organizationId}/members/${viewer.userId}`,
@@ -196,14 +203,14 @@ describe('updateMemberRole (PUT /v1/orgs/:id/members/:userId) — throws', () =>
     });
     expect(res.statusCode).toBe(403);
     expect(res.json()).toEqual({ error: 'SIMULATED_FAILURE' });
-    expect(await auditSince(since)).toEqual([]);
+    expect(await newAuditActionsSince(before)).toEqual([]);
   });
 });
 
 describe('leaveOrganization (DELETE /v1/orgs/:id/members/:userId, yourself) — throws', () => {
   it('the sole owner leaving is a 409 last_owner, and no member_removed row', async () => {
     const owner = await tenant('fail-leave-owner');
-    const since = new Date();
+    const before = await auditSnapshot();
     const res = await app.inject({
       method: 'DELETE',
       url: `/v1/orgs/${owner.organizationId}/members/${owner.userId}`,
@@ -211,7 +218,7 @@ describe('leaveOrganization (DELETE /v1/orgs/:id/members/:userId, yourself) — 
     });
     expect(res.statusCode).toBe(409);
     expect(res.json()).toEqual({ error: 'last_owner' });
-    expect(await auditSince(since)).not.toContain('member_removed');
+    expect(await newAuditActionsSince(before)).not.toContain('member_removed');
   });
 });
 
@@ -222,7 +229,7 @@ describe('removeMember (DELETE /v1/orgs/:id/members/:userId, someone else) — t
     vi.spyOn(testAuth.api, 'removeMember').mockRejectedValue(
       new APIError('BAD_REQUEST', { code: 'SIMULATED_FAILURE', message: 'simulated' }),
     );
-    const since = new Date();
+    const before = await auditSnapshot();
     const res = await app.inject({
       method: 'DELETE',
       url: `/v1/orgs/${owner.organizationId}/members/${viewer.userId}`,
@@ -230,14 +237,14 @@ describe('removeMember (DELETE /v1/orgs/:id/members/:userId, someone else) — t
     });
     expect(res.statusCode).toBe(400);
     expect(res.json()).toEqual({ error: 'SIMULATED_FAILURE' });
-    expect(await auditSince(since)).toEqual([]);
+    expect(await newAuditActionsSince(before)).toEqual([]);
   });
 });
 
 describe('createOrganization (POST /v1/orgs) — throws', () => {
   it('a taken slug is a 400 with the code, in the same { error } shape', async () => {
     const owner = await tenant('fail-org');
-    const since = new Date();
+    const before = await auditSnapshot();
     const res = await app.inject({
       method: 'POST',
       url: '/v1/orgs',
@@ -249,7 +256,7 @@ describe('createOrganization (POST /v1/orgs) — throws', () => {
     });
     expect(res.statusCode).toBe(400);
     expect(Object.keys(res.json())).toEqual(['error']);
-    expect(await auditSince(since)).toEqual([]);
+    expect(await newAuditActionsSince(before)).toEqual([]);
   });
 });
 
@@ -260,11 +267,11 @@ describe('listOrganizations (GET /v1/orgs) — throws', () => {
     vi.spyOn(testAuth.api, 'listOrganizations').mockRejectedValue(
       new APIError('INTERNAL_SERVER_ERROR', { code: 'SIMULATED_FAILURE', message: 'simulated' }),
     );
-    const since = new Date();
+    const before = await auditSnapshot();
     const res = await app.inject({ method: 'GET', url: '/v1/orgs', headers: asHeaders(user) });
     expect(res.statusCode).toBe(500);
     expect(res.json()).toEqual({ error: 'SIMULATED_FAILURE' });
-    expect(await auditSince(since)).toEqual([]);
+    expect(await newAuditActionsSince(before)).toEqual([]);
   });
 });
 
@@ -273,10 +280,10 @@ describe('getSession (every session-guarded route) — throws', () => {
     vi.spyOn(testAuth.api, 'getSession').mockRejectedValue(
       new APIError('UNAUTHORIZED', { code: 'SIMULATED_FAILURE', message: 'simulated' }),
     );
-    const since = new Date();
+    const before = await auditSnapshot();
     const res = await app.inject({ method: 'GET', url: '/v1/orgs', headers: { origin: ORIGIN } });
     expect(res.statusCode).toBe(401);
     expect(res.json()).toEqual({ error: 'SIMULATED_FAILURE' });
-    expect(await auditSince(since)).toEqual([]);
+    expect(await newAuditActionsSince(before)).toEqual([]);
   });
 });

@@ -26,6 +26,14 @@ import { buildApp, type AppDeps, type ShopifyDeps } from './app.js';
 loadDotEnvIfPresent('../../.env');
 const env = loadEnv(postgresEnvSchema.and(clickhouseEnvSchema));
 
+// issue #11: testDbSetup.ts (a Vitest `setupFiles` entry) sets this before any test file's own
+// imports run, to the same `VITEST_POOL_ID`-derived value it used for this worker's own Postgres
+// database. Every Redis key prefix below reuses it, so two workers' counters/keys never collide —
+// falls back to '0' for a non-Vitest run (e.g. a script importing this module directly).
+export const TEST_WORKER_ID = process.env.TEST_WORKER_ID ?? '0';
+/** The `@fastify/rate-limit` nameSpace this worker's own limiter uses — reuse this, not `'rl:'`, when a test scans Redis by key pattern. */
+export const TEST_RATE_LIMIT_NAMESPACE = `rl:${TEST_WORKER_ID}:`;
+
 export const testDb: Db = createDb(env.DATABASE_URL);
 export const testClickhouse = createClickHouseClient(env);
 
@@ -40,6 +48,7 @@ export const testAuth: Auth = createAuth({
   },
   redisDurableUrl: 'redis://localhost:6379',
   allowInsecureCookies: true, // plain-HTTP inject() in tests
+  redisKeyPrefix: `ba:${TEST_WORKER_ID}:`,
 });
 
 // Durable Redis, with low retry/timeout so an outage errors fast instead of hanging a request.
@@ -75,21 +84,23 @@ const testQueueRedis = new Redis('redis://localhost:6379', { maxRetriesPerReques
 // The queue keeps its canonical name (HLD §8) but lives under its own BullMQ key prefix, so a real
 // `shopify-sync` worker running against this same local Redis (e.g. `pnpm dev`) can never consume,
 // lock or race the jobs these tests enqueue and then assert on.
+const TEST_BULL_PREFIX = `bull-test-${TEST_WORKER_ID}`;
+
 export const testShopifySyncQueue = new Queue<ShopifySyncJob>(SHOPIFY_SYNC_QUEUE, {
   connection: testQueueRedis,
-  prefix: 'bull-test',
+  prefix: TEST_BULL_PREFIX,
 });
 
 // Same isolation for identity-stitch: a real stitch worker on this Redis must never consume these jobs.
 export const testIdentityStitchQueue = new Queue<IdentityStitchJob>(IDENTITY_STITCH_QUEUE, {
   connection: testQueueRedis,
-  prefix: 'bull-test',
+  prefix: TEST_BULL_PREFIX,
 });
 
 // Same isolation for dsr: a real dsr worker on this Redis must never consume these jobs.
 export const testDsrQueue = new Queue<DsrJob>(DSR_QUEUE, {
   connection: testQueueRedis,
-  prefix: 'bull-test',
+  prefix: TEST_BULL_PREFIX,
 });
 
 export const testShopify: ShopifyDeps = {
@@ -111,7 +122,7 @@ export function buildTestApp(overrides: Partial<AppDeps> = {}) {
     clickhouse: testClickhouse,
     auth: testAuth,
     trustedOrigin: 'http://localhost:5173',
-    rateLimit: { redis: testRedis, hasher: testHasher },
+    rateLimit: { redis: testRedis, hasher: testHasher, nameSpace: TEST_RATE_LIMIT_NAMESPACE },
     dpaVersion: TEST_DPA_VERSION,
     shopify: testShopify,
     ...overrides,
