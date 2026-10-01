@@ -832,8 +832,77 @@ describe('processDsr — store_erasure (§4.7, offboarding)', () => {
   }, 20_000);
 });
 
+describe('processDsr — correction (§4.6, issue #92)', () => {
+  it('deletes identity_links for H, keeps orders.visitor_id and the pixel data, and re-attributes O', async () => {
+    attrAdd.mockClear();
+    const phone = '+919876511122';
+    const visitorId = 'visitor-correction-1';
+    const order = await seedOrder(A, { phone, visitorId });
+    await link(A, visitorId, phone);
+    await seedVisitorRows(A, visitorId, order.id);
+
+    const request = await dsrRequests.createFromMerchant(storeBoundScope(A.storeId), {
+      storeId: A.storeId,
+      type: 'correction',
+      identityHash: hash(A, phone),
+      dueAt: new Date(NOW.getTime() + 7 * 86_400_000),
+    });
+
+    const outcome = await processDsr(
+      deps(),
+      { storeId: A.storeId, type: 'correction', requestId: request.id },
+      'job-correction-1',
+    );
+    expect(outcome).toMatchObject({ kind: 'correction', hashesScoped: 1, ordersAffected: 1 });
+
+    expect(await countCh(A, 'identity_links', visitorId)).toBe(0);
+    // Correction isn't erasure: the visitor's own pixel data is untouched.
+    expect(await countCh(A, 'events', visitorId)).toBe(1);
+
+    const [kept] = await db.select().from(schema.orders).where(eq(schema.orders.id, order.id));
+    expect(kept).toMatchObject({ visitorId, phoneHashHmac: hash(A, phone) }); // unchanged
+
+    expect(attrAdd).toHaveBeenCalledWith(
+      'incremental',
+      { storeId: A.storeId, mode: 'incremental', orderIds: [order.id] },
+      expect.objectContaining({ jobId: `attr-${order.id}` }),
+    );
+
+    const [completed] = await dsrRequests.listRecentByStore(
+      storeBoundScope(A.storeId),
+      A.storeId,
+      1,
+    );
+    expect(completed).toMatchObject({ id: request.id, status: 'completed' });
+    expect(await auditCountFor(request.id, 'dsr_completed')).toBe(1);
+  }, 20_000);
+
+  it('is idempotent: a redelivered job is a no-op', async () => {
+    const phone = '+919876511133';
+    await seedOrder(A, { phone });
+    const request = await dsrRequests.createFromMerchant(storeBoundScope(A.storeId), {
+      storeId: A.storeId,
+      type: 'correction',
+      identityHash: hash(A, phone),
+      dueAt: new Date(NOW.getTime() + 86_400_000),
+    });
+
+    await processDsr(
+      deps(),
+      { storeId: A.storeId, type: 'correction', requestId: request.id },
+      'job-correction-2a',
+    );
+    const replay = await processDsr(
+      deps(),
+      { storeId: A.storeId, type: 'correction', requestId: request.id },
+      'job-correction-2b',
+    );
+    expect(replay).toEqual({ kind: 'already_completed' });
+  }, 20_000);
+});
+
 describe('processDsr — unimplemented types', () => {
-  it.each(['access', 'correction'] as const)('rejects type %s', async (type) => {
+  it.each(['access'] as const)('rejects type %s', async (type) => {
     await expect(
       processDsr(deps(), { storeId: A.storeId, type, requestId: randomUUID() }, 'job-x'),
     ).rejects.toThrow(DsrTypeNotImplementedError);

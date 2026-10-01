@@ -7,6 +7,7 @@ import {
   jobScope,
 } from '@truepath/db';
 import { DsrJobSchema, storeBoundScope, type DsrJob } from '@truepath/shared';
+import { runCorrection } from './correction.js';
 import { isSuppressionReady, SuppressionNotReadyError } from '../eventSuppression.js';
 import {
   runFollowupErasure,
@@ -16,10 +17,9 @@ import {
 } from './erasure.js';
 import { runStoreErasure } from './storeErasure.js';
 
-// The `dsr` queue's BullMQ processor (HLD §8; privacy-dpdp.md §4.4/§4.5/§4.7). `erasure` and
-// `store_erasure` are fulfilled here; `access`/`correction` have no producer yet (SPEC v0.5: access
-// needs an S3 export bucket this phase doesn't build; correction has no caller anywhere in the
-// codebase).
+// The `dsr` queue's BullMQ processor (HLD §8; privacy-dpdp.md §4.4/§4.5/§4.6/§4.7). `erasure`,
+// `store_erasure` and `correction` are fulfilled here; `access` has no fulfilment yet (issue #91 —
+// needs an S3 export bucket this phase doesn't provision).
 
 export class DsrTypeNotImplementedError extends Error {
   constructor(type: string) {
@@ -55,6 +55,7 @@ export type DsrOutcome =
     }
   | { readonly kind: 'followup'; readonly visitorsScoped: number; readonly ordersAffected: number }
   | { readonly kind: 'store_erasure'; readonly ordersDeleted: number }
+  | { readonly kind: 'correction'; readonly hashesScoped: number; readonly ordersAffected: number }
   | { readonly kind: 'already_completed' };
 
 /**
@@ -68,7 +69,7 @@ export async function processDsr(
   job: DsrJob,
   jobId: string,
 ): Promise<DsrOutcome> {
-  if (job.type !== 'erasure' && job.type !== 'store_erasure') {
+  if (job.type !== 'erasure' && job.type !== 'store_erasure' && job.type !== 'correction') {
     throw new DsrTypeNotImplementedError(job.type);
   }
 
@@ -93,6 +94,39 @@ export async function processDsr(
   const trigger = (row.resultSummary as { trigger?: string } | null)?.trigger;
 
   const audit = createAuditLogRepository(deps.db);
+
+  if (job.type === 'correction') {
+    if (alreadyCompleted) return { kind: 'already_completed' };
+    if (row.identityHash === null) {
+      throw new Error(`dsr: correction request ${job.requestId} has no identity_hash`);
+    }
+    const counts = await runCorrection(deps, job.storeId, row.identityHash);
+    await dsrRequests.complete(orgScope, job.storeId, job.requestId, {
+      resultSummaryPatch: {
+        identity_links_deleted_hashes: counts.hashesScoped,
+        orders_affected: counts.ordersAffected,
+      },
+      completedAt: deps.now(),
+    });
+    await audit.write(orgScope, {
+      organizationId: store.organizationId,
+      actorUserId: null,
+      actorType: 'system',
+      action: 'dsr_completed',
+      targetType: 'dsr_request',
+      targetId: job.requestId,
+      metadata: {
+        type: 'correction',
+        trigger: trigger as
+          'merchant' | 'shopify_webhook' | 'consent_withdrawn' | 'consent_region_remediation',
+      },
+    });
+    return {
+      kind: 'correction',
+      hashesScoped: counts.hashesScoped,
+      ordersAffected: counts.ordersAffected,
+    };
+  }
 
   if (job.visitorIds !== undefined && trigger !== 'consent_withdrawn') {
     // Follow-up purge (§4.4 step 9): `row` is the original, already-completed erasure this new
