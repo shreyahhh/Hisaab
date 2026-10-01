@@ -1,7 +1,8 @@
-import { and, eq, sql } from 'drizzle-orm';
+import { and, eq, ne, sql } from 'drizzle-orm';
 import { assertOrganizationInScope, type Scope } from '@truepath/shared';
 import { organizations } from '../schema/index.js';
 import type { DbExecutor } from './auditLogRepository.js';
+import { SystemScopeRequiredError } from './suppressionRebuildRepository.js';
 
 export type OrganizationRow = typeof organizations.$inferSelect;
 
@@ -35,6 +36,26 @@ export interface OrganizationRepository {
     organizationId: string,
     options: { readonly now: Date },
   ): Promise<OrganizationRow | null>;
+  /**
+   * Issue #84 (auth-tenancy.md §4.6 step 4): orgs whose 7-day grace period has elapsed and are ready
+   * for the erasure scheduler to run. `SystemScope`-only (this is a cross-organization scan, not a
+   * `GET` for one org) — same `SystemScopeRequiredError` convention as
+   * `suppressionRebuildRepository`/`webhookDeliveryRepository`/`metaWarmupSchedulingRepository`.
+   */
+  listReadyForErasure(scope: Scope, now: Date): Promise<OrganizationRow[]>;
+  /**
+   * Issue #84 (auth-tenancy.md §5 "Org deletion overdue"): orgs still `pending_deletion` past their
+   * 30-day `deletion_due_by` — meant to be read *after* a scheduler run, so orgs it just finished
+   * tombstoning no longer match. `SystemScope`-only, same reason as `listReadyForErasure`.
+   */
+  listOverdue(scope: Scope, now: Date): Promise<OrganizationRow[]>;
+  /**
+   * Issue #84 (auth-tenancy.md §4.6 step 5): the completion tombstone — `status='deleted'`, `name`
+   * replaced by `deleted-<id>` (never reused, so it can't collide), `metadata` cleared (it held only
+   * the deletion-lifecycle timestamps). Idempotent: returns `null` if already `deleted`. `audit_log`
+   * and `dsr_requests` are untouched — neither holds shopper or org-identifying data beyond ids.
+   */
+  markDeleted(scope: Scope, organizationId: string): Promise<OrganizationRow | null>;
 }
 
 /** The only sanctioned way to read/write `organizations`' deletion lifecycle (ADR-0016). */
@@ -84,6 +105,42 @@ export function createOrganizationRepository(db: DbExecutor): OrganizationReposi
             sql`(${organizations.metadata}->>'deletion_scheduled_at')::timestamptz > ${options.now.toISOString()}::timestamptz`,
           ),
         )
+        .returning();
+      return row ?? null;
+    },
+
+    async listReadyForErasure(scope, now) {
+      if (scope.kind !== 'system') throw new SystemScopeRequiredError();
+      return db
+        .select()
+        .from(organizations)
+        .where(
+          and(
+            eq(organizations.status, 'pending_deletion'),
+            sql`(${organizations.metadata}->>'deletion_scheduled_at')::timestamptz <= ${now.toISOString()}::timestamptz`,
+          ),
+        );
+    },
+
+    async listOverdue(scope, now) {
+      if (scope.kind !== 'system') throw new SystemScopeRequiredError();
+      return db
+        .select()
+        .from(organizations)
+        .where(
+          and(
+            eq(organizations.status, 'pending_deletion'),
+            sql`(${organizations.metadata}->>'deletion_due_by')::timestamptz <= ${now.toISOString()}::timestamptz`,
+          ),
+        );
+    },
+
+    async markDeleted(scope, organizationId) {
+      assertOrganizationInScope(scope, organizationId);
+      const [row] = await db
+        .update(organizations)
+        .set({ status: 'deleted', name: `deleted-${organizationId}`, metadata: {} })
+        .where(and(eq(organizations.id, organizationId), ne(organizations.status, 'deleted')))
         .returning();
       return row ?? null;
     },

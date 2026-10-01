@@ -214,10 +214,9 @@ export const AUDIT_ACTION_OWNERS = {
   member_removed: implemented('M0-4', 'apps/api/src/auditTrail.test.ts'),
   org_deletion_requested: implemented('#8', 'apps/api/src/routes/orgDeletion.test.ts'),
   org_deletion_cancelled: implemented('#8', 'apps/api/src/routes/orgDeletion.test.ts'),
-  // The erasure scheduler (LLD §4.6 steps 4-5) that actually completes a deletion and writes this
-  // row is a separate follow-up (ties into the DSR/store_erasure pipeline, issue #25) — not built by
-  // #8, which only ships the request/cancel lifecycle.
-  org_deleted: pending('follow-up to #8 (erasure scheduler, ties into #25)'),
+  // The erasure scheduler (LLD §4.6 steps 4-5) that completes a deletion and writes this row — a
+  // follow-up to #8, built once the DSR/store_erasure pipeline (#25) it reuses landed.
+  org_deleted: implemented('#84', 'apps/workers/src/orgDeletionScheduler.test.ts'),
   // Reassigned from 'pending M4-2' to M1 (issue #72): HLD §8's "Consent-region gate" layer 1 is a
   // hard onboarding block, not a privacy-settings-page feature — no real store could ever leave
   // consent_region_unconfirmed without it, so M1's own exit criterion (a real store's events flow)

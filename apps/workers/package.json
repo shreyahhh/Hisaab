@@ -9,6 +9,7 @@
     "dev:meta-warmup": "tsx src/devMetaWarmup.ts",
     "dev:prune-webhook-deliveries": "tsx src/devWebhookDeliveryPrune.ts",
     "dev:backfill-attribution-confidence": "tsx src/devAttributionConfidenceBackfill.ts",
+    "dev:erase-overdue-orgs": "tsx src/devOrgDeletionScheduler.ts",
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "lint": "eslint .",
