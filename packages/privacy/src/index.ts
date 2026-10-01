@@ -42,6 +42,7 @@ export {
 export {
   ALLOWED_QUERY_PARAMS,
   findPii,
+  originOnly,
   REDACTED,
   redactLogValue,
   sanitiseReferrer,

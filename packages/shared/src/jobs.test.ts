@@ -6,6 +6,11 @@ import {
   adSyncMetaJobId,
   META_WARMUP_INTERVAL_MS,
   metaWarmupSchedulerId,
+  DSR_JOB_OPTIONS,
+  DSR_QUEUE,
+  DSR_WITHDRAWAL_DELAY_MS,
+  DsrJobSchema,
+  STORE_ERASURE_DELAY_MS,
   IDENTITY_STITCH_DELAY_MS,
   IDENTITY_STITCH_QUEUE,
   IdentityStitchJobSchema,
@@ -60,6 +65,37 @@ describe('identity-stitch / attribution-run registry (HLD §8)', () => {
     expect(IdentityStitchJobSchema.safeParse({ ...ok, attempt: 3 }).success).toBe(false);
     expect(IdentityStitchJobSchema.safeParse({ ...ok, orderId: '5001' }).success).toBe(false);
     expect(IdentityStitchJobSchema.safeParse({ ...ok, extra: 1 }).success).toBe(false);
+  });
+});
+
+describe('dsr registry (HLD §8, issue #25)', () => {
+  const storeId = '0192f3a4-7b1c-7c2d-8e3f-4a5b6c7d8e9f';
+  const requestId = '1192f3a4-7b1c-7c2d-8e3f-4a5b6c7d8e9f';
+
+  it('names the queue exactly as HLD §8 registers it', () => {
+    expect(DSR_QUEUE).toBe('dsr');
+  });
+
+  it('delays: withdrawal coalescing is 60s, store_erasure is 7 days', () => {
+    expect(DSR_WITHDRAWAL_DELAY_MS).toBe(60_000);
+    expect(STORE_ERASURE_DELAY_MS).toBe(7 * 24 * 60 * 60 * 1000);
+  });
+
+  it('5 attempts, exponential backoff from 2s, matching the LLD failure-mode table', () => {
+    expect(DSR_JOB_OPTIONS).toMatchObject({
+      attempts: 5,
+      backoff: { type: 'exponential', delay: 2000 },
+    });
+  });
+
+  it('validates the dsr payload strictly, visitorIds optional', () => {
+    const ok = { storeId, type: 'erasure' as const, requestId };
+    expect(DsrJobSchema.safeParse(ok).success).toBe(true);
+    expect(DsrJobSchema.safeParse({ ...ok, visitorIds: ['v1', 'v2'] }).success).toBe(true);
+    expect(DsrJobSchema.safeParse({ ...ok, type: 'made_up' }).success).toBe(false);
+    expect(DsrJobSchema.safeParse({ ...ok, storeId: 'not-a-uuid' }).success).toBe(false);
+    expect(DsrJobSchema.safeParse({ ...ok, extra: 1 }).success).toBe(false);
+    expect(DsrJobSchema.safeParse({ ...ok, visitorIds: [] }).success).toBe(true);
   });
 });
 

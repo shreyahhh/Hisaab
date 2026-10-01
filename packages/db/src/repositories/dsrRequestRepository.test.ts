@@ -105,3 +105,184 @@ describe('DsrRequestRepository (shopify-integration.md §4.3)', () => {
     }
   });
 });
+
+describe('DsrRequestRepository — status transitions (issue #25)', () => {
+  async function seedPending(label: string) {
+    const tenant = await seedTestTenant(label);
+    const repo = createDsrRequestRepository(db);
+    const scope = jobScope(tenant.organizationId, tenant.storeId);
+    const { row } = await repo.createFromWebhook(scope, {
+      storeId: tenant.storeId,
+      type: 'erasure',
+      identityHash: 'k1:' + 'c'.repeat(64),
+      dueAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
+      sourceRef: `${label}-webhook`,
+    });
+    return { tenant, scope, repo, requestId: row.id };
+  }
+
+  describe('beginProcessing', () => {
+    it('moves pending to in_progress', async () => {
+      const { tenant, scope, repo, requestId } = await seedPending('dsr-begin-pending');
+      try {
+        const result = await repo.beginProcessing(scope, tenant.storeId, requestId);
+        expect(result.alreadyCompleted).toBe(false);
+        expect(result.row.status).toBe('in_progress');
+      } finally {
+        await cleanupTestTenant(tenant);
+      }
+    });
+
+    it('is idempotent against an already-completed row: no-op, alreadyCompleted true', async () => {
+      const { tenant, scope, repo, requestId } = await seedPending('dsr-begin-completed');
+      try {
+        await repo.beginProcessing(scope, tenant.storeId, requestId);
+        const completed = await repo.complete(scope, tenant.storeId, requestId, {
+          resultSummaryPatch: { events: 0 },
+          completedAt: new Date(),
+        });
+        expect(completed.status).toBe('completed');
+
+        const result = await repo.beginProcessing(scope, tenant.storeId, requestId);
+        expect(result.alreadyCompleted).toBe(true);
+        expect(result.row.status).toBe('completed'); // untouched, not reset to in_progress
+      } finally {
+        await cleanupTestTenant(tenant);
+      }
+    });
+
+    it('resumes a previously-failed job', async () => {
+      const { tenant, scope, repo, requestId } = await seedPending('dsr-begin-failed');
+      try {
+        await repo.fail(scope, tenant.storeId, requestId);
+        const result = await repo.beginProcessing(scope, tenant.storeId, requestId);
+        expect(result.alreadyCompleted).toBe(false);
+        expect(result.row.status).toBe('in_progress');
+      } finally {
+        await cleanupTestTenant(tenant);
+      }
+    });
+  });
+
+  describe('complete', () => {
+    it('merges the patch into result_summary, preserving trigger/source_ref, and sets completed_at', async () => {
+      const { tenant, scope, repo, requestId } = await seedPending('dsr-complete-merge');
+      try {
+        const completedAt = new Date('2026-10-01T10:00:00.000Z');
+        const row = await repo.complete(scope, tenant.storeId, requestId, {
+          resultSummaryPatch: { events: 3, touchpoints: 5 },
+          completedAt,
+        });
+        expect(row.status).toBe('completed');
+        expect(row.completedAt?.toISOString()).toBe(completedAt.toISOString());
+        expect(row.resultSummary).toMatchObject({
+          trigger: 'shopify_webhook',
+          source_ref: 'dsr-complete-merge-webhook',
+          events: 3,
+          touchpoints: 5,
+        });
+      } finally {
+        await cleanupTestTenant(tenant);
+      }
+    });
+  });
+
+  describe('fail', () => {
+    it('sets status to failed', async () => {
+      const { tenant, scope, repo, requestId } = await seedPending('dsr-fail');
+      try {
+        const row = await repo.fail(scope, tenant.storeId, requestId);
+        expect(row.status).toBe('failed');
+      } finally {
+        await cleanupTestTenant(tenant);
+      }
+    });
+  });
+
+  describe('appendFollowup', () => {
+    it('appends an entry to result_summary.followups[]', async () => {
+      const { tenant, scope, repo, requestId } = await seedPending('dsr-followup-append');
+      try {
+        await repo.complete(scope, tenant.storeId, requestId, {
+          resultSummaryPatch: {},
+          completedAt: new Date(),
+        });
+        const at = new Date('2026-10-01T11:00:00.000Z');
+        const result = await repo.appendFollowup(scope, tenant.storeId, requestId, {
+          followupKey: 'suppression-row-1',
+          visitorCount: 1,
+          rowsDeleted: 4,
+          at,
+        });
+        expect(result.appended).toBe(true);
+
+        const [row] = await repo.listRecentByStore(scope, tenant.storeId, 1);
+        expect(row?.resultSummary).toMatchObject({
+          followups: [
+            {
+              followup_key: 'suppression-row-1',
+              visitor_count: 1,
+              rows_deleted: 4,
+              at: at.toISOString(),
+            },
+          ],
+        });
+      } finally {
+        await cleanupTestTenant(tenant);
+      }
+    });
+
+    it('is idempotent: a repeated followupKey is not appended twice', async () => {
+      const { tenant, scope, repo, requestId } = await seedPending('dsr-followup-idempotent');
+      try {
+        await repo.complete(scope, tenant.storeId, requestId, {
+          resultSummaryPatch: {},
+          completedAt: new Date(),
+        });
+        const entry = {
+          followupKey: 'suppression-row-dup',
+          visitorCount: 1,
+          rowsDeleted: 2,
+          at: new Date(),
+        };
+        const first = await repo.appendFollowup(scope, tenant.storeId, requestId, entry);
+        const second = await repo.appendFollowup(scope, tenant.storeId, requestId, entry);
+        expect(first.appended).toBe(true);
+        expect(second.appended).toBe(false);
+
+        const [row] = await repo.listRecentByStore(scope, tenant.storeId, 1);
+        const followups = (row?.resultSummary as { followups?: unknown[] } | null)?.followups ?? [];
+        expect(followups).toHaveLength(1);
+      } finally {
+        await cleanupTestTenant(tenant);
+      }
+    });
+
+    it('two different followupKeys both land', async () => {
+      const { tenant, scope, repo, requestId } = await seedPending('dsr-followup-multiple');
+      try {
+        await repo.complete(scope, tenant.storeId, requestId, {
+          resultSummaryPatch: {},
+          completedAt: new Date(),
+        });
+        await repo.appendFollowup(scope, tenant.storeId, requestId, {
+          followupKey: 'row-1',
+          visitorCount: 1,
+          rowsDeleted: 1,
+          at: new Date(),
+        });
+        await repo.appendFollowup(scope, tenant.storeId, requestId, {
+          followupKey: 'row-2',
+          visitorCount: 1,
+          rowsDeleted: 1,
+          at: new Date(),
+        });
+        const [row] = await repo.listRecentByStore(scope, tenant.storeId, 1);
+        const followups = (row?.resultSummary as { followups?: unknown[] } | null)?.followups ?? [];
+        expect(followups).toHaveLength(2);
+      } finally {
+        await cleanupTestTenant(tenant);
+      }
+    });
+  });
+});

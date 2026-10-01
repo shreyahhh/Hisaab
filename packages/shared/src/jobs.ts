@@ -3,12 +3,18 @@ import { z } from 'zod';
 // new queue names or payload shapes without adding them here first (CLAUDE.md — "Names are
 // canonical").
 
-/** HLD §8: `dsr`. The consumer lands with M4-2; until then jobs enqueued here simply wait. */
+/** HLD §8: `dsr`. Issue #25 builds its `erasure`/`store_erasure` consumer; `access`/`correction` still wait. */
 export const DSR_QUEUE = 'dsr';
 
 /**
- * HLD §8: `DsrJob{storeId, type, requestId, visitorIds?}`. `visitorIds` restricts an erasure to a
- * follow-up purge of those (raw, pseudonymous) visitor ids — enqueued on a `suppression_hit`.
+ * HLD §8: `DsrJob{storeId, type, requestId, visitorIds?}`. `visitorIds` restricts an `erasure` job to
+ * a specific set of (raw, pseudonymous) visitor ids rather than the full one-hop identity expansion a
+ * webhook-triggered erasure otherwise does (privacy-dpdp.md §4.3/§4.4) — used for two single-visitor
+ * cases, both "one visitor, not a person" (§4.5): a withdrawal-triggered erasure (the only visitor
+ * whose consent was withdrawn) and a follow-up purge after a `suppression_hit` (an already-erased
+ * shopper returning on a new device). An `identity_hash_hmac` on `dsr_requests` can't stand in for
+ * this — ClickHouse's `visitor_id` columns hold the raw token, which an HMAC cannot be reverse-joined
+ * against, so a single-visitor job must carry the real id(s) here instead.
  */
 export interface DsrJob {
   readonly storeId: string;
@@ -17,8 +23,27 @@ export interface DsrJob {
   readonly visitorIds?: readonly string[];
 }
 
+export const DsrJobSchema = z
+  .object({
+    storeId: z.string().uuid(),
+    type: z.enum(['access', 'erasure', 'correction', 'store_erasure']),
+    requestId: z.string().uuid(),
+    visitorIds: z.array(z.string().min(1)).optional(),
+  })
+  .strict();
+
 /** privacy-dpdp.md §4.5: withdrawal-triggered erasure jobs wait 60 s so a burst can be coalesced. */
 export const DSR_WITHDRAWAL_DELAY_MS = 60_000;
+
+/** privacy-dpdp.md §4.7 step 2: keeps the export window open, within Shopify's 30-day deadline. */
+export const STORE_ERASURE_DELAY_MS = 7 * 24 * 60 * 60 * 1000;
+
+/** Enqueue options for `dsr` jobs (HLD "Error handling & retries": exponential backoff, base 2 s, 5 attempts). */
+export const DSR_JOB_OPTIONS = {
+  attempts: 5,
+  backoff: { type: 'exponential' as const, delay: 2000 },
+  removeOnComplete: { age: 30 * 86_400 },
+} as const;
 
 /** HLD §8: `shopify-sync`. */
 export const SHOPIFY_SYNC_QUEUE = 'shopify-sync';

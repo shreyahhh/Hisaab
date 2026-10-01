@@ -420,4 +420,142 @@ describe('OrderRepository — identity-stitching methods', () => {
       }
     });
   });
+
+  describe('findByIdentityHashes / findByVisitorIds / anonymiseErasedOrders (issue #25)', () => {
+    const HASH = (n: number) => `k1:${n.toString(16).padStart(64, '0')}`;
+
+    it('findByIdentityHashes matches by phone or email hash, never another store', async () => {
+      const t = await seedTestTenant('dsr-order-find-hash');
+      const other = await seedTestTenant('dsr-order-find-hash-other');
+      try {
+        const repo = createOrderRepository(db);
+        const scope = jobScope(t.organizationId, t.storeId);
+        const byPhone = await repo.applySnapshot(
+          scope,
+          baseInput(t.storeId, { externalOrderId: 'p1', phoneHashHmac: HASH(1) }),
+        );
+        const byEmail = await repo.applySnapshot(
+          scope,
+          baseInput(t.storeId, { externalOrderId: 'e1', emailHashHmac: HASH(2) }),
+        );
+        await repo.applySnapshot(
+          scope,
+          baseInput(t.storeId, { externalOrderId: 'unrelated', phoneHashHmac: HASH(3) }),
+        );
+        // same hash in a different store must never come back
+        await repo.applySnapshot(
+          jobScope(other.organizationId, other.storeId),
+          baseInput(other.storeId, { externalOrderId: 'other-store', phoneHashHmac: HASH(1) }),
+        );
+
+        const found = await repo.findByIdentityHashes(scope, t.storeId, [HASH(1), HASH(2)]);
+        expect(new Set(found.map((o) => o.id))).toEqual(
+          new Set([byPhone.orderId, byEmail.orderId]),
+        );
+      } finally {
+        await cleanupTestTenant(t);
+        await cleanupTestTenant(other);
+      }
+    });
+
+    it('findByIdentityHashes returns [] for an empty hash list, with no query at all', async () => {
+      const t = await seedTestTenant('dsr-order-find-hash-empty');
+      try {
+        const repo = createOrderRepository(db);
+        const scope = jobScope(t.organizationId, t.storeId);
+        expect(await repo.findByIdentityHashes(scope, t.storeId, [])).toEqual([]);
+      } finally {
+        await cleanupTestTenant(t);
+      }
+    });
+
+    it('findByVisitorIds matches orders.visitor_id, never another store', async () => {
+      const t = await seedTestTenant('dsr-order-find-visitor');
+      try {
+        const repo = createOrderRepository(db);
+        const scope = jobScope(t.organizationId, t.storeId);
+        const result = await repo.applySnapshot(
+          scope,
+          baseInput(t.storeId, { externalOrderId: 'v1' }),
+        );
+        await repo.linkVisitorIfUnset(scope, t.storeId, result.orderId, 'visitor-abc');
+        await repo.applySnapshot(scope, baseInput(t.storeId, { externalOrderId: 'v2' })); // no visitor
+
+        const found = await repo.findByVisitorIds(scope, t.storeId, ['visitor-abc', 'visitor-xyz']);
+        expect(found.map((o) => o.id)).toEqual([result.orderId]);
+      } finally {
+        await cleanupTestTenant(t);
+      }
+    });
+
+    it('anonymiseErasedOrders nulls the hashes/visitor_id, blanks discount_codes and note_attributes, and truncates landing/referring site to origin', async () => {
+      const t = await seedTestTenant('dsr-order-anonymise');
+      try {
+        const repo = createOrderRepository(db);
+        const scope = jobScope(t.organizationId, t.storeId);
+        const result = await repo.applySnapshot(
+          scope,
+          baseInput(t.storeId, {
+            externalOrderId: 'anon-1',
+            phoneHashHmac: HASH(10),
+            emailHashHmac: HASH(11),
+            discountCodes: ['RAHUL10'],
+            landingSite: 'https://shop.example.com/pages/x?ref=RAHUL10',
+            referringSite: 'https://instagram.com/rahul',
+            noteAttributes: [{ name: 'utm_source', value: 'rahul' }],
+          }),
+        );
+        await repo.linkVisitorIfUnset(scope, t.storeId, result.orderId, 'visitor-to-erase');
+
+        const { updated } = await repo.anonymiseErasedOrders(scope, t.storeId, [result.orderId]);
+        expect(updated).toBe(1);
+
+        const [row] = await db.select().from(orders).where(eq(orders.id, result.orderId));
+        expect(row).toMatchObject({
+          phoneHashHmac: null,
+          emailHashHmac: null,
+          visitorId: null,
+          discountCodes: [],
+          noteAttributes: {},
+          landingSite: 'https://shop.example.com',
+          referringSite: 'https://instagram.com',
+        });
+      } finally {
+        await cleanupTestTenant(t);
+      }
+    });
+
+    it('anonymiseErasedOrders is a no-op for an empty orderIds list', async () => {
+      const t = await seedTestTenant('dsr-order-anonymise-empty');
+      try {
+        const repo = createOrderRepository(db);
+        const scope = jobScope(t.organizationId, t.storeId);
+        expect(await repo.anonymiseErasedOrders(scope, t.storeId, [])).toEqual({ updated: 0 });
+      } finally {
+        await cleanupTestTenant(t);
+      }
+    });
+
+    it('anonymiseErasedOrders never touches an order outside the given ids or store', async () => {
+      const t = await seedTestTenant('dsr-order-anonymise-isolated');
+      try {
+        const repo = createOrderRepository(db);
+        const scope = jobScope(t.organizationId, t.storeId);
+        const target = await repo.applySnapshot(
+          scope,
+          baseInput(t.storeId, { externalOrderId: 'target', phoneHashHmac: HASH(20) }),
+        );
+        const untouched = await repo.applySnapshot(
+          scope,
+          baseInput(t.storeId, { externalOrderId: 'untouched', phoneHashHmac: HASH(21) }),
+        );
+        await repo.anonymiseErasedOrders(scope, t.storeId, [target.orderId]);
+
+        const [row] = await db.select().from(orders).where(eq(orders.id, untouched.orderId));
+        expect(row?.phoneHashHmac).toBe(HASH(21));
+      } finally {
+        await cleanupTestTenant(t);
+      }
+    });
+  });
 });

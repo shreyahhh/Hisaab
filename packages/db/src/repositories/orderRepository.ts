@@ -1,5 +1,6 @@
 import { and, asc, desc, eq, gt, gte, inArray, isNull, or, sql } from 'drizzle-orm';
 import { assertStoreInScope, type Scope } from '@truepath/shared';
+import { originOnly } from '@truepath/privacy';
 import type { Db } from '../client.js';
 import { orders, orderStatusEvents } from '../schema/index.js';
 import { SystemScopeRequiredError } from './suppressionRebuildRepository.js';
@@ -108,6 +109,32 @@ export interface OrderRepository {
       readonly storeIds?: readonly string[];
     },
   ): Promise<readonly { readonly id: string; readonly storeId: string }[]>;
+
+  /** Issue #25 (DSR erasure, privacy-dpdp.md §4.3 step 2): orders whose phone or email HMAC is in `hashes`. */
+  findByIdentityHashes(
+    scope: Scope,
+    storeId: string,
+    hashes: readonly string[],
+  ): Promise<OrderRow[]>;
+  /** Issue #25: orders whose `visitor_id` is in `visitorIds` (the raw, pseudonymous tokens). */
+  findByVisitorIds(
+    scope: Scope,
+    storeId: string,
+    visitorIds: readonly string[],
+  ): Promise<OrderRow[]>;
+  /**
+   * Issue #25 (privacy-dpdp.md §4.4 step 4): nulls `phone_hash_hmac`/`email_hash_hmac`/`visitor_id`,
+   * blanks `discount_codes` (a discount code can be a personalised referral/influencer code — the
+   * issue's own review comment calls this out explicitly, not just the hashed columns), truncates
+   * `landing_site`/`referring_site` to their origin (`originOnly`, `@truepath/privacy` — they can
+   * carry UTMs with personal values), and blanks `note_attributes`. A no-op (0 updated) for an empty
+   * `orderIds`.
+   */
+  anonymiseErasedOrders(
+    scope: Scope,
+    storeId: string,
+    orderIds: readonly string[],
+  ): Promise<{ readonly updated: number }>;
 }
 
 /** The only sanctioned way to read/write `orders`/`order_status_events` (ADR-0016). */
@@ -319,6 +346,67 @@ export function createOrderRepository(db: Db): OrderRepository {
         .where(and(...conditions))
         .orderBy(asc(orders.id))
         .limit(options.limit);
+    },
+
+    async findByIdentityHashes(scope, storeId, hashes) {
+      assertStoreInScope(scope, storeId);
+      if (hashes.length === 0) return [];
+      const list = [...hashes];
+      return db
+        .select()
+        .from(orders)
+        .where(
+          and(
+            eq(orders.storeId, storeId),
+            or(inArray(orders.phoneHashHmac, list), inArray(orders.emailHashHmac, list)),
+          ),
+        );
+    },
+
+    async findByVisitorIds(scope, storeId, visitorIds) {
+      assertStoreInScope(scope, storeId);
+      if (visitorIds.length === 0) return [];
+      return db
+        .select()
+        .from(orders)
+        .where(and(eq(orders.storeId, storeId), inArray(orders.visitorId, [...visitorIds])));
+    },
+
+    async anonymiseErasedOrders(scope, storeId, orderIds) {
+      assertStoreInScope(scope, storeId);
+      if (orderIds.length === 0) return { updated: 0 };
+
+      // landing_site/referring_site are truncated per-row (originOnly depends on each order's own
+      // value), so this can't be one bulk UPDATE with a single literal — bounded to one shopper's
+      // orders (DSR erasure scope; store_erasure deletes the rows outright instead, never calls this).
+      const rows = await db
+        .select({
+          id: orders.id,
+          landingSite: orders.landingSite,
+          referringSite: orders.referringSite,
+        })
+        .from(orders)
+        .where(and(eq(orders.storeId, storeId), inArray(orders.id, [...orderIds])));
+
+      let updated = 0;
+      await db.transaction(async (tx) => {
+        for (const row of rows) {
+          await tx
+            .update(orders)
+            .set({
+              phoneHashHmac: null,
+              emailHashHmac: null,
+              visitorId: null,
+              discountCodes: [],
+              noteAttributes: {},
+              landingSite: originOnly(row.landingSite),
+              referringSite: originOnly(row.referringSite),
+            })
+            .where(and(eq(orders.id, row.id), eq(orders.storeId, storeId)));
+          updated += 1;
+        }
+      });
+      return { updated };
     },
   };
 }

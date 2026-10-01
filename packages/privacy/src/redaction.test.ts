@@ -1,6 +1,13 @@
 import { randomBytes } from 'node:crypto';
 import { describe, expect, it } from 'vitest';
-import { findPii, REDACTED, redactLogValue, sanitiseReferrer, sanitiseUrl } from './redaction.js';
+import {
+  findPii,
+  originOnly,
+  REDACTED,
+  redactLogValue,
+  sanitiseReferrer,
+  sanitiseUrl,
+} from './redaction.js';
 
 const HASH = 'k1:' + 'ab12'.repeat(16);
 
@@ -335,5 +342,29 @@ describe('sanitiseReferrer', () => {
   it('returns an empty string for a non-URL', () => {
     expect(sanitiseReferrer('')).toBe('');
     expect(sanitiseReferrer('android-app://com.instagram.android')).toBe('');
+  });
+});
+
+describe('originOnly (issue #25, DSR erasure)', () => {
+  it('keeps scheme and host only, dropping path, query and fragment', () => {
+    expect(originOnly('https://shop.example.com/pages/x?ref=RAHUL10#top')).toBe(
+      'https://shop.example.com',
+    );
+  });
+
+  it('strips a personalised referral/influencer code in the path or query just as well as in the host case', () => {
+    expect(originOnly('https://shop.example.com/discount/RAHUL10')).toBe(
+      'https://shop.example.com',
+    );
+  });
+
+  it('passes null through as null, never as an empty string', () => {
+    expect(originOnly(null)).toBeNull();
+  });
+
+  it('returns null, not an empty string, for a non-http(s) value', () => {
+    expect(originOnly('')).toBeNull();
+    expect(originOnly('android-app://com.instagram.android')).toBeNull();
+    expect(originOnly('not a url at all')).toBeNull();
   });
 });
