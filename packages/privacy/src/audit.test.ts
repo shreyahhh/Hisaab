@@ -1,4 +1,3 @@
-import { randomBytes } from 'node:crypto';
 import { describe, expect, it } from 'vitest';
 import { AUDIT_ACTIONS } from '@truepath/shared';
 import { AuditMetadataError, isAuditAction, validateAuditMetadata } from './audit.js';
@@ -73,7 +72,11 @@ describe('validateAuditMetadata', () => {
         ['9753124680', 'phone'],
         ['+14155550123', 'phone'],
         [`k1:${'ab'.repeat(32)}`, 'hash'],
-        [randomBytes(32).toString('hex'), 'hash'],
+        // issue #87: was `randomBytes(32).toString('hex')` — a random hex string's digit runs can
+        // coincidentally also satisfy the phone regex (flaky). `'cd'.repeat(32)` is a deterministic
+        // 64-hex-char value made only of hex *letters*, so it has no decimal-digit run at all and can
+        // never match the phone heuristic, while still exercising the bare-hash (no `k1:` prefix) case.
+        ['cd'.repeat(32), 'hash'],
       ] as const) {
         const error = failure('system_scope_used', { note: value });
         expect(error.reasons, value).toEqual([`note: looks like ${kind}`]);
