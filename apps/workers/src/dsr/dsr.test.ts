@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { DelayedError } from 'bullmq';
 import { eq } from 'drizzle-orm';
 import { Redis } from 'ioredis';
-import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { ch, createClickHouseClient } from '@truepath/clickhouse';
 import {
   createDsrRequestRepository,
@@ -46,6 +46,18 @@ const suppressed = createSuppressedIdentityRepository(db);
 
 const attrAdd = vi.fn(async (..._a: unknown[]) => ({}) as never);
 
+// issue #93: the `dsr` queue's own jobs, keyed by jobId — a stand-in for the real BullMQ queue that
+// lets a test seed "another withdrawal request is still queued" without a live BullMQ connection.
+const dsrQueueJobs = new Map<string, DsrJob>();
+const dsrQueueRef = {
+  async getJob(jobId: string) {
+    const data = dsrQueueJobs.get(jobId);
+    return data ? { data } : undefined;
+  },
+};
+
+afterEach(() => dsrQueueJobs.clear());
+
 let A: TestTenant;
 let B: TestTenant;
 const tenants: TestTenant[] = [];
@@ -64,6 +76,7 @@ function deps(): DsrWorkerDeps {
     attributionQueue: { add: attrAdd } as unknown as DsrWorkerDeps['attributionQueue'],
     now: () => NOW,
     readyKey,
+    dsrQueue: dsrQueueRef,
   };
 }
 
@@ -418,6 +431,225 @@ describe('processDsr — withdrawal-triggered erasure (§4.5, narrow scope)', ()
     );
     expect(completed).toMatchObject({ id: request.id, status: 'completed' });
     expect(await auditCountFor(request.id, 'dsr_completed')).toBe(1);
+  }, 20_000);
+});
+
+describe('processDsr — issue #93: withdrawal batching (§4.5 step 2)', () => {
+  it('folds another pending withdrawal request into one run and completes both', async () => {
+    attrAdd.mockClear();
+    const v1 = 'visitor-batch-1';
+    const v2 = 'visitor-batch-2';
+    const order1 = await seedOrder(A, { visitorId: v1 });
+    const order2 = await seedOrder(A, { visitorId: v2 });
+    await seedVisitorRows(A, v1, order1.id);
+    await seedVisitorRows(A, v2, order2.id);
+
+    const req1 = await createWithdrawalRequest(A);
+    const req2 = await createWithdrawalRequest(A);
+    // req2's own job is still queued (its 60s coalescing delay hasn't fired yet) — seed its data
+    // the way eventBatch.ts's real producer does.
+    dsrQueueJobs.set(`dsr-${req2.id}`, {
+      storeId: A.storeId,
+      type: 'erasure',
+      requestId: req2.id,
+      visitorIds: [v2],
+    });
+
+    const outcome = await processDsr(
+      deps(),
+      { storeId: A.storeId, type: 'erasure', requestId: req1.id, visitorIds: [v1] },
+      'job-batch-1',
+    );
+    expect(outcome).toMatchObject({ kind: 'withdrawal', visitorsScoped: 2, ordersAffected: 2 });
+
+    expect(await countCh(A, 'events', v1)).toBe(0);
+    expect(await countCh(A, 'events', v2)).toBe(0);
+
+    const [r1] = await db
+      .select()
+      .from(schema.dsrRequests)
+      .where(eq(schema.dsrRequests.id, req1.id));
+    const [r2] = await db
+      .select()
+      .from(schema.dsrRequests)
+      .where(eq(schema.dsrRequests.id, req2.id));
+    expect(r1).toMatchObject({ status: 'completed' });
+    expect(r2).toMatchObject({ status: 'completed' });
+    expect((r2!.resultSummary as Record<string, unknown>)['batched_with']).toBe(req1.id);
+    expect(await auditCountFor(req1.id, 'dsr_completed')).toBe(1);
+    expect(await auditCountFor(req2.id, 'dsr_completed')).toBe(1);
+
+    // req2's own job, if it fired naturally afterwards, must find itself already completed.
+    const replay = await processDsr(
+      deps(),
+      { storeId: A.storeId, type: 'erasure', requestId: req2.id, visitorIds: [v2] },
+      'job-batch-1-replay',
+    );
+    expect(replay).toEqual({ kind: 'already_completed' });
+  }, 20_000);
+
+  it('completes a claimed request with a zero-effect outcome when its own job data is unrecoverable', async () => {
+    const orphan = await createWithdrawalRequest(A); // no dsrQueueJobs entry seeded — simulates a gone job
+    const v3 = 'visitor-batch-orphan-main';
+    const order3 = await seedOrder(A, { visitorId: v3 });
+    await seedVisitorRows(A, v3, order3.id);
+    const main = await createWithdrawalRequest(A);
+
+    const outcome = await processDsr(
+      deps(),
+      { storeId: A.storeId, type: 'erasure', requestId: main.id, visitorIds: [v3] },
+      'job-batch-orphan',
+    );
+    expect(outcome).toMatchObject({ kind: 'withdrawal', visitorsScoped: 1, ordersAffected: 1 });
+
+    const [orphanRow] = await db
+      .select()
+      .from(schema.dsrRequests)
+      .where(eq(schema.dsrRequests.id, orphan.id));
+    expect(orphanRow).toMatchObject({ status: 'completed' });
+    expect((orphanRow!.resultSummary as Record<string, unknown>)['note']).toBe(
+      'job_data_unavailable',
+    );
+  }, 20_000);
+});
+
+describe('processDsr — issue #93: DLQ purge (§4.4 step 5)', () => {
+  it('removes a DLQ job referencing the erased order, keeps an unrelated one', async () => {
+    const phone = '+919876599999';
+    const visitorId = 'visitor-dlq-1';
+    const order = await seedOrder(A, { phone });
+    await link(A, visitorId, phone);
+    await seedVisitorRows(A, visitorId, order.id);
+
+    const removed = vi.fn(async () => undefined);
+    const kept = vi.fn(async () => undefined);
+    const fakeDlq = {
+      getJobs: vi.fn(async () => [
+        { data: { storeId: A.storeId, orderId: order.id, attempt: 0 }, remove: removed },
+        { data: { storeId: A.storeId, orderId: 'unrelated-order', attempt: 0 }, remove: kept },
+      ]),
+    };
+
+    const { row } = await dsrRequests.createFromWebhook(storeBoundScope(A.storeId), {
+      storeId: A.storeId,
+      type: 'erasure',
+      identityHash: hash(A, phone),
+      dueAt: new Date(NOW.getTime() + 7 * 86_400_000),
+      sourceRef: 'wh-erasure-dlq-1',
+    });
+    await processDsr(
+      { ...deps(), dlqQueues: [fakeDlq] },
+      { storeId: A.storeId, type: 'erasure', requestId: row.id },
+      'job-dlq-1',
+    );
+
+    expect(removed).toHaveBeenCalledTimes(1);
+    expect(kept).not.toHaveBeenCalled();
+  }, 20_000);
+});
+
+describe('processDsr — issue #93: in-flight stream purge (§4.4 step 5)', () => {
+  it('XDELs a pending stream:events-raw entry and a stream:events-dead entry for the erased visitor', async () => {
+    const testStream = `test:${randomUUID()}:events-raw`;
+    const testDead = `test:${randomUUID()}:events-dead`;
+    const testGroup = 'test-group';
+    try {
+      await redis.xgroup('CREATE', testStream, testGroup, '0', 'MKSTREAM');
+
+      const phone = '+919876500011';
+      const visitorId = 'visitor-stream-purge-1';
+      const order = await seedOrder(A, { phone });
+      await link(A, visitorId, phone);
+      await seedVisitorRows(A, visitorId, order.id);
+
+      const payload = (vid: string): string =>
+        JSON.stringify({
+          kind: 'event',
+          store_id: A.storeId,
+          event_id: randomUUID(),
+          event_name: 'page_viewed',
+          occurred_at: NOW.toISOString(),
+          received_at: NOW.toISOString(),
+          visitor_id: vid,
+          visitor_new: false,
+          page_url: 'https://example.myshopify.com/',
+          referrer: '',
+          device_type: 'desktop',
+          os: '',
+          browser: '',
+          is_in_app_browser: 0,
+          geo_state: '',
+          geo_city: '',
+          consent_purposes: [],
+          identity: {},
+          properties: {},
+        });
+
+      await redis.xadd(testStream, '*', 'store_id', A.storeId, 'payload', payload(visitorId));
+      const keepId = (await redis.xadd(
+        testStream,
+        '*',
+        'store_id',
+        A.storeId,
+        'payload',
+        payload('visitor-unrelated'),
+      )) as string;
+      // Read (not ack) both, so they sit in the group's pending entries list.
+      await redis.xreadgroup(
+        'GROUP',
+        testGroup,
+        'test-consumer',
+        'COUNT',
+        10,
+        'STREAMS',
+        testStream,
+        '>',
+      );
+
+      await redis.xadd(
+        testDead,
+        '*',
+        'store_id',
+        A.storeId,
+        'reason',
+        'delivery_limit',
+        'payload',
+        payload(visitorId),
+      );
+      const deadKeepId = (await redis.xadd(
+        testDead,
+        '*',
+        'store_id',
+        A.storeId,
+        'reason',
+        'delivery_limit',
+        'payload',
+        payload('visitor-unrelated'),
+      )) as string;
+
+      const { row } = await dsrRequests.createFromWebhook(storeBoundScope(A.storeId), {
+        storeId: A.storeId,
+        type: 'erasure',
+        identityHash: hash(A, phone),
+        dueAt: new Date(NOW.getTime() + 7 * 86_400_000),
+        sourceRef: 'wh-erasure-stream-purge-1',
+      });
+      await processDsr(
+        {
+          ...deps(),
+          streamNames: { eventsRaw: testStream, eventsDead: testDead, group: testGroup },
+        },
+        { storeId: A.storeId, type: 'erasure', requestId: row.id },
+        'job-stream-purge',
+      );
+
+      const remainingRaw = await redis.xrange(testStream, '-', '+');
+      expect(remainingRaw.map((r) => r[0])).toEqual([keepId]);
+      const remainingDead = await redis.xrange(testDead, '-', '+');
+      expect(remainingDead.map((r) => r[0])).toEqual([deadKeepId]);
+    } finally {
+      await redis.del(testStream, testDead);
+    }
   }, 20_000);
 });
 

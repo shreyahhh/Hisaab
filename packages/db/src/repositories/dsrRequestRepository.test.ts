@@ -1,6 +1,8 @@
 import type { TenantScope } from '@truepath/shared';
+import { eq } from 'drizzle-orm';
 import { describe, expect, it } from 'vitest';
 import { createDsrRequestRepository } from './dsrRequestRepository.js';
+import { dsrRequests } from '../schema/index.js';
 import { cleanupTestTenant, db, seedTestTenant } from '../testing.js';
 
 function jobScope(organizationId: string, storeId: string): TenantScope {
@@ -294,6 +296,101 @@ describe('DsrRequestRepository — status transitions (issue #25)', () => {
         const [row] = await repo.listRecentByStore(scope, tenant.storeId, 1);
         const followups = (row?.resultSummary as { followups?: unknown[] } | null)?.followups ?? [];
         expect(followups).toHaveLength(2);
+      } finally {
+        await cleanupTestTenant(tenant);
+      }
+    });
+  });
+
+  describe('claimPendingWithdrawalBatch (issue #93, privacy-dpdp.md §4.5 step 2)', () => {
+    async function seedWithdrawal(tenant: Awaited<ReturnType<typeof seedTestTenant>>) {
+      const [row] = await db
+        .insert(dsrRequests)
+        .values({
+          storeId: tenant.storeId,
+          type: 'erasure',
+          identityHash: null,
+          dueAt: new Date(Date.now() + 86_400_000),
+          resultSummary: { trigger: 'consent_withdrawn' },
+        })
+        .returning();
+      return row!;
+    }
+
+    it('claims other pending withdrawal requests, excludes the given one, and flips them to in_progress', async () => {
+      const { tenant, scope, repo, requestId } = await seedPending('dsr-claim-exclude');
+      try {
+        const withdrawal1 = await seedWithdrawal(tenant);
+        const withdrawal2 = await seedWithdrawal(tenant);
+
+        const claimed = await repo.claimPendingWithdrawalBatch(
+          scope,
+          tenant.storeId,
+          withdrawal1.id,
+          500,
+        );
+        const claimedIds = claimed.map((r) => r.id).sort();
+        expect(claimedIds).toEqual([withdrawal2.id].sort());
+        expect(claimed.every((r) => r.status === 'in_progress')).toBe(true);
+
+        // The excluded id and the unrelated shopify_webhook-triggered row are both left alone.
+        const [untouched] = await db
+          .select()
+          .from(dsrRequests)
+          .where(eq(dsrRequests.id, withdrawal1.id));
+        expect(untouched!.status).toBe('pending');
+        const [other] = await db.select().from(dsrRequests).where(eq(dsrRequests.id, requestId));
+        expect(other!.status).toBe('pending');
+      } finally {
+        await cleanupTestTenant(tenant);
+      }
+    });
+
+    it('does not claim an already-completed or a different trigger', async () => {
+      const {
+        tenant,
+        scope,
+        repo,
+        requestId: completedId,
+      } = await seedPending('dsr-claim-skip-completed');
+      try {
+        await repo.complete(scope, tenant.storeId, completedId, {
+          resultSummaryPatch: {},
+          completedAt: new Date(),
+        });
+        const withdrawal = await seedWithdrawal(tenant);
+
+        const claimed = await repo.claimPendingWithdrawalBatch(
+          scope,
+          tenant.storeId,
+          withdrawal.id,
+          500,
+        );
+        // Only the webhook-triggered row exists besides `withdrawal` itself, and it's both the
+        // wrong trigger and already completed — neither makes it eligible.
+        expect(claimed.map((r) => r.id)).not.toContain(completedId);
+      } finally {
+        await cleanupTestTenant(tenant);
+      }
+    });
+
+    it('respects the limit', async () => {
+      const tenant = await seedTestTenant('dsr-claim-limit');
+      const scope = jobScope(tenant.organizationId, tenant.storeId);
+      try {
+        const repo = createDsrRequestRepository(db);
+        const seeded = [
+          await seedWithdrawal(tenant),
+          await seedWithdrawal(tenant),
+          await seedWithdrawal(tenant),
+        ];
+        const claimed = await repo.claimPendingWithdrawalBatch(
+          scope,
+          tenant.storeId,
+          seeded[0]!.id,
+          1,
+        );
+        expect(claimed).toHaveLength(1);
       } finally {
         await cleanupTestTenant(tenant);
       }

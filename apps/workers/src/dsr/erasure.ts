@@ -13,6 +13,10 @@ import {
 import { storeContext, type IdentityHasher } from '@truepath/privacy';
 import {
   ATTRIBUTION_RUN_JOB_OPTIONS,
+  EVENT_WORKERS_GROUP,
+  STREAM_EVENTS_DEAD,
+  STREAM_EVENTS_RAW,
+  STREAM_FIELD_STORE_ID,
   SUPPRESSION_TTL_DAYS,
   attributionRunJobId,
   checkoutKey,
@@ -21,6 +25,7 @@ import {
   type AttributionRunJob,
 } from '@truepath/shared';
 import { queueSuppressionMirror, type SuppressionMirrorOp } from '../eventSuppression.js';
+import { parseStreamEntry, toRawEntry } from '../streamEntries.js';
 import { resolveErasureScope } from './resolveErasureScope.js';
 
 // privacy-dpdp.md §4.4 (webhook erasure + §4.4 step 9 follow-up) and §4.5 (withdrawal-triggered
@@ -35,13 +40,36 @@ import { resolveErasureScope } from './resolveErasureScope.js';
 // `requestId` always points at a full `erased`-reason request, never a `withdrawn`-reason one (HLD §8
 // "Suppression set": `erased` and `withdrawn` are separate identifier-type/reason rows).
 
+/** A `<queue>-failed` DLQ, typed loosely so a real BullMQ `Queue` satisfies it structurally. */
+export interface DlqJobRef {
+  readonly data: unknown;
+  remove(): Promise<void>;
+}
+export interface DlqQueueRef {
+  getJobs(types: Array<'waiting' | 'delayed'>): Promise<DlqJobRef[]>;
+}
+
 export interface ErasureDeps {
   readonly db: Db;
   readonly clickhouse: ClickHouseClient;
-  readonly redis: Pick<Redis, 'del' | 'pipeline'>;
+  readonly redis: Pick<Redis, 'del' | 'pipeline' | 'xpending' | 'xrange' | 'xdel'>;
   readonly hasher: IdentityHasher;
   readonly attributionQueue: Pick<Queue<AttributionRunJob>, 'add'>;
   readonly now: () => Date;
+  /**
+   * issue #93: the `<queue>-failed` DLQs to scan for a job whose payload references an erased
+   * order/visitor (privacy-dpdp.md §4.4 step 5 / §4.5 step 3). Omit (or pass `[]`) to skip the
+   * scan — every call site still works without it, since suppression is re-checked at every
+   * consumption point regardless (a stray DLQ entry for an already-suppressed visitor is a no-op
+   * on its own). Production wiring passes the live set (index.ts); most tests don't need to.
+   */
+  readonly dlqQueues?: readonly DlqQueueRef[];
+  /** Test-only override of the real stream/group names (mirrors EventConsumerOptions). */
+  readonly streamNames?: {
+    readonly eventsRaw: string;
+    readonly eventsDead: string;
+    readonly group: string;
+  };
 }
 
 export interface ErasureCounts {
@@ -110,6 +138,84 @@ async function verifyVisitorRowsGone(
   }
 }
 
+const STREAM_PENDING_SCAN_LIMIT = 1000;
+const DEAD_STREAM_SCAN_PAGE = 1000;
+
+/**
+ * privacy-dpdp.md §4.4 step 5: `stream:events-raw`'s pending (not-yet-`XACK`ed) entries — the only
+ * ones that could still reach ClickHouse — and every entry on the capped `stream:events-dead`.
+ * Best-effort cleanliness, not correctness: `event-workers` re-checks suppression before writing
+ * anything, so a stray in-flight entry for an already-suppressed visitor is a no-op either way.
+ */
+async function purgeStreamEntries(
+  deps: ErasureDeps,
+  storeId: string,
+  visitorIds: ReadonlySet<string>,
+): Promise<void> {
+  if (visitorIds.size === 0) return;
+  const eventsRaw = deps.streamNames?.eventsRaw ?? STREAM_EVENTS_RAW;
+  const eventsDead = deps.streamNames?.eventsDead ?? STREAM_EVENTS_DEAD;
+  const group = deps.streamNames?.group ?? EVENT_WORKERS_GROUP;
+
+  // NOGROUP means event-workers has never run against this stream yet — nothing is pending.
+  let pending: [string, string, number, number][] | null = null;
+  try {
+    pending = (await deps.redis.xpending(eventsRaw, group, '-', '+', STREAM_PENDING_SCAN_LIMIT)) as
+      [string, string, number, number][] | null;
+  } catch (error) {
+    if (!(error instanceof Error) || !error.message.includes('NOGROUP')) throw error;
+  }
+  const toDeleteRaw: string[] = [];
+  for (const [id] of pending ?? []) {
+    const rows = await deps.redis.xrange(eventsRaw, id, id);
+    const row = rows[0];
+    if (!row) continue;
+    const raw = toRawEntry(row[0], row[1]);
+    if (raw.fields[STREAM_FIELD_STORE_ID] !== storeId) continue;
+    const parsed = parseStreamEntry(raw);
+    if (parsed && visitorIds.has(parsed.entry.visitor_id)) toDeleteRaw.push(id);
+  }
+  if (toDeleteRaw.length > 0) await deps.redis.xdel(eventsRaw, ...toDeleteRaw);
+
+  let cursor = '-';
+  const toDeleteDead: string[] = [];
+  for (;;) {
+    const rows = await deps.redis.xrange(eventsDead, cursor, '+', 'COUNT', DEAD_STREAM_SCAN_PAGE);
+    if (rows.length === 0) break;
+    for (const [id, flat] of rows) {
+      const raw = toRawEntry(id, flat);
+      if (raw.fields[STREAM_FIELD_STORE_ID] !== storeId) continue;
+      const parsed = parseStreamEntry(raw);
+      if (parsed && visitorIds.has(parsed.entry.visitor_id)) toDeleteDead.push(id);
+    }
+    if (rows.length < DEAD_STREAM_SCAN_PAGE) break;
+    cursor = `(${rows[rows.length - 1]![0]}`; // exclusive — resume just past the last id read
+  }
+  if (toDeleteDead.length > 0) await deps.redis.xdel(eventsDead, ...toDeleteDead);
+}
+
+/**
+ * privacy-dpdp.md §4.4 step 5: every `<queue>-failed` DLQ, for a job whose payload has an
+ * `orderId ∈ O` or `visitorIds` intersecting `V`. Only the payload is inspected — never the
+ * job's error message (HLD §8 "Error handling & retries": that can carry SQL parameters).
+ */
+async function purgeDlqJobs(
+  deps: ErasureDeps,
+  visitorIds: ReadonlySet<string>,
+  orderIds: ReadonlySet<string>,
+): Promise<void> {
+  if (visitorIds.size === 0 && orderIds.size === 0) return;
+  for (const queue of deps.dlqQueues ?? []) {
+    const jobs = await queue.getJobs(['waiting', 'delayed']);
+    for (const job of jobs) {
+      const data = job.data as { orderId?: string; visitorIds?: readonly string[] } | undefined;
+      const matchesOrder = data?.orderId !== undefined && orderIds.has(data.orderId);
+      const matchesVisitor = data?.visitorIds?.some((v) => visitorIds.has(v)) ?? false;
+      if (matchesOrder || matchesVisitor) await job.remove();
+    }
+  }
+}
+
 async function redisCleanup(
   deps: ErasureDeps,
   storeId: string,
@@ -122,6 +228,10 @@ async function redisCleanup(
     ...orders.map((o) => checkoutKey(scope, storeId, o.externalOrderId)),
   ];
   if (keys.length > 0) await deps.redis.del(...keys);
+
+  const visitorIdSet = new Set(visitorIds);
+  await purgeStreamEntries(deps, storeId, visitorIdSet);
+  await purgeDlqJobs(deps, visitorIdSet, new Set(orders.map((o) => o.id)));
 }
 
 function visitorHmacs(deps: ErasureDeps, storeId: string, visitorIds: readonly string[]): string[] {

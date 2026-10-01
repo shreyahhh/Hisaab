@@ -28,10 +28,22 @@ export class DsrTypeNotImplementedError extends Error {
   }
 }
 
+/** A reference to the `dsr` queue itself, typed loosely so a real BullMQ `Queue` satisfies it. */
+export interface DsrQueueRef {
+  getJob(jobId: string): Promise<{ readonly data: unknown } | undefined>;
+}
+
 export interface DsrWorkerDeps extends ErasureDeps {
   readonly redis: ErasureDeps['redis'] & Pick<Redis, 'exists' | 'scan'>;
   /** The suppression readiness marker; only tests override the default. */
   readonly readyKey?: string;
+  /**
+   * privacy-dpdp.md §4.5 step 2: looks up a claimed withdrawal request's own queued job
+   * (`dsr-<requestId>`, eventBatch.ts) to recover its raw `visitorIds` — `dsr_requests` itself only
+   * ever stores an HMAC, which cannot be reverse-joined against ClickHouse's raw `visitor_id`
+   * columns (jobs.ts's `DsrJob.visitorIds` doc comment).
+   */
+  readonly dsrQueue: DsrQueueRef;
 }
 
 export type DsrOutcome =
@@ -117,24 +129,72 @@ export async function processDsr(
     'merchant' | 'shopify_webhook' | 'consent_withdrawn' | 'consent_region_remediation';
 
   if (job.visitorIds !== undefined) {
-    // trigger === 'consent_withdrawn'
-    const counts = await runWithdrawalErasure(deps, job.storeId, job.visitorIds);
-    await dsrRequests.complete(orgScope, job.storeId, job.requestId, {
-      resultSummaryPatch: {
-        visitors_scoped: counts.visitorsScoped,
-        orders_affected: counts.ordersAffected,
-      },
-      completedAt: deps.now(),
-    });
-    await audit.write(orgScope, {
-      organizationId: store.organizationId,
-      actorUserId: null,
-      actorType: 'system',
-      action: 'dsr_completed',
-      targetType: 'dsr_request',
-      targetId: job.requestId,
-      metadata: { type: 'erasure', trigger: dsrTrigger },
-    });
+    // trigger === 'consent_withdrawn'. §4.5 step 2: fold in up to 500 other pending
+    // withdrawal-triggered requests for this store, so a burst of withdrawals issues one delete
+    // per table instead of one per visitor.
+    const claimed = await dsrRequests.claimPendingWithdrawalBatch(
+      orgScope,
+      job.storeId,
+      job.requestId,
+      500,
+    );
+    const foldedInIds: string[] = [];
+    const unresolvedIds: string[] = [];
+    const extraVisitorIds: string[] = [];
+    for (const claim of claimed) {
+      const claimedJob = await deps.dsrQueue.getJob(`dsr-${claim.id}`);
+      const parsed = claimedJob ? DsrJobSchema.safeParse(claimedJob.data) : undefined;
+      if (parsed?.success && parsed.data.visitorIds && parsed.data.visitorIds.length > 0) {
+        extraVisitorIds.push(...parsed.data.visitorIds);
+        foldedInIds.push(claim.id);
+      } else {
+        // Its own raw visitor id can't be recovered (the job is gone) — nothing to erase for it,
+        // and leaving it `in_progress` forever would strand it, so it's completed as a no-op.
+        unresolvedIds.push(claim.id);
+      }
+    }
+    const allVisitorIds = [...new Set([...job.visitorIds, ...extraVisitorIds])];
+
+    const counts = await runWithdrawalErasure(deps, job.storeId, allVisitorIds);
+
+    for (const id of unresolvedIds) {
+      await dsrRequests.complete(orgScope, job.storeId, id, {
+        resultSummaryPatch: {
+          visitors_scoped: 0,
+          orders_affected: 0,
+          note: 'job_data_unavailable',
+        },
+        completedAt: deps.now(),
+      });
+      await audit.write(orgScope, {
+        organizationId: store.organizationId,
+        actorUserId: null,
+        actorType: 'system',
+        action: 'dsr_completed',
+        targetType: 'dsr_request',
+        targetId: id,
+        metadata: { type: 'erasure', trigger: 'consent_withdrawn' },
+      });
+    }
+    for (const id of [job.requestId, ...foldedInIds]) {
+      await dsrRequests.complete(orgScope, job.storeId, id, {
+        resultSummaryPatch: {
+          visitors_scoped: counts.visitorsScoped,
+          orders_affected: counts.ordersAffected,
+          ...(id === job.requestId ? {} : { batched_with: job.requestId }),
+        },
+        completedAt: deps.now(),
+      });
+      await audit.write(orgScope, {
+        organizationId: store.organizationId,
+        actorUserId: null,
+        actorType: 'system',
+        action: 'dsr_completed',
+        targetType: 'dsr_request',
+        targetId: id,
+        metadata: { type: 'erasure', trigger: dsrTrigger },
+      });
+    }
     return {
       kind: 'withdrawal',
       visitorsScoped: counts.visitorsScoped,
