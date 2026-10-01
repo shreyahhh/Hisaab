@@ -70,6 +70,11 @@ export {
   type OrganizationRow,
 } from './repositories/organizationRepository.js';
 export {
+  createOrgDeletionRepository,
+  type EraseMembersAndInvitesResult,
+  type OrgDeletionRepository,
+} from './repositories/orgDeletionRepository.js';
+export {
   publishCollectorConfig,
   deleteCollectorConfig,
   noticeVersionOf,

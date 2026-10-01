@@ -10,28 +10,40 @@ import {
   type Db,
   type DsrRequestRow,
 } from '@truepath/db';
-import { storeBoundScope } from '@truepath/shared';
+import { storeBoundScope, type Scope } from '@truepath/shared';
 import type { Redis } from 'ioredis';
 
 // privacy-dpdp.md §4.7: `shop/redact` offboarding. Runs once, 7 days after the webhook (the enqueue
 // delay keeps the export window open). Every ClickHouse/Postgres row the store ever owned is deleted;
 // `stores`, `audit_log` and `dsr_requests` are kept as the tombstone + record — none of them hold
 // shopper data.
+//
+// `eraseStoreData` is the reusable erasure core — issue #84's org-deletion scheduler calls it
+// directly, once per store, under its own `SystemScope('org_deletion')`, with no `dsr_requests` row
+// involved (org deletion isn't a DSR webhook flow). `runStoreErasure` is the `shop/redact`-triggered
+// wrapper: it adds the DSR request's own completion + audit on top.
 
-export interface StoreErasureDeps {
+export interface StoreErasureDataDeps {
   readonly db: Db;
   readonly clickhouse: ClickHouseClient;
   readonly redis: Pick<Redis, 'scan' | 'del'>;
+}
+
+export interface StoreErasureDeps extends StoreErasureDataDeps {
   readonly now: () => Date;
 }
 
-export interface StoreErasureResult {
+export interface EraseStoreDataResult {
   readonly ordersDeleted: number;
+  readonly consentRecordsDeleted: number;
+  readonly integrationsDeleted: number;
   readonly redisKeysDeleted: number;
 }
 
+export type StoreErasureResult = EraseStoreDataResult;
+
 /** SCAN (never KEYS — this runs against the live durable Redis) every key under a store-prefixed pattern. */
-async function scanDelete(redis: StoreErasureDeps['redis'], pattern: string): Promise<number> {
+async function scanDelete(redis: StoreErasureDataDeps['redis'], pattern: string): Promise<number> {
   let cursor = '0';
   let deleted = 0;
   do {
@@ -45,7 +57,7 @@ async function scanDelete(redis: StoreErasureDeps['redis'], pattern: string): Pr
   return deleted;
 }
 
-async function verifyClickHouseEmpty(deps: StoreErasureDeps, storeId: string): Promise<void> {
+async function verifyClickHouseEmpty(deps: StoreErasureDataDeps, storeId: string): Promise<void> {
   const scoped = ch(deps.clickhouse, storeBoundScope(storeId), storeId);
   for (const table of CLICKHOUSE_TABLES) {
     const [row] = await scoped.select<{ n: string }>({
@@ -62,18 +74,17 @@ async function verifyClickHouseEmpty(deps: StoreErasureDeps, storeId: string): P
 }
 
 /**
- * privacy-dpdp.md §4.7 step 3-4: the full store_erasure job body. `request` is the already-loaded,
- * `in_progress` `dsr_requests(type='store_erasure')` row.
+ * privacy-dpdp.md §4.7 step 3: collector-config deletion, every ClickHouse table, every Postgres
+ * table `dsrStoreErasureRepository.eraseStore` covers, the Redis store-prefixed SCAN wipe, the
+ * ClickHouse-empty verification, and the `stores` tombstone. `scope` must cover `storeId` — a
+ * `SystemScope` or a `jobScope(organizationId, storeId)` both work (`assertStoreInScope` accepts
+ * either).
  */
-export async function runStoreErasure(
-  deps: StoreErasureDeps,
+export async function eraseStoreData(
+  deps: StoreErasureDataDeps,
+  scope: Scope,
   storeId: string,
-  request: DsrRequestRow,
-): Promise<StoreErasureResult> {
-  const store = await createStoreRepository(deps.db).getById(storeBoundScope(storeId), storeId);
-  if (!store) throw new Error(`store_erasure: store ${storeId} not found`);
-  const scope = jobScope(store.organizationId, storeId);
-
+): Promise<EraseStoreDataResult> {
   // The collector config is keyed by store_key (from integrations.settings), not store_id, so it
   // can't be found by a store-prefixed SCAN — delete it from every integration row before Postgres's
   // own delete removes them.
@@ -106,13 +117,36 @@ export async function runStoreErasure(
 
   await createStoreRepository(deps.db).markDeleted(scope, storeId);
 
+  return {
+    ordersDeleted: erased.orders,
+    consentRecordsDeleted: erased.consentRecords,
+    integrationsDeleted: erased.integrations,
+    redisKeysDeleted,
+  };
+}
+
+/**
+ * privacy-dpdp.md §4.7 step 3-4: the `shop/redact`-triggered store_erasure job body. `request` is
+ * the already-loaded, `in_progress` `dsr_requests(type='store_erasure')` row.
+ */
+export async function runStoreErasure(
+  deps: StoreErasureDeps,
+  storeId: string,
+  request: DsrRequestRow,
+): Promise<StoreErasureResult> {
+  const store = await createStoreRepository(deps.db).getById(storeBoundScope(storeId), storeId);
+  if (!store) throw new Error(`store_erasure: store ${storeId} not found`);
+  const scope = jobScope(store.organizationId, storeId);
+
+  const result = await eraseStoreData(deps, scope, storeId);
+
   const dsrRequests = createDsrRequestRepository(deps.db);
   await dsrRequests.complete(scope, storeId, request.id, {
     resultSummaryPatch: {
-      orders_deleted: erased.orders,
-      consent_records_deleted: erased.consentRecords,
-      integrations_deleted: erased.integrations,
-      redis_keys_deleted: redisKeysDeleted,
+      orders_deleted: result.ordersDeleted,
+      consent_records_deleted: result.consentRecordsDeleted,
+      integrations_deleted: result.integrationsDeleted,
+      redis_keys_deleted: result.redisKeysDeleted,
     },
     completedAt: deps.now(),
   });
@@ -126,5 +160,5 @@ export async function runStoreErasure(
     metadata: { type: 'store_erasure', trigger: 'shopify_webhook' },
   });
 
-  return { ordersDeleted: erased.orders, redisKeysDeleted };
+  return result;
 }
