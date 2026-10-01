@@ -87,6 +87,17 @@ function main(): void {
   const identityStitchQueue = new Queue<IdentityStitchJob>(IDENTITY_STITCH_QUEUE, { connection });
   const attributionQueue = new Queue<AttributionRunJob>(ATTRIBUTION_RUN_QUEUE, { connection });
 
+  // Hoisted (not created inline at each attachDeadLetter call) so the dsr worker can also scan them
+  // for a job referencing an order/visitor it just erased (issue #93, privacy-dpdp.md §4.4 step 5).
+  const dsrFailedQueue = new Queue<DsrJob>(`${DSR_QUEUE}-failed`, { connection });
+  const identityStitchFailedQueue = new Queue<IdentityStitchJob>(
+    `${IDENTITY_STITCH_QUEUE}-failed`,
+    { connection },
+  );
+  const adSyncMetaFailedQueue = new Queue<AdSyncMetaJob>(`${AD_SYNC_META_QUEUE}-failed`, {
+    connection,
+  });
+
   const worker = new Worker(
     SHOPIFY_SYNC_QUEUE,
     createShopifySyncProcessor({ db, adapter, cipher, hasher, redis, identityStitchQueue }),
@@ -124,11 +135,7 @@ function main(): void {
     ),
     { connection },
   );
-  attachDeadLetter(
-    stitchWorker,
-    new Queue<IdentityStitchJob>(`${IDENTITY_STITCH_QUEUE}-failed`, { connection }),
-    log,
-  );
+  attachDeadLetter(stitchWorker, identityStitchFailedQueue, log);
   console.log('apps/workers: identity-stitch worker listening');
 
   // dsr (issue #25): fulfils `erasure` jobs (webhook, withdrawal and follow-up scopes) and
@@ -139,13 +146,22 @@ function main(): void {
   const dsrWorker = new Worker<DsrJob>(
     DSR_QUEUE,
     createDsrProcessor(
-      { db, redis, clickhouse, hasher, attributionQueue, now: () => new Date() },
+      {
+        db,
+        redis,
+        clickhouse,
+        hasher,
+        attributionQueue,
+        now: () => new Date(),
+        dsrQueue,
+        dlqQueues: [dsrFailedQueue, identityStitchFailedQueue, adSyncMetaFailedQueue],
+      },
       log,
     ),
     { connection },
   );
   dsrWorker.on('failed', createDsrFailureHandler({ db }));
-  attachDeadLetter(dsrWorker, new Queue<DsrJob>(`${DSR_QUEUE}-failed`, { connection }), log);
+  attachDeadLetter(dsrWorker, dsrFailedQueue, log);
   console.log('apps/workers: dsr worker listening');
 
   // ad-sync-meta / meta-warmup (M1-8, meta-integration.md §2.2): only the `meta-warmup` job name is
@@ -165,11 +181,7 @@ function main(): void {
     },
     { connection },
   );
-  attachDeadLetter(
-    metaWarmupWorker,
-    new Queue<AdSyncMetaJob>(`${AD_SYNC_META_QUEUE}-failed`, { connection }),
-    log,
-  );
+  attachDeadLetter(metaWarmupWorker, adSyncMetaFailedQueue, log);
 
   // Registers the repeatable job for every store the operator has already registered an account for
   // (idempotent: `upsertJobScheduler` keys on the stable per-store scheduler id). A store registered

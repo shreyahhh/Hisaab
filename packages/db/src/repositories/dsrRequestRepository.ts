@@ -1,4 +1,4 @@
-import { and, desc, eq, ne, sql } from 'drizzle-orm';
+import { and, desc, eq, inArray, ne, sql } from 'drizzle-orm';
 import { assertStoreInScope, type Scope } from '@truepath/shared';
 import type { Db } from '../client.js';
 import { dsrRequests } from '../schema/index.js';
@@ -84,6 +84,21 @@ export interface DsrRequestRepository {
     requestId: string,
     input: AppendFollowupInput,
   ): Promise<{ readonly appended: boolean }>;
+
+  /**
+   * privacy-dpdp.md §4.5 step 2: claims up to `limit` other pending (`pending`/`failed`,
+   * excluding `excludeRequestId`) withdrawal-triggered (`type='erasure'`,
+   * `result_summary->>'trigger' = 'consent_withdrawn'`) requests for the store, flipping them to
+   * `in_progress` in the same transaction (`FOR UPDATE SKIP LOCKED` so a concurrent worker can't
+   * double-claim one), and returns the claimed rows. The caller still owns completing each one —
+   * this only reserves them.
+   */
+  claimPendingWithdrawalBatch(
+    scope: Scope,
+    storeId: string,
+    excludeRequestId: string,
+    limit: number,
+  ): Promise<DsrRequestRow[]>;
 }
 
 /** The only sanctioned way to write `dsr_requests` from a webhook (ADR-0016). */
@@ -231,6 +246,35 @@ export function createDsrRequestRepository(db: Db): DsrRequestRepository {
           })
           .where(and(eq(dsrRequests.id, requestId), eq(dsrRequests.storeId, storeId)));
         return { appended: true };
+      });
+    },
+
+    async claimPendingWithdrawalBatch(scope, storeId, excludeRequestId, limit) {
+      assertStoreInScope(scope, storeId);
+      return db.transaction(async (tx) => {
+        const candidates = await tx
+          .select({ id: dsrRequests.id })
+          .from(dsrRequests)
+          .where(
+            and(
+              eq(dsrRequests.storeId, storeId),
+              eq(dsrRequests.type, 'erasure'),
+              ne(dsrRequests.id, excludeRequestId),
+              inArray(dsrRequests.status, ['pending', 'failed']),
+              sql`(${dsrRequests.resultSummary}->>'trigger') = 'consent_withdrawn'`,
+            ),
+          )
+          .orderBy(dsrRequests.createdAt)
+          .limit(limit)
+          .for('update', { skipLocked: true });
+        if (candidates.length === 0) return [];
+
+        const ids = candidates.map((c) => c.id);
+        return tx
+          .update(dsrRequests)
+          .set({ status: 'in_progress' })
+          .where(inArray(dsrRequests.id, ids))
+          .returning();
       });
     },
   };
