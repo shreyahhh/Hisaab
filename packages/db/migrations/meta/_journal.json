@@ -85,6 +85,13 @@
       "when": 1790801308555,
       "tag": "0011_audit_log_attribution_confidence_backfilled",
       "breakpoints": true
+    },
+    {
+      "idx": 12,
+      "version": "7",
+      "when": 1790804782754,
+      "tag": "0012_audit_log_password_reset",
+      "breakpoints": true
     }
   ]
 }

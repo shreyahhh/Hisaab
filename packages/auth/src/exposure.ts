@@ -12,10 +12,16 @@
 export const AUTH_BASE_PATH = '/v1/auth';
 
 export interface ExposedAuthRoute {
-  readonly method: 'GET';
-  /** Relative to AUTH_BASE_PATH. */
+  readonly method: 'GET' | 'POST';
+  /** Relative to AUTH_BASE_PATH. May carry a `:param` (Fastify route syntax). */
   readonly path: string;
-  /** Why it is safe to expose without an audit row; goes into the cross-tenant exemption registry. */
+  /**
+   * Why it is safe to expose. For a read-only route, why it needs no audit row (goes into the
+   * cross-tenant exemption registry too). For a state-changing route, where its audit row actually
+   * comes from — Better Auth's HTTP router runs outside our Fastify route handlers, so these can't
+   * call `deps.audit.*` directly; they audit via a `databaseHooks`/lifecycle callback in
+   * `packages/auth/src/betterAuth.ts` instead (issue #16).
+   */
   readonly reason: string;
 }
 
@@ -35,6 +41,24 @@ export const EXPOSED_AUTH_ROUTES = [
     method: 'GET',
     path: '/error',
     reason: "Better Auth's static error page for OAuth redirects; no data, no state change.",
+  },
+  {
+    method: 'POST',
+    path: '/request-password-reset',
+    reason:
+      'Audited as password_reset_requested via the sendResetPassword hook (betterAuth.ts), written only when a real user is found — an unknown email gets Better Auth\'s own generic, unaudited "if this email exists" response, so no attempt is ever recorded against an email that was never a real account.',
+  },
+  {
+    method: 'GET',
+    path: '/reset-password/:token',
+    reason:
+      "The emailed link's redirect target: validates the token exists and isn't expired, then 302s to the dashboard's own reset page (or an error page) with it in the query string. Read-only — nothing is consumed or changed — same class as /error.",
+  },
+  {
+    method: 'POST',
+    path: '/reset-password',
+    reason:
+      'Audited as password_reset_completed via the onPasswordReset hook (betterAuth.ts), which only fires after the token is verified, consumed and the password actually changed — an invalid/expired token never reaches it.',
   },
 ] as const satisfies readonly ExposedAuthRoute[];
 
@@ -68,8 +92,8 @@ export const DISABLED_AUTH_PATHS = [
   '/verify-password',
   // Password, email and profile.
   '/change-password',
-  '/request-password-reset',
-  '/reset-password',
+  // /request-password-reset and /reset-password (+ /reset-password/:token, which this list can't
+  // hold a literal match for) are exposed and audited (issue #16) — see EXPOSED_AUTH_ROUTES.
   '/send-verification-email',
   '/verify-email',
   '/change-email',

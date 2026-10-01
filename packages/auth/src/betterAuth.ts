@@ -3,7 +3,7 @@ import { drizzleAdapter } from 'better-auth/adapters/drizzle';
 import { organization } from 'better-auth/plugins/organization';
 import { redisStorage } from '@better-auth/redis-storage';
 import { Redis } from 'ioredis';
-import { schema, type Db } from '@truepath/db';
+import { createAuditLogRepository, schema, type Db } from '@truepath/db';
 import type { AuthEnv } from '@truepath/shared';
 import { ac, adminRole, analystRole, ownerRole, viewerRole } from './accessControl.js';
 import { noopEmailSender, type AuthEmailSender } from './email.js';
@@ -101,8 +101,34 @@ export function createAuth(options: CreateAuthOptions) {
       enabled: true,
       minPasswordLength: 12,
       requireEmailVerification: true,
-      sendResetPassword: async ({ user, url }) =>
-        emailSender.sendPasswordReset({ to: user.email, url }),
+      // Issue #16: audited here, not in a Fastify route — /request-password-reset and
+      // /reset-password are bridged straight to Better Auth's own HTTP router (ADR-0022), which
+      // runs outside our route handlers entirely, so these lifecycle callbacks are the only place
+      // that sees a real, found user. Better Auth calls sendResetPassword only when the email
+      // matches an account (an unknown email gets its own generic, unaudited response), and
+      // onPasswordReset only after the token is verified, consumed and the password actually
+      // changed — so there is nothing to additionally gate here, and metadata is target_user_id
+      // only (never the email, privacy-dpdp.md's audit rule).
+      sendResetPassword: async ({ user, url }) => {
+        await emailSender.sendPasswordReset({ to: user.email, url });
+        await createAuditLogRepository(db).writePlatform({
+          actorType: 'user',
+          action: 'password_reset_requested',
+          targetType: 'auth',
+          targetId: 'password_reset',
+          metadata: { target_user_id: user.id },
+        });
+      },
+      onPasswordReset: async ({ user }) => {
+        await createAuditLogRepository(db).writePlatform({
+          actorUserId: user.id,
+          actorType: 'user',
+          action: 'password_reset_completed',
+          targetType: 'auth',
+          targetId: 'password_reset',
+          metadata: { target_user_id: user.id },
+        });
+      },
     },
     emailVerification: {
       sendVerificationEmail: async ({ user, url }) =>

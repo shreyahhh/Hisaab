@@ -1,6 +1,12 @@
-import { eq } from 'drizzle-orm';
+import { and, eq } from 'drizzle-orm';
 import { APIError } from 'better-auth/api';
-import { AUTH_BASE_PATH, DISABLED_AUTH_PATHS, EXPOSED_AUTH_ROUTES } from '@truepath/auth';
+import {
+  AUTH_BASE_PATH,
+  createAuth,
+  DISABLED_AUTH_PATHS,
+  EXPOSED_AUTH_ROUTES,
+  noopEmailSender,
+} from '@truepath/auth';
 import { schema } from '@truepath/db';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { buildTestApp, testAuth, testDb } from './testApp.js';
@@ -51,14 +57,31 @@ const exposed = (method: string, path: string) =>
 // Paths `disabledPaths` can't list because they carry a parameter, so only the allow-list covers them.
 const ALLOW_LIST_ONLY = ['/reset-password/:token'];
 
+// issue #16: unlike the three original GET routes (always 200, no input), these validate their body/
+// query and can't return 200 from an empty payload. `/request-password-reset` still can, with any
+// syntactically valid email — Better Auth never reveals whether it matches a real account, so an
+// unregistered address is exactly as good as a real one for proving the route (and the bridge's body
+// fix) actually works, without seeding a user just for this generic sweep. `/reset-password` and
+// `/reset-password/:token` are state-dependent (a real, unexpired token) and are proven properly, with
+// a real body and a real audit row, in the dedicated tests further down this file instead.
+const PAYLOAD_OVERRIDES: Record<string, unknown> = {
+  '/request-password-reset': { email: 'auth-bridge-smoke-test@example.invalid' },
+};
+const NOT_PLAIN_200 = new Set(['/reset-password', '/reset-password/:token']);
+
 const json = { origin: ORIGIN, 'content-type': 'application/json' };
 function viaApp(e: Endpoint) {
   return app.inject({
     method: e.method as 'GET' | 'POST',
     url: `${AUTH_BASE_PATH}${e.example}`,
-    headers: json,
+    // Without a trusted IP, Better Auth's rate limiter falls back to one shared bucket per path
+    // (ADR-0019's `ipAddressHeaders: ['x-forwarded-for']` config trusts only this header, and inject's
+    // own `remoteAddress` isn't it) — `/request-password-reset` in particular has its own strict
+    // built-in special rule (3 per 60s), so every test hitting it needs its own IP or they'd all
+    // collide into that single bucket.
+    headers: { ...json, 'x-forwarded-for': '10.99.1.1' },
     remoteAddress: '10.99.1.1',
-    ...(e.method === 'GET' ? {} : { payload: {} }),
+    ...(e.method === 'GET' ? {} : { payload: PAYLOAD_OVERRIDES[e.path] ?? {} }),
   });
 }
 
@@ -83,7 +106,13 @@ describe('through the app, only the allow-listed Better Auth routes are reachabl
     async (_label, e) => {
       const res = await viaApp(e);
       if (exposed(e.method, e.path)) {
-        expect(res.statusCode, 'an allow-listed route must respond').toBe(200);
+        // A reachable route is never a 404 (Fastify did register it) — exact success is only
+        // asserted where a placeholder body/query can genuinely produce it (see NOT_PLAIN_200).
+        if (NOT_PLAIN_200.has(e.path)) {
+          expect(res.statusCode, 'an allow-listed route must respond').not.toBe(404);
+        } else {
+          expect(res.statusCode, 'an allow-listed route must respond').toBe(200);
+        }
       } else {
         // Fastify's own answer: the route isn't registered, so Better Auth never sees the request.
         expect(res.statusCode).toBe(404);
@@ -98,10 +127,12 @@ describe('through the app, only the allow-listed Better Auth routes are reachabl
       .map((r) => `${r.method} ${r.url}`)
       .sort();
     const expected = [
-      ...EXPOSED_AUTH_ROUTES.flatMap((r) => [
-        `GET ${AUTH_BASE_PATH}${r.path}`,
-        `HEAD ${AUTH_BASE_PATH}${r.path}`,
-      ]),
+      // Fastify only mirrors a HEAD for a GET route, never for POST.
+      ...EXPOSED_AUTH_ROUTES.flatMap((r) =>
+        r.method === 'GET'
+          ? [`GET ${AUTH_BASE_PATH}${r.path}`, `HEAD ${AUTH_BASE_PATH}${r.path}`]
+          : [`${r.method} ${AUTH_BASE_PATH}${r.path}`],
+      ),
       `POST ${AUTH_BASE_PATH}/signup`,
       `POST ${AUTH_BASE_PATH}/login`,
       `POST ${AUTH_BASE_PATH}/logout`,
@@ -170,13 +201,19 @@ describe("Better Auth's own router refuses every disabled path, bypassing the br
 
   it('still serves the allow-listed routes', async () => {
     for (const route of EXPOSED_AUTH_ROUTES) {
+      const payload = PAYLOAD_OVERRIDES[route.path];
       const res = await testAuth.handler(
         new Request(`http://localhost:3000${AUTH_BASE_PATH}${route.path}`, {
           method: route.method,
           headers: { ...json, 'x-forwarded-for': '10.98.1.2' },
+          ...(route.method === 'POST' ? { body: JSON.stringify(payload ?? {}) } : {}),
         }),
       );
-      expect(res.status, route.path).toBe(200);
+      if (NOT_PLAIN_200.has(route.path)) {
+        expect(res.status, route.path).not.toBe(404);
+      } else {
+        expect(res.status, route.path).toBe(200);
+      }
     }
   });
 });
@@ -255,4 +292,171 @@ describe('the CSRF hook covers our /v1/auth wrappers', () => {
       expect(res.json()).toEqual({ error: 'invalid_content_type' });
     },
   );
+});
+
+// issue #16: request-password-reset and reset-password, bridged straight to Better Auth (no wrapper
+// route of our own), audited via the sendResetPassword/onPasswordReset hooks in
+// packages/auth/src/betterAuth.ts. These also double as the "a bridged POST body arrives" proof the
+// issue asks for — none of this passes unless authBridge.ts's body fix actually works, since Better
+// Auth's own zod validation on both endpoints requires the JSON body it reads.
+//
+// A verification token is ephemeral (secondaryStorage: Redis, betterAuth.ts), not a Postgres row, so
+// the only way to get the real token a test needs is the same way a shopper would: from the URL
+// sendResetPassword hands to the email sender. This file's shared `testAuth` always uses
+// `noopEmailSender` (discards the URL), so these tests build one extra Better Auth instance —
+// identical config, a capturing email sender — purely to observe that URL.
+describe('password reset (issue #16)', () => {
+  function buildResetTestApp() {
+    const sentUrls: string[] = [];
+    const auth = createAuth({
+      db: testDb,
+      env: {
+        BETTER_AUTH_SECRET: 'a'.repeat(32),
+        BETTER_AUTH_URL: 'http://localhost:3000',
+        DASHBOARD_URL: 'http://localhost:5173',
+        GOOGLE_CLIENT_ID: 'test-google-client-id',
+        GOOGLE_CLIENT_SECRET: 'test-google-client-secret',
+      },
+      redisDurableUrl: 'redis://localhost:6379',
+      allowInsecureCookies: true,
+      emailSender: {
+        ...noopEmailSender,
+        async sendPasswordReset({ url }) {
+          sentUrls.push(url);
+        },
+      },
+    });
+    return { app: buildTestApp({ auth }), auth, sentUrls };
+  }
+
+  function tokenFromUrl(url: string): string {
+    const match = /\/reset-password\/([^/?]+)/.exec(url);
+    if (!match) throw new Error(`tokenFromUrl: no token in ${url}`);
+    return match[1]!;
+  }
+
+  async function passwordResetAuditRows(
+    action: 'password_reset_requested' | 'password_reset_completed',
+  ) {
+    return testDb
+      .select()
+      .from(schema.auditLog)
+      .where(
+        and(eq(schema.auditLog.action, action), eq(schema.auditLog.targetId, 'password_reset')),
+      );
+  }
+
+  it('requesting a reset for a real user audits password_reset_requested with target_user_id only, and creates a token', async () => {
+    const reset = buildResetTestApp();
+    const owner = await seedRealTenant(reset.auth, testDb, 'reset-request-ok');
+    try {
+      const before = (await passwordResetAuditRows('password_reset_requested')).length;
+      const res = await reset.app.inject({
+        method: 'POST',
+        url: `${AUTH_BASE_PATH}/request-password-reset`,
+        headers: { ...json, 'x-forwarded-for': '10.96.1.1' },
+        remoteAddress: '10.96.1.1',
+        payload: { email: owner.email },
+      });
+      expect(res.statusCode).toBe(200);
+
+      const rows = await passwordResetAuditRows('password_reset_requested');
+      expect(rows.length).toBe(before + 1);
+      const latest = rows.sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime())[0]!;
+      expect(latest).toMatchObject({
+        organizationId: null,
+        actorUserId: null,
+        actorType: 'user',
+        metadata: { target_user_id: owner.userId },
+      });
+      expect(JSON.stringify(latest.metadata)).not.toContain(owner.email);
+
+      expect(reset.sentUrls).toHaveLength(1);
+      tokenFromUrl(reset.sentUrls[0]!); // throws if the URL doesn't carry one
+    } finally {
+      await reset.app.close();
+      await cleanupRealTenant(testDb, owner);
+    }
+  });
+
+  it('requesting a reset for an unknown email is still 200, and audits nothing', async () => {
+    const reset = buildResetTestApp();
+    try {
+      const before = (await passwordResetAuditRows('password_reset_requested')).length;
+      const res = await reset.app.inject({
+        method: 'POST',
+        url: `${AUTH_BASE_PATH}/request-password-reset`,
+        headers: { ...json, 'x-forwarded-for': '10.96.1.4' },
+        remoteAddress: '10.96.1.4',
+        payload: { email: 'reset-request-unknown@example.invalid' },
+      });
+      expect(res.statusCode).toBe(200);
+      expect((await passwordResetAuditRows('password_reset_requested')).length).toBe(before);
+      expect(reset.sentUrls).toHaveLength(0); // no email is sent for an unknown address either
+    } finally {
+      await reset.app.close();
+    }
+  });
+
+  it('completing a reset with the real token changes the password and audits password_reset_completed', async () => {
+    const reset = buildResetTestApp();
+    const owner = await seedRealTenant(reset.auth, testDb, 'reset-complete-ok');
+    try {
+      await reset.app.inject({
+        method: 'POST',
+        url: `${AUTH_BASE_PATH}/request-password-reset`,
+        headers: { ...json, 'x-forwarded-for': '10.96.1.2' },
+        remoteAddress: '10.96.1.2',
+        payload: { email: owner.email },
+      });
+      const token = tokenFromUrl(reset.sentUrls[0]!);
+      const before = (await passwordResetAuditRows('password_reset_completed')).length;
+
+      const newPassword = 'a-different-long-password-456';
+      const res = await reset.app.inject({
+        method: 'POST',
+        url: `${AUTH_BASE_PATH}/reset-password`,
+        headers: { ...json, 'x-forwarded-for': '10.96.1.2' },
+        remoteAddress: '10.96.1.2',
+        payload: { token, newPassword },
+      });
+      expect(res.statusCode).toBe(200);
+
+      const rows = await passwordResetAuditRows('password_reset_completed');
+      expect(rows.length).toBe(before + 1);
+      const latest = rows.sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime())[0]!;
+      expect(latest).toMatchObject({
+        organizationId: null,
+        actorUserId: owner.userId,
+        actorType: 'user',
+        metadata: { target_user_id: owner.userId },
+      });
+
+      const signIn = await reset.auth.api.signInEmail({
+        body: { email: owner.email, password: newPassword },
+      });
+      expect(signIn.user.id).toBe(owner.userId);
+    } finally {
+      await reset.app.close();
+      await cleanupRealTenant(testDb, owner);
+    }
+  });
+
+  it('an invalid token is rejected and audits nothing (failure path)', async () => {
+    const reset = buildResetTestApp();
+    try {
+      const before = (await passwordResetAuditRows('password_reset_completed')).length;
+      const res = await reset.app.inject({
+        method: 'POST',
+        url: `${AUTH_BASE_PATH}/reset-password`,
+        headers: { ...json, 'x-forwarded-for': '10.96.1.3' },
+        remoteAddress: '10.96.1.3',
+        payload: { token: 'not-a-real-token', newPassword: 'a-different-long-password-456' },
+      });
+      expect(res.statusCode).toBe(400);
+      expect((await passwordResetAuditRows('password_reset_completed')).length).toBe(before);
+    } finally {
+      await reset.app.close();
+    }
+  });
 });
