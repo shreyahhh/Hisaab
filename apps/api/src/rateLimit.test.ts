@@ -4,7 +4,13 @@ import { schema } from '@truepath/db';
 import { purposeContext } from '@truepath/privacy';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { LIMITS } from './rateLimit.js';
-import { buildTestApp, testDb, testHasher, testRedis } from './testApp.js';
+import {
+  buildTestApp,
+  testDb,
+  testHasher,
+  testRedis,
+  TEST_RATE_LIMIT_NAMESPACE,
+} from './testApp.js';
 
 // Our own routes call `auth.api.*` directly, which skips Better Auth's rate limiter (verified in
 // packages/auth: 15 direct signInEmail calls never returned 429) — so they carry their own,
@@ -154,7 +160,10 @@ describe('POST /v1/auth/login — per-IP and per-account limits', () => {
       password: 'wrong-password-long-enough',
     });
     expect(otherEmail.statusCode).not.toBe(429);
-  });
+    // 22 real signIn attempts (each a Better Auth password check) comfortably clear Vitest's
+    // default 5 s under serial execution, but can brush against it under issue #11's parallel
+    // workers all doing the same CPU-bound password hashing at once.
+  }, 15_000);
 });
 
 describe('login rate limiting by hashed email', () => {
@@ -173,7 +182,9 @@ describe('login rate limiting by hashed email', () => {
   });
 
   it('puts every unusable email in one shared bucket instead of a key per value', async () => {
-    const pattern = '*:email:invalid';
+    // Scoped to this worker's own nameSpace (issue #11): every unusable email really does share
+    // one bucket, but only among requests this worker's own rate limiter sees.
+    const pattern = `${TEST_RATE_LIMIT_NAMESPACE}*:email:invalid`;
     const stale = await testRedis.keys(pattern);
     if (stale.length > 0) await testRedis.del(...stale);
 
@@ -208,7 +219,7 @@ describe('rate-limit keys on the durable Redis', () => {
     const email = uniqueEmail();
     await post('/v1/auth/login', ip, { email, password: 'wrong-password-long-enough' });
 
-    const keys = await testRedis.keys('rl:*');
+    const keys = await testRedis.keys(`${TEST_RATE_LIMIT_NAMESPACE}*`);
     expect(keys.length).toBeGreaterThan(0);
     expect(keys.some((k) => k.includes(ip) || k.includes(email))).toBe(false);
 
