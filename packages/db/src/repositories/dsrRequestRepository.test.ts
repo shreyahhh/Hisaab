@@ -197,6 +197,20 @@ describe('DsrRequestRepository — status transitions (issue #25)', () => {
         await cleanupTestTenant(tenant);
       }
     });
+
+    it('never downgrades an already-completed row (a follow-up purge failing must not un-complete the original erasure)', async () => {
+      const { tenant, scope, repo, requestId } = await seedPending('dsr-fail-completed');
+      try {
+        await repo.complete(scope, tenant.storeId, requestId, {
+          resultSummaryPatch: {},
+          completedAt: new Date(),
+        });
+        const row = await repo.fail(scope, tenant.storeId, requestId);
+        expect(row.status).toBe('completed');
+      } finally {
+        await cleanupTestTenant(tenant);
+      }
+    });
   });
 
   describe('appendFollowup', () => {

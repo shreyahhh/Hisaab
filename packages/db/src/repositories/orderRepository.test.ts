@@ -557,5 +557,45 @@ describe('OrderRepository — identity-stitching methods', () => {
         await cleanupTestTenant(t);
       }
     });
+
+    it('unlinkVisitor nulls only visitor_id, keeping the phone/email hashes (§4.5 withdrawal scope)', async () => {
+      const t = await seedTestTenant('dsr-order-unlink-visitor');
+      try {
+        const repo = createOrderRepository(db);
+        const scope = jobScope(t.organizationId, t.storeId);
+        const result = await repo.applySnapshot(
+          scope,
+          baseInput(t.storeId, {
+            externalOrderId: 'withdraw-1',
+            phoneHashHmac: HASH(30),
+            emailHashHmac: HASH(31),
+          }),
+        );
+        await repo.linkVisitorIfUnset(scope, t.storeId, result.orderId, 'visitor-withdrawing');
+
+        const { updated } = await repo.unlinkVisitor(scope, t.storeId, [result.orderId]);
+        expect(updated).toBe(1);
+
+        const [row] = await db.select().from(orders).where(eq(orders.id, result.orderId));
+        expect(row).toMatchObject({
+          visitorId: null,
+          phoneHashHmac: HASH(30),
+          emailHashHmac: HASH(31),
+        });
+      } finally {
+        await cleanupTestTenant(t);
+      }
+    });
+
+    it('unlinkVisitor is a no-op for an empty orderIds list', async () => {
+      const t = await seedTestTenant('dsr-order-unlink-visitor-empty');
+      try {
+        const repo = createOrderRepository(db);
+        const scope = jobScope(t.organizationId, t.storeId);
+        expect(await repo.unlinkVisitor(scope, t.storeId, [])).toEqual({ updated: 0 });
+      } finally {
+        await cleanupTestTenant(t);
+      }
+    });
   });
 });

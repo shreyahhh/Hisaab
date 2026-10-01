@@ -11,6 +11,7 @@ import {
   testDb,
   testHasher,
   testRedis,
+  testDsrQueue,
   testIdentityStitchQueue,
   testShopifySyncQueue,
   TEST_DASHBOARD_URL,
@@ -124,6 +125,7 @@ function appWith(adapterOptions: FakeAdapterOptions = {}) {
       dashboardUrl: TEST_DASHBOARD_URL,
       shopifySyncQueue: testShopifySyncQueue,
       identityStitchQueue: testIdentityStitchQueue,
+      dsrQueue: testDsrQueue,
     },
   });
 }

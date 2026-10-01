@@ -8,7 +8,7 @@ import type { ClickHouseClient } from '@truepath/clickhouse';
 import { createAuditLogRepository, type Db } from '@truepath/db';
 import type { ShopifyAdapter } from '@truepath/integrations';
 import type { CredentialsCipher, IdentityHasher } from '@truepath/privacy';
-import type { IdentityStitchJob, ShopifySyncJob } from '@truepath/shared';
+import type { DsrJob, IdentityStitchJob, ShopifySyncJob } from '@truepath/shared';
 import { createAuditService, type AuditService } from './audit.js';
 import { registerAuthBridge } from './authBridge.js';
 import { registerAuthErrorHandler, type ErrorReporter } from './errors.js';
@@ -54,6 +54,8 @@ export interface ShopifyDeps {
   readonly shopifySyncQueue: Queue<ShopifySyncJob>;
   /** HLD §8 `identity-stitch` queue — an applied order webhook enqueues attempt 0 (M1-7). */
   readonly identityStitchQueue: Queue<IdentityStitchJob>;
+  /** HLD §8 `dsr` queue — `customers/redact` enqueues its erasure job immediately (issue #25). */
+  readonly dsrQueue: Queue<DsrJob>;
   /** Public Collector base URL baked into the pixel's settings (M1-4). Unset → the pixel isn't installed. */
   readonly collectorUrl?: string;
 }
@@ -156,6 +158,7 @@ export function buildApp(deps: AppDeps): FastifyInstance {
       shopifySyncQueue: deps.shopify.shopifySyncQueue,
       redis: deps.shopify.redis,
       identityStitchQueue: deps.shopify.identityStitchQueue,
+      dsrQueue: deps.shopify.dsrQueue,
     });
   });
 

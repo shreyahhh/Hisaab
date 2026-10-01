@@ -463,10 +463,12 @@ describe('processEventBatch', () => {
       identityHash: visitorHmac(v),
       resultSummary: { trigger: 'consent_withdrawn' },
     });
+    // visitorIds carries the raw visitor id (not its HMAC): ClickHouse's visitor_id columns hold the
+    // raw token, which the erasure job could never find rows for from identityHash/visitorHmac alone.
     expect(dsrAdd).toHaveBeenCalledWith(
       'erasure',
-      { storeId: storeId(), type: 'erasure', requestId },
-      { jobId: `dsr-${requestId}`, delay: 60_000 },
+      { storeId: storeId(), type: 'erasure', requestId, visitorIds: [v] },
+      expect.objectContaining({ jobId: `dsr-${requestId}`, delay: 60_000, attempts: 5 }),
     );
 
     // the next page view of that visitor is dropped at the re-check
@@ -559,7 +561,10 @@ describe('processEventBatch', () => {
         requestId: erasure!.id,
         visitorIds: ['visitor-newdevice'],
       },
-      { jobId: `dsr-followup-${erasure!.id}-${suppression!.id}` },
+      expect.objectContaining({
+        jobId: `dsr-followup-${erasure!.id}-${suppression!.id}`,
+        attempts: 5,
+      }),
     );
     expect(
       (await chRows<{ visitor_id: string }>('events', ['visitor_id'])).some(

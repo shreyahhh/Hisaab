@@ -13,6 +13,7 @@ import {
   clickhouseEnvSchema,
   credentialsKeyEnvSchema,
   dpaEnvSchema,
+  DSR_QUEUE,
   identityKeyEnvSchema,
   IDENTITY_STITCH_QUEUE,
   loadDotEnvIfPresent,
@@ -23,6 +24,7 @@ import {
   SHOPIFY_OAUTH_SCOPES,
   SHOPIFY_SYNC_QUEUE,
   shopifyEnvSchema,
+  type DsrJob,
   type IdentityStitchJob,
   type ShopifySyncJob,
 } from '@truepath/shared';
@@ -103,6 +105,7 @@ function main(): void {
   const identityStitchQueue = new Queue<IdentityStitchJob>(IDENTITY_STITCH_QUEUE, {
     connection: queueConnection,
   });
+  const dsrQueue = new Queue<DsrJob>(DSR_QUEUE, { connection: queueConnection });
 
   const shopify: ShopifyDeps = {
     adapter,
@@ -114,6 +117,7 @@ function main(): void {
     dashboardUrl: env.DASHBOARD_URL,
     shopifySyncQueue,
     identityStitchQueue,
+    dsrQueue,
     ...(env.COLLECTOR_PUBLIC_URL ? { collectorUrl: env.COLLECTOR_PUBLIC_URL } : {}),
   };
 

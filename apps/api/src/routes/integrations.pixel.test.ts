@@ -16,6 +16,7 @@ import {
   testDb,
   testHasher,
   testRedis,
+  testDsrQueue,
   testIdentityStitchQueue,
   testShopifySyncQueue,
   TEST_DASHBOARD_URL,
@@ -88,6 +89,7 @@ function appWith(
       dashboardUrl: TEST_DASHBOARD_URL,
       shopifySyncQueue: testShopifySyncQueue,
       identityStitchQueue: testIdentityStitchQueue,
+      dsrQueue: testDsrQueue,
       ...(collectorUrl ? { collectorUrl } : {}),
     },
   });
@@ -523,6 +525,7 @@ describe('rotateSigningKey / completeKeyRotation (S-6, issue #45)', () => {
         dashboardUrl: TEST_DASHBOARD_URL,
         shopifySyncQueue: testShopifySyncQueue,
         identityStitchQueue: testIdentityStitchQueue,
+        dsrQueue: testDsrQueue,
         collectorUrl: COLLECTOR_URL,
       },
     });

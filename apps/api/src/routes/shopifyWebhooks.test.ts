@@ -10,6 +10,7 @@ import {
   buildTestApp,
   testCredentialsCipher,
   testDb,
+  testDsrQueue,
   testHasher,
   testIdentityStitchQueue,
   testRedis,
@@ -514,6 +515,9 @@ describe('POST /webhooks/shopify/compliance', () => {
       .from(schema.auditLog)
       .where(eq(schema.auditLog.targetId, rows[0]!.id));
     expect(auditRows[0]?.action).toBe('dsr_created');
+
+    // `access` has no fulfilment pipeline yet (SPEC v0.5: needs an S3 export bucket) — no job enqueued.
+    expect(await testDsrQueue.getJob(`dsr-${rows[0]!.id}`)).toBeUndefined();
   });
 
   it('customers/redact creates a dsr_requests(type=erasure) receipt', async () => {
@@ -540,6 +544,13 @@ describe('POST /webhooks/shopify/compliance', () => {
     expect(rows).toHaveLength(1);
     expect(rows[0]?.type).toBe('erasure');
     expect(rows[0]?.identityHash).not.toBeNull();
+
+    const job = await testDsrQueue.getJob(`dsr-${rows[0]!.id}`);
+    expect(job?.data).toMatchObject({
+      storeId: t.storeId,
+      type: 'erasure',
+      requestId: rows[0]!.id,
+    });
   });
 
   it('shop/redact creates a dsr_requests(type=store_erasure) receipt with a null identity hash', async () => {
@@ -561,6 +572,9 @@ describe('POST /webhooks/shopify/compliance', () => {
     expect(rows).toHaveLength(1);
     expect(rows[0]?.type).toBe('store_erasure');
     expect(rows[0]?.identityHash).toBeNull();
+
+    // store_erasure fulfilment lands with issue #25's third PR — not enqueued yet.
+    expect(await testDsrQueue.getJob(`dsr-${rows[0]!.id}`)).toBeUndefined();
   });
 
   it('is idempotent: a retried compliance webhook (same X-Shopify-Webhook-Id) creates only one receipt', async () => {
