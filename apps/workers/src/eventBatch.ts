@@ -1,4 +1,4 @@
-import type { Queue } from 'bullmq';
+import type { JobsOptions, Queue } from 'bullmq';
 import type { Redis } from 'ioredis';
 import { ch, type ClickHouseClient } from '@truepath/clickhouse';
 import {
@@ -11,6 +11,7 @@ import { storeContext, type IdentityHasher } from '@truepath/privacy';
 import {
   CHECKOUT_KEY_TTL_SECONDS,
   DEDUPE_TTL_SECONDS,
+  DSR_JOB_OPTIONS,
   DSR_WITHDRAWAL_DELAY_MS,
   SUPPRESSION_TTL_DAYS,
   campaignFingerprint,
@@ -457,7 +458,7 @@ export async function processEventBatch(
   const withdrawalDueAt = new Date(now.getTime() + 86_400_000);
   const effects = createEventEffectsRepository(deps.db);
   const mirror: SuppressionMirrorOp[] = [];
-  const jobs: { name: string; data: DsrJob; opts: { jobId: string; delay?: number } }[] = [];
+  const jobs: { name: string; data: DsrJob; opts: JobsOptions }[] = [];
   let withdrawals = 0;
   let hitsHandled = 0;
   let hitsUnmatched = 0;
@@ -477,6 +478,10 @@ export async function processEventBatch(
     const consentRecords: ConsentRecordInput[] = [];
     const consentChanges: ConsentChange[] = [];
     const checkoutLinks: { externalOrderId: string; visitorId: string }[] = [];
+    // The raw (pseudonymous) visitor id behind each withdrawal's event_id — ClickHouse's visitor_id
+    // columns hold the raw token, not an HMAC, so the erasure job needs this to find its rows at all
+    // (DsrJob.visitorIds doc comment, issue #25 decision 1).
+    const withdrawalVisitorByEvent = new Map<string, string>();
     for (const item of items) {
       const { e } = item;
       if (item.isConsent) {
@@ -496,6 +501,7 @@ export async function processEventBatch(
             eventId: e.event_id,
             visitorHmac: hasher.hmac(hctx, e.visitor_id),
           });
+          withdrawalVisitorByEvent.set(e.event_id, e.visitor_id);
         } else if (e.consent_purposes.includes('attribution_analytics')) {
           // A grant without analytics (marketing only) doesn't bring a withdrawn visitor back.
           consentChanges.push({ kind: 'grant', visitorHmacs: hasher.hmacAll(hctx, e.visitor_id) });
@@ -557,10 +563,20 @@ export async function processEventBatch(
     }
     for (const request of result.withdrawalRequests) {
       withdrawals += 1;
+      const visitorId = withdrawalVisitorByEvent.get(request.eventId);
       jobs.push({
         name: 'erasure',
-        data: { storeId, type: 'erasure', requestId: request.requestId },
-        opts: { jobId: `dsr-${request.requestId}`, delay: DSR_WITHDRAWAL_DELAY_MS },
+        data: {
+          storeId,
+          type: 'erasure',
+          requestId: request.requestId,
+          ...(visitorId !== undefined ? { visitorIds: [visitorId] } : {}),
+        },
+        opts: {
+          jobId: `dsr-${request.requestId}`,
+          delay: DSR_WITHDRAWAL_DELAY_MS,
+          ...DSR_JOB_OPTIONS,
+        },
       });
     }
     result.suppressionHitRequests.forEach((hit, n) => {
@@ -585,7 +601,7 @@ export async function processEventBatch(
           visitorIds: [hitList[n]!.visitorId],
         },
         // BullMQ rejects ':' in custom ids (and the visitor's HMAC must not end up in a logged id).
-        opts: { jobId: `dsr-followup-${hit.requestId}-${hit.suppressionId}` },
+        opts: { jobId: `dsr-followup-${hit.requestId}-${hit.suppressionId}`, ...DSR_JOB_OPTIONS },
       });
     });
   }

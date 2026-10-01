@@ -65,7 +65,12 @@ export interface DsrRequestRepository {
     input: CompleteDsrRequestInput,
   ): Promise<DsrRequestRow>;
 
-  /** `status='failed'` — the job exhausted its BullMQ retries (DSR_JOB_OPTIONS: 5 attempts). */
+  /**
+   * `status='failed'` — the job exhausted its BullMQ retries (DSR_JOB_OPTIONS: 5 attempts). Never
+   * downgrades an already-`completed` row: a follow-up purge job (issue #25 §4.4 step 9) shares its
+   * `requestId` with the original, already-finished erasure, and a failure in the follow-up must not
+   * make a successfully completed erasure look failed.
+   */
   fail(scope: Scope, storeId: string, requestId: string): Promise<DsrRequestRow>;
 
   /**
@@ -169,13 +174,25 @@ export function createDsrRequestRepository(db: Db): DsrRequestRepository {
 
     async fail(scope, storeId, requestId) {
       assertStoreInScope(scope, storeId);
-      const [row] = await db
+      const [updated] = await db
         .update(dsrRequests)
         .set({ status: 'failed' })
-        .where(and(eq(dsrRequests.id, requestId), eq(dsrRequests.storeId, storeId)))
+        .where(
+          and(
+            eq(dsrRequests.id, requestId),
+            eq(dsrRequests.storeId, storeId),
+            ne(dsrRequests.status, 'completed'),
+          ),
+        )
         .returning();
-      if (!row) throw new Error('fail: no such dsr_requests row');
-      return row;
+      if (updated) return updated;
+
+      const [existing] = await db
+        .select()
+        .from(dsrRequests)
+        .where(and(eq(dsrRequests.id, requestId), eq(dsrRequests.storeId, storeId)));
+      if (!existing) throw new Error('fail: no such dsr_requests row');
+      return existing; // already completed — never downgraded
     },
 
     async appendFollowup(scope, storeId, requestId, input) {

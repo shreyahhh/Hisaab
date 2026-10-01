@@ -7,11 +7,13 @@ import { createShopifyAdapter } from '@truepath/integrations';
 import { createTestCredentialsCipher, createTestIdentityHasher } from '@truepath/privacy/testing';
 import {
   clickhouseEnvSchema,
+  DSR_QUEUE,
   loadDotEnvIfPresent,
   loadEnv,
   postgresEnvSchema,
   IDENTITY_STITCH_QUEUE,
   SHOPIFY_SYNC_QUEUE,
+  type DsrJob,
   type IdentityStitchJob,
   type ShopifySyncJob,
 } from '@truepath/shared';
@@ -84,6 +86,12 @@ export const testIdentityStitchQueue = new Queue<IdentityStitchJob>(IDENTITY_STI
   prefix: 'bull-test',
 });
 
+// Same isolation for dsr: a real dsr worker on this Redis must never consume these jobs.
+export const testDsrQueue = new Queue<DsrJob>(DSR_QUEUE, {
+  connection: testQueueRedis,
+  prefix: 'bull-test',
+});
+
 export const testShopify: ShopifyDeps = {
   adapter: testShopifyAdapter,
   cipher: testCredentialsCipher,
@@ -94,6 +102,7 @@ export const testShopify: ShopifyDeps = {
   dashboardUrl: TEST_DASHBOARD_URL,
   shopifySyncQueue: testShopifySyncQueue,
   identityStitchQueue: testIdentityStitchQueue,
+  dsrQueue: testDsrQueue,
 };
 
 export function buildTestApp(overrides: Partial<AppDeps> = {}) {

@@ -332,6 +332,12 @@ export const repositoryRegistry: readonly RepositoryDescriptor[] = [
         invoke: (db, scope, storeId) =>
           createOrderRepository(db).anonymiseErasedOrders(scope, storeId, [NEVER_MATCHES]),
       },
+      {
+        name: 'unlinkVisitor',
+        scopeKind: 'store',
+        invoke: (db, scope, storeId) =>
+          createOrderRepository(db).unlinkVisitor(scope, storeId, [NEVER_MATCHES]),
+      },
     ],
   },
   {

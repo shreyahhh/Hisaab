@@ -27,8 +27,10 @@ import {
   type SuppressionReader,
 } from '@truepath/privacy';
 import {
+  DSR_JOB_OPTIONS,
   IDENTITY_STITCH_JOB_OPTIONS,
   identityStitchJobId,
+  type DsrJob,
   type IdentityStitchJob,
   type ShopifySyncJob,
   type TenantScope,
@@ -86,6 +88,12 @@ export interface ShopifyWebhookDeps {
   readonly redis: SuppressionReader & Pick<Redis, 'del'>;
   /** HLD §8 `identity-stitch`: an applied order enqueues attempt 0 (identity-stitching.md §2.1). */
   readonly identityStitchQueue: Pick<Queue<IdentityStitchJob>, 'add'>;
+  /**
+   * HLD §8 `dsr`: `customers/redact` enqueues its erasure job immediately. `store_erasure`
+   * (`shop/redact`) isn't enqueued yet — issue #25's third PR adds that alongside its fulfilment, so
+   * the receipt-only M1-1 behaviour for it is unchanged here.
+   */
+  readonly dsrQueue: Pick<Queue<DsrJob>, 'add'>;
 }
 
 /** What applying an order needs beyond the database: the suppression check and the stitch queue. */
@@ -126,7 +134,7 @@ async function handleAppUninstalled(
  * does not fulfil it — see the tracked, launch-blocking follow-up issue for the DSR pipeline.
  */
 async function handleComplianceWebhook(
-  deps: TenantScopeDeps & { hasher: IdentityHasher },
+  deps: TenantScopeDeps & { hasher: IdentityHasher; dsrQueue: Pick<Queue<DsrJob>, 'add'> },
   scope: TenantScope,
   storeId: string,
   topic: (typeof COMPLIANCE_TOPICS)[number],
@@ -172,6 +180,16 @@ async function handleComplianceWebhook(
     targetId: row.id,
     metadata: { type, trigger: 'shopify_webhook' },
   });
+
+  // `access` isn't enqueued (SPEC v0.5: needs an S3 export bucket, out of this phase); `store_erasure`
+  // isn't enqueued yet either (issue #25's third PR adds it alongside its fulfilment).
+  if (type === 'erasure') {
+    await deps.dsrQueue.add(
+      'erasure',
+      { storeId, type: 'erasure', requestId: row.id },
+      { jobId: `dsr-${row.id}`, ...DSR_JOB_OPTIONS },
+    );
+  }
 }
 
 /**
@@ -498,7 +516,7 @@ export function registerShopifyWebhookRoutes(
           shopifyTopic === 'shop/redact'
         ) {
           await handleComplianceWebhook(
-            { ...deps, hasher: webhook.hasher },
+            { ...deps, hasher: webhook.hasher, dsrQueue: webhook.dsrQueue },
             scope,
             resolved.id,
             shopifyTopic,

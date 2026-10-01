@@ -135,6 +135,17 @@ export interface OrderRepository {
     storeId: string,
     orderIds: readonly string[],
   ): Promise<{ readonly updated: number }>;
+  /**
+   * Issue #25 (privacy-dpdp.md §4.5 step 3, withdrawal-triggered erasure): nulls only `visitor_id` —
+   * the phone/email hashes are kept, because they come from the merchant's own order system, not the
+   * pixel, and the consent being withdrawn covers pixel tracking only (§4.5's counsel note). A no-op
+   * (0 updated) for an empty `orderIds`.
+   */
+  unlinkVisitor(
+    scope: Scope,
+    storeId: string,
+    orderIds: readonly string[],
+  ): Promise<{ readonly updated: number }>;
 }
 
 /** The only sanctioned way to read/write `orders`/`order_status_events` (ADR-0016). */
@@ -407,6 +418,17 @@ export function createOrderRepository(db: Db): OrderRepository {
         }
       });
       return { updated };
+    },
+
+    async unlinkVisitor(scope, storeId, orderIds) {
+      assertStoreInScope(scope, storeId);
+      if (orderIds.length === 0) return { updated: 0 };
+      const updated = await db
+        .update(orders)
+        .set({ visitorId: null })
+        .where(and(eq(orders.storeId, storeId), inArray(orders.id, [...orderIds])))
+        .returning({ id: orders.id });
+      return { updated: updated.length };
     },
   };
 }
