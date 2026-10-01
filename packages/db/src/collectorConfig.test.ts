@@ -2,7 +2,11 @@ import { randomInt } from 'node:crypto';
 import { describe, expect, it } from 'vitest';
 import { createTestCredentialsCipher } from '@truepath/privacy/testing';
 import type { TenantScope } from '@truepath/shared';
-import { publishCollectorConfig, type CollectorConfigSink } from './collectorConfig.js';
+import {
+  deleteCollectorConfig,
+  publishCollectorConfig,
+  type CollectorConfigSink,
+} from './collectorConfig.js';
 import { createDpaAcceptanceRepository } from './repositories/dpaAcceptanceRepository.js';
 import { createIntegrationRepository } from './repositories/integrationRepository.js';
 import { createOrganizationRepository } from './repositories/organizationRepository.js';
@@ -179,5 +183,23 @@ describe('publishCollectorConfig — organization status (issue #8)', () => {
     } finally {
       await cleanupTestTenant(tenant);
     }
+  });
+});
+
+describe('deleteCollectorConfig (issue #44/#25)', () => {
+  it('deletes the key for the store_key carried in settings', async () => {
+    const deleted: string[] = [];
+    const sink = { del: async (key: string) => void deleted.push(key) };
+    await deleteCollectorConfig(sink, { store_key: 'pk_' + '0'.repeat(24) });
+    expect(deleted).toEqual([`collector:store:pk_${'0'.repeat(24)}`]);
+  });
+
+  it('is a no-op when settings carries no store_key', async () => {
+    const deleted: string[] = [];
+    const sink = { del: async (key: string) => void deleted.push(key) };
+    await deleteCollectorConfig(sink, {});
+    await deleteCollectorConfig(sink, null);
+    await deleteCollectorConfig(sink, { store_key: 'not-a-valid-pattern' });
+    expect(deleted).toEqual([]);
   });
 });

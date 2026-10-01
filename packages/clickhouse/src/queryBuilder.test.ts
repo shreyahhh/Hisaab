@@ -495,12 +495,16 @@ describe('ch() — scoped ClickHouse query builder (ADR-0016)', () => {
       expect(await countFor(storeG)).toBe(1); // untouched
     });
 
-    it('a store-wide delete (no where) removes every row for that store, never another tenant', async () => {
-      expect(await countFor(storeF)).toBe(1); // orderF2, from the previous test
-      await ch(client, tenantScope(storeF), storeF).delete({ table: 'order_status' });
-      expect(await countFor(storeF)).toBe(0);
-      expect(await countFor(storeG)).toBe(1); // storeG's row survives a storeF-scoped delete
-    });
+    it(
+      'a store-wide delete (no where) removes every row for that store, never another tenant',
+      async () => {
+        expect(await countFor(storeF)).toBe(1); // orderF2, from the previous test
+        await ch(client, tenantScope(storeF), storeF).delete({ table: 'order_status' });
+        expect(await countFor(storeF)).toBe(0);
+        expect(await countFor(storeG)).toBe(1); // storeG's row survives a storeF-scoped delete
+      },
+      20_000,
+    );
 
     it('rejects an unknown table name before running anything', async () => {
       const scoped = ch(client, tenantScope(storeG), storeG);

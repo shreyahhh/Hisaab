@@ -71,9 +71,11 @@ export {
 } from './repositories/organizationRepository.js';
 export {
   publishCollectorConfig,
+  deleteCollectorConfig,
   noticeVersionOf,
   type CollectorConfigDeps,
   type CollectorConfigSink,
+  type CollectorConfigDeleteSink,
 } from './collectorConfig.js';
 export {
   createCollectorConfigRepository,
@@ -131,6 +133,11 @@ export {
   createCapiDispatchLogRepository,
   type CapiDispatchLogRepository,
 } from './repositories/capiDispatchLogRepository.js';
+export {
+  createDsrStoreErasureRepository,
+  type DsrStoreErasureRepository,
+  type EraseStoreResult,
+} from './repositories/dsrStoreErasureRepository.js';
 export {
   repositoryRegistry,
   type RepositoryDescriptor,

@@ -48,6 +48,13 @@ export interface StoreRepository {
    * Idempotent: a repeat confirmation is a no-op that returns the existing timestamp.
    */
   confirmIndiaOptIn(scope: Scope, storeId: string): Promise<ConfirmIndiaOptInResult | null>;
+  /**
+   * Issue #25 (privacy-dpdp.md §4.7 step 3): the final step of `store_erasure` — `status='deleted'`
+   * and `privacy_config` nulled back to `{}` (it can carry a grievance contact name/email/phone).
+   * The row itself, `audit_log` and `dsr_requests` are kept as the tombstone + record; they hold no
+   * shopper data. Idempotent: returns null if already deleted.
+   */
+  markDeleted(scope: Scope, storeId: string): Promise<StoreRow | null>;
 }
 
 function asRecord(value: unknown): Record<string, unknown> {
@@ -147,6 +154,15 @@ export function createStoreRepository(db: Db): StoreRepository {
         if (!updated) throw new Error('confirmIndiaOptIn: update did not return a row');
         return { store: updated, alreadyConfirmed: false };
       });
+    },
+    async markDeleted(scope, storeId) {
+      assertStoreInScope(scope, storeId);
+      const rows = await db
+        .update(stores)
+        .set({ status: 'deleted', privacyConfig: {} })
+        .where(and(eq(stores.id, storeId), ne(stores.status, 'deleted')))
+        .returning();
+      return rows[0] ?? null;
     },
   };
 }

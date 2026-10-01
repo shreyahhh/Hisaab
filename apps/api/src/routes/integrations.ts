@@ -5,6 +5,7 @@ import { resolveMembership } from '@truepath/auth';
 import {
   createIntegrationRepository,
   createStoreRepository,
+  deleteCollectorConfig,
   ShopLinkedToAnotherOrganizationError,
 } from '@truepath/db';
 import type { ShopifyAdapter, ShopifyCredentials } from '@truepath/integrations';
@@ -17,12 +18,7 @@ import {
   type TenantScope,
 } from '@truepath/shared';
 import { consumeShopifyOAuthState, issueShopifyOAuthState } from '../shopifyOAuthState.js';
-import {
-  deleteCollectorConfig,
-  installWebPixel,
-  publishCollectorConfig,
-  resolvePixelKeys,
-} from '../shopifyPixel.js';
+import { installWebPixel, publishCollectorConfig, resolvePixelKeys } from '../shopifyPixel.js';
 import {
   requireOrgScope,
   requirePermission,

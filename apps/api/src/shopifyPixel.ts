@@ -17,12 +17,7 @@ import {
   type ShopifyCredentials,
 } from '@truepath/integrations';
 import type { CredentialsCipher } from '@truepath/privacy';
-import {
-  CollectorStoreConfig,
-  collectorStoreKey,
-  STORE_KEY_PATTERN,
-  type Scope,
-} from '@truepath/shared';
+import { CollectorStoreConfig, STORE_KEY_PATTERN, type Scope } from '@truepath/shared';
 
 // Pixel install and the Collector's per-store config (shopify-integration.md §4.1 steps 5–7, issue
 // #28; collector.md §2.5). Three separable steps, in the order the OAuth callback runs them:
@@ -155,23 +150,6 @@ export async function publishCollectorConfig(
     scope,
     storeId,
   );
-}
-
-/**
- * Deletes `collector:store:<store_key>` once Shopify is disconnected (issue #44) — on `app/uninstalled`
- * and on `DELETE /v1/orgs/:id/integrations/:integrationId`. The signing secret must not outlive the
- * integration, and a later reconnect must mint a fresh store key rather than resurrecting a revoked
- * one. `markUninstalled`/`revokeForOrganization` wipe `encrypted_credentials` but keep `settings`, so
- * the store key is still readable from the integration row they return — pass that `settings` value
- * here, never re-fetch the row afterward.
- */
-export async function deleteCollectorConfig(
-  redis: Pick<Redis, 'del'>,
-  settings: unknown,
-): Promise<void> {
-  const parsed = SettingsSlice.safeParse(settings);
-  if (!parsed.success || !parsed.data.store_key) return;
-  await redis.del(collectorStoreKey(parsed.data.store_key));
 }
 
 /**

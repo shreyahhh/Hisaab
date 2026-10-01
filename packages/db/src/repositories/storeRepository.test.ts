@@ -151,6 +151,32 @@ describe('StoreRepository (ADR-0016)', () => {
       }
     });
 
+    it('markDeleted sets status=deleted and nulls privacy_config, once, idempotently (issue #25 §4.7)', async () => {
+      const tenant = await seedTestTenant('store-repo-deleted');
+      try {
+        const repo = createStoreRepository(db);
+        const jobScope: TenantScope = {
+          kind: 'tenant',
+          userId: null,
+          organizationId: tenant.organizationId,
+          role: 'job',
+          storeIds: new Set([tenant.storeId]),
+        };
+        await db
+          .update(stores)
+          .set({ privacyConfig: { grievance_contact: { name: 'x' } } })
+          .where(eq(stores.id, tenant.storeId));
+
+        const first = await repo.markDeleted(jobScope, tenant.storeId);
+        expect(first).toMatchObject({ status: 'deleted', privacyConfig: {} });
+
+        const retry = await repo.markDeleted(jobScope, tenant.storeId);
+        expect(retry).toBeNull();
+      } finally {
+        await cleanupTestTenant(tenant);
+      }
+    });
+
     it('denies upsertByShopDomain for an org outside scope before touching the shop domain', async () => {
       const tenantA = await seedTestTenant('store-repo-upsert-scope-a');
       const tenantB = await seedTestTenant('store-repo-upsert-scope-b');

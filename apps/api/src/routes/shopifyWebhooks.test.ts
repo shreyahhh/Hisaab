@@ -573,8 +573,14 @@ describe('POST /webhooks/shopify/compliance', () => {
     expect(rows[0]?.type).toBe('store_erasure');
     expect(rows[0]?.identityHash).toBeNull();
 
-    // store_erasure fulfilment lands with issue #25's third PR — not enqueued yet.
-    expect(await testDsrQueue.getJob(`dsr-${rows[0]!.id}`)).toBeUndefined();
+    // Delayed 7 days (privacy-dpdp.md §4.7 step 2) — keeps the export window open.
+    const job = await testDsrQueue.getJob(`dsr-${rows[0]!.id}`);
+    expect(job?.data).toMatchObject({
+      storeId: t.storeId,
+      type: 'store_erasure',
+      requestId: rows[0]!.id,
+    });
+    expect(job?.opts.delay).toBe(7 * 24 * 60 * 60 * 1000);
   });
 
   it('is idempotent: a retried compliance webhook (same X-Shopify-Webhook-Id) creates only one receipt', async () => {

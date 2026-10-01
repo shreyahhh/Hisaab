@@ -6,6 +6,7 @@ import { createDpaAcceptanceRepository } from './dpaAcceptanceRepository.js';
 import { createAdAccountRepository } from './adAccountRepository.js';
 import { createChannelRuleRepository } from './channelRuleRepository.js';
 import { createCapiDispatchLogRepository } from './capiDispatchLogRepository.js';
+import { createDsrStoreErasureRepository } from './dsrStoreErasureRepository.js';
 import { createConsentRecordRepository } from './consentRecordRepository.js';
 import { createDsrRequestRepository } from './dsrRequestRepository.js';
 import { createEventEffectsRepository } from './eventEffectsRepository.js';
@@ -90,6 +91,11 @@ export const repositoryRegistry: readonly RepositoryDescriptor[] = [
         name: 'markUninstalled',
         scopeKind: 'store',
         invoke: (db, scope, storeId) => createStoreRepository(db).markUninstalled(scope, storeId),
+      },
+      {
+        name: 'markDeleted',
+        scopeKind: 'store',
+        invoke: (db, scope, storeId) => createStoreRepository(db).markDeleted(scope, storeId),
       },
     ],
   },
@@ -229,6 +235,17 @@ export const repositoryRegistry: readonly RepositoryDescriptor[] = [
           createCapiDispatchLogRepository(db).redactLastErrorForOrders(scope, storeId, [
             NEVER_MATCHES,
           ]),
+      },
+    ],
+  },
+  {
+    name: 'DsrStoreErasureRepository',
+    methods: [
+      {
+        name: 'eraseStore',
+        scopeKind: 'store',
+        invoke: (db, scope, storeId) =>
+          createDsrStoreErasureRepository(db).eraseStore(scope, storeId),
       },
     ],
   },

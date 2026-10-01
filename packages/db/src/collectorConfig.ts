@@ -26,6 +26,16 @@ export interface CollectorConfigSink {
   set(key: string, value: string): Promise<unknown>;
 }
 
+export interface CollectorConfigDeleteSink {
+  del(key: string): Promise<unknown>;
+}
+
+/** `integrations.settings.store_key`, if present and well-formed — the rest of `settings` is opaque here. */
+function storeKeyOf(settings: unknown): string | null {
+  const value = asRecord(settings)['store_key'];
+  return typeof value === 'string' && STORE_KEY_PATTERN.test(value) ? value : null;
+}
+
 export interface CollectorConfigDeps {
   readonly db: Db;
   /** ADR-0023 envelope encryption: the pixel signing keys live inside `encrypted_credentials`. */
@@ -134,4 +144,20 @@ export async function publishCollectorConfig(
   });
   await deps.sink.set(collectorStoreKey(storeKey), JSON.stringify(config));
   return config;
+}
+
+/**
+ * Deletes `collector:store:<store_key>` (issue #44: a revoked/uninstalled/erased store's key must not
+ * work for a later reconnect; issue #25 §4.7: part of `store_erasure`'s Redis cleanup). Takes the
+ * integration row's `settings` directly — callers already have it from the read that found the
+ * integration, and must not re-fetch it afterward (the row may already be gone, e.g. after
+ * `store_erasure`'s own Postgres deletes). A no-op if `settings` carries no store key.
+ */
+export async function deleteCollectorConfig(
+  sink: CollectorConfigDeleteSink,
+  settings: unknown,
+): Promise<void> {
+  const storeKey = storeKeyOf(settings);
+  if (storeKey === null) return;
+  await sink.del(collectorStoreKey(storeKey));
 }
