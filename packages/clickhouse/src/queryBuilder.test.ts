@@ -429,6 +429,100 @@ describe('ch() — scoped ClickHouse query builder (ADR-0016)', () => {
     });
   });
 
+  describe('delete() — issue #25 DSR erasure/store_erasure', () => {
+    const storeF = randomUUID();
+    const storeG = randomUUID();
+    const orderF1 = randomUUID();
+    const orderF2 = randomUUID();
+    const orderG = randomUUID();
+
+    const statusRow = (store: string, order: string) => {
+      const now = new Date().toISOString();
+      return {
+        store_id: store,
+        order_id: order,
+        delivery_status: 'delivered',
+        total_amount_paise: 1,
+        refunded_amount_paise: 0,
+        delivered_at: now,
+        rto_at: null,
+        placed_at: now,
+        payment_method: 'cod',
+        is_first_order: 1,
+        pincode_prefix: '400',
+        source_updated_at: now,
+      };
+    };
+
+    const countFor = async (store: string): Promise<number> => {
+      const [row] = await ch(client, tenantScope(store), store).select<{ n: string }>({
+        table: 'order_status',
+        columns: [],
+        aggregates: [{ fn: 'count', as: 'n' }],
+      });
+      return Number(row!.n);
+    };
+
+    beforeAll(async () => {
+      await ch(client, tenantScope(storeF), storeF).insert('order_status', [
+        statusRow(storeF, orderF1),
+        statusRow(storeF, orderF2),
+      ]);
+      await ch(client, tenantScope(storeG), storeG).insert('order_status', [
+        statusRow(storeG, orderG),
+      ]);
+    });
+
+    afterAll(async () => {
+      await client.command({
+        query: `ALTER TABLE order_status DELETE WHERE store_id IN ({f:UUID}, {g:UUID})`,
+        query_params: { f: storeF, g: storeG },
+      });
+    });
+
+    it('deletes only rows matching an IN-list predicate, for the scoped store only', async () => {
+      await ch(client, tenantScope(storeF), storeF).delete({
+        table: 'order_status',
+        where: {
+          order_id: { op: 'IN', value: [orderF1], type: 'Array(String)' },
+        },
+      });
+      const remaining = await ch(client, tenantScope(storeF), storeF).select<{ order_id: string }>({
+        table: 'order_status',
+        columns: ['order_id'],
+      });
+      expect(remaining.map((r) => r.order_id)).toEqual([orderF2]);
+      expect(await countFor(storeG)).toBe(1); // untouched
+    });
+
+    it('a store-wide delete (no where) removes every row for that store, never another tenant', async () => {
+      expect(await countFor(storeF)).toBe(1); // orderF2, from the previous test
+      await ch(client, tenantScope(storeF), storeF).delete({ table: 'order_status' });
+      expect(await countFor(storeF)).toBe(0);
+      expect(await countFor(storeG)).toBe(1); // storeG's row survives a storeF-scoped delete
+    });
+
+    it('rejects an unknown table name before running anything', async () => {
+      const scoped = ch(client, tenantScope(storeG), storeG);
+      const unknownTable =
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any -- deliberately invalid, to prove the allowlist rejects it
+        'order_status; DROP TABLE order_status' as any;
+      await expect(scoped.delete({ table: unknownTable })).rejects.toThrow(
+        /Unknown ClickHouse table/,
+      );
+      expect(await countFor(storeG)).toBe(1); // the reject happened before any query ran
+    });
+
+    it('treats a where value containing SQL-like text as literal data, not injected SQL', async () => {
+      const scoped = ch(client, tenantScope(storeG), storeG);
+      await scoped.delete({
+        table: 'order_status',
+        where: { delivery_status: { op: '=', value: "x' OR '1'='1", type: 'String' } },
+      });
+      expect(await countFor(storeG)).toBe(1); // nothing matched the literal string; row survives
+    });
+  });
+
   it('insert() refuses a row whose store_id does not match the scoped store', async () => {
     const scoped = ch(client, tenantScope(storeA), storeA);
     await expect(

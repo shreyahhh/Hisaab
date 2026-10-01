@@ -188,3 +188,17 @@ export function sanitiseReferrer(url: string): string {
   const parsed = parseHttpUrl(url);
   return parsed ? `${parsed.protocol}//${parsed.host}${maskedPath(parsed.pathname)}` : '';
 }
+
+/**
+ * Scheme + host only — no path, no query, no fragment. Issue #25 (DSR erasure, privacy-dpdp.md
+ * §4.4 step 4): `orders.landing_site`/`referring_site` can carry UTMs with personal values (a
+ * referral code, an influencer handle) even after the order's own hashed identifiers are nulled, so
+ * erasure reduces them to this rather than deleting the column outright — the origin alone is still
+ * useful for channel-level reporting. `null` in, or a value that isn't a http(s) URL, is `null` out
+ * (never `''`, so an anonymised order is distinguishable from one that genuinely captured no referrer).
+ */
+export function originOnly(url: string | null): string | null {
+  if (url === null) return null;
+  const parsed = parseHttpUrl(url);
+  return parsed ? `${parsed.protocol}//${parsed.host}` : null;
+}

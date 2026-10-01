@@ -104,9 +104,43 @@ function aggregateSql(a: AggregateColumn): string {
   }
 }
 
+export interface ScopedDeleteOptions {
+  readonly table: ClickHouseTableName;
+  /** Omit for a store-wide delete (store_erasure) — `store_id = ?` is always injected regardless. */
+  readonly where?: Readonly<Record<string, WhereCondition>>;
+}
+
 export interface ScopedClickHouse {
   select<T = Record<string, unknown>>(opts: ScopedSelectOptions): Promise<T[]>;
   insert(table: ClickHouseTableName, rows: ReadonlyArray<Record<string, unknown>>): Promise<void>;
+  /**
+   * `DELETE FROM table WHERE store_id = ? [AND ...]` (ADR-0015's lightweight-delete mechanism) —
+   * issue #25's DSR erasure/store_erasure is the first caller. Lightweight deletes are visible to
+   * reads immediately but physically purged within 7 days (ADR-0015), so verify with a follow-up
+   * `select({ aggregates: [{ fn: 'count', as: 'n' }] })` rather than trusting a row count back from
+   * this call — ClickHouse's own `command()` doesn't return one.
+   */
+  delete(opts: ScopedDeleteOptions): Promise<void>;
+}
+
+/** Builds the WHERE clause and bound parameters every statement shares — always store-scoped first. */
+function buildWhere(
+  storeId: string,
+  where: Readonly<Record<string, WhereCondition>> | undefined,
+): { readonly clauses: readonly string[]; readonly params: Record<string, unknown> } {
+  const clauses = ['store_id = {store_id:UUID}'];
+  const params: Record<string, unknown> = { store_id: storeId };
+
+  for (const [column, condition] of Object.entries(where ?? {})) {
+    assertSafeIdentifier(column);
+    if ((condition.op === 'IN') !== (condition.type === 'Array(String)')) {
+      throw new Error('IN takes an Array(String) and Array(String) is only for IN');
+    }
+    const paramName = `w_${column}`;
+    clauses.push(`${column} ${condition.op} {${paramName}:${condition.type}}`);
+    params[paramName] = condition.value;
+  }
+  return { clauses, params };
 }
 
 /**
@@ -143,18 +177,7 @@ export function ch(client: ClickHouseClient, scope: Scope, storeId: string): Sco
       if (selectList.length === 0) throw new Error('select() needs at least one column');
       const columns = selectList.join(', ');
 
-      const whereClauses = ['store_id = {store_id:UUID}'];
-      const params: Record<string, unknown> = { store_id: storeId };
-
-      for (const [column, condition] of Object.entries(opts.where ?? {})) {
-        assertSafeIdentifier(column);
-        if ((condition.op === 'IN') !== (condition.type === 'Array(String)')) {
-          throw new Error('IN takes an Array(String) and Array(String) is only for IN');
-        }
-        const paramName = `w_${column}`;
-        whereClauses.push(`${column} ${condition.op} {${paramName}:${condition.type}}`);
-        params[paramName] = condition.value;
-      }
+      const { clauses: whereClauses, params } = buildWhere(storeId, opts.where);
 
       const groupBy = opts.groupBy?.length
         ? ` GROUP BY ${opts.groupBy.map(assertSafeIdentifier).join(', ')}`
@@ -167,6 +190,13 @@ export function ch(client: ClickHouseClient, scope: Scope, storeId: string): Sco
 
       const result = await client.query({ query, query_params: params, format: 'JSONEachRow' });
       return result.json<T>();
+    },
+
+    async delete(opts) {
+      assertKnownTable(opts.table);
+      const { clauses, params } = buildWhere(storeId, opts.where);
+      const query = `DELETE FROM ${opts.table} WHERE ${clauses.join(' AND ')}`;
+      await client.command({ query, query_params: params });
     },
   };
 }

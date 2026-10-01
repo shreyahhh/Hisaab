@@ -45,6 +45,8 @@ export {
 } from './repositories/metaWarmupSchedulingRepository.js';
 export {
   createDsrRequestRepository,
+  type AppendFollowupInput,
+  type CompleteDsrRequestInput,
   type CreateDsrRequestFromWebhookInput,
   type DsrRequestRepository,
   type DsrRequestRow,
@@ -122,8 +124,13 @@ export {
 } from './repositories/consentRecordRepository.js';
 export {
   createSuppressedIdentityRepository,
+  type AddSuppressionInput,
   type SuppressedIdentityRepository,
 } from './repositories/suppressedIdentityRepository.js';
+export {
+  createCapiDispatchLogRepository,
+  type CapiDispatchLogRepository,
+} from './repositories/capiDispatchLogRepository.js';
 export {
   repositoryRegistry,
   type RepositoryDescriptor,

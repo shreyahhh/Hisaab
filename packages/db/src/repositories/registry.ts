@@ -5,6 +5,7 @@ import { createAuditLogRepository } from './auditLogRepository.js';
 import { createDpaAcceptanceRepository } from './dpaAcceptanceRepository.js';
 import { createAdAccountRepository } from './adAccountRepository.js';
 import { createChannelRuleRepository } from './channelRuleRepository.js';
+import { createCapiDispatchLogRepository } from './capiDispatchLogRepository.js';
 import { createConsentRecordRepository } from './consentRecordRepository.js';
 import { createDsrRequestRepository } from './dsrRequestRepository.js';
 import { createEventEffectsRepository } from './eventEffectsRepository.js';
@@ -167,6 +168,38 @@ export const repositoryRegistry: readonly RepositoryDescriptor[] = [
         invoke: (db, scope, storeId) =>
           createDsrRequestRepository(db).listRecentByStore(scope, storeId, 20),
       },
+      {
+        name: 'beginProcessing',
+        scopeKind: 'store',
+        invoke: (db, scope, storeId) =>
+          createDsrRequestRepository(db).beginProcessing(scope, storeId, NEVER_MATCHES),
+      },
+      {
+        name: 'complete',
+        scopeKind: 'store',
+        invoke: (db, scope, storeId) =>
+          createDsrRequestRepository(db).complete(scope, storeId, NEVER_MATCHES, {
+            resultSummaryPatch: {},
+            completedAt: new Date(),
+          }),
+      },
+      {
+        name: 'fail',
+        scopeKind: 'store',
+        invoke: (db, scope, storeId) =>
+          createDsrRequestRepository(db).fail(scope, storeId, NEVER_MATCHES),
+      },
+      {
+        name: 'appendFollowup',
+        scopeKind: 'store',
+        invoke: (db, scope, storeId) =>
+          createDsrRequestRepository(db).appendFollowup(scope, storeId, NEVER_MATCHES, {
+            followupKey: 'cross-tenant-test',
+            visitorCount: 0,
+            rowsDeleted: 0,
+            at: new Date(),
+          }),
+      },
     ],
   },
   {
@@ -178,6 +211,25 @@ export const repositoryRegistry: readonly RepositoryDescriptor[] = [
         invoke: (db, scope, storeId) =>
           createConsentRecordRepository(db).listRecentByStore(scope, storeId, 20),
       },
+      {
+        name: 'deleteByVisitorHmacs',
+        scopeKind: 'store',
+        invoke: (db, scope, storeId) =>
+          createConsentRecordRepository(db).deleteByVisitorHmacs(scope, storeId, ['k1:x']),
+      },
+    ],
+  },
+  {
+    name: 'CapiDispatchLogRepository',
+    methods: [
+      {
+        name: 'redactLastErrorForOrders',
+        scopeKind: 'store',
+        invoke: (db, scope, storeId) =>
+          createCapiDispatchLogRepository(db).redactLastErrorForOrders(scope, storeId, [
+            NEVER_MATCHES,
+          ]),
+      },
     ],
   },
   {
@@ -188,6 +240,17 @@ export const repositoryRegistry: readonly RepositoryDescriptor[] = [
         scopeKind: 'store',
         invoke: (db, scope, storeId) =>
           createSuppressedIdentityRepository(db).countByStore(scope, storeId),
+      },
+      {
+        name: 'add',
+        scopeKind: 'store',
+        invoke: (db, scope, storeId) =>
+          createSuppressedIdentityRepository(db).add(scope, storeId, {
+            identifierType: 'visitor_id',
+            identifier: `k1:${'0'.repeat(64)}`,
+            reason: 'erased',
+            expiresAt: new Date(),
+          }),
       },
     ],
   },
@@ -250,6 +313,24 @@ export const repositoryRegistry: readonly RepositoryDescriptor[] = [
         scopeKind: 'store',
         invoke: (db, scope, storeId) =>
           createOrderRepository(db).listRecentByStore(scope, storeId, 20),
+      },
+      {
+        name: 'findByIdentityHashes',
+        scopeKind: 'store',
+        invoke: (db, scope, storeId) =>
+          createOrderRepository(db).findByIdentityHashes(scope, storeId, ['k1:x']),
+      },
+      {
+        name: 'findByVisitorIds',
+        scopeKind: 'store',
+        invoke: (db, scope, storeId) =>
+          createOrderRepository(db).findByVisitorIds(scope, storeId, ['v']),
+      },
+      {
+        name: 'anonymiseErasedOrders',
+        scopeKind: 'store',
+        invoke: (db, scope, storeId) =>
+          createOrderRepository(db).anonymiseErasedOrders(scope, storeId, [NEVER_MATCHES]),
       },
     ],
   },
