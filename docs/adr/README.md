@@ -24,13 +24,14 @@ Michael Nygard format (Title, Status, Context, Decision, Consequences). **Accept
 | [0018](0018-vitest-for-testing.md) | Vitest as the unit test runner | Accepted | SPEC §15 (open decision, M0-1) |
 | [0019](0019-better-auth-rate-limit-storage-durable-redis.md) | Better Auth rate-limit storage: durable Redis, not cache Redis | Accepted, supersedes ADR-0012's placement | M0-4 review |
 | [0020](0020-identity-master-keys-via-env.md) | Identity master keys injected as env vars from Secrets Manager | Accepted, refines ADR-0007 | M0-5 review |
-| [0021](0021-audit-writes-after-better-auth-commits.md) | Audit writes for Better Auth actions: after the commit, retried once, reported on failure | Accepted | M0-6 review |
+| [0021](0021-audit-writes-after-better-auth-commits.md) | Audit writes for Better Auth actions: after the commit, retried once, reported on failure | Superseded by [0028](0028-audit-outbox-for-better-auth-commits.md) | M0-6 review |
 | [0022](0022-better-auth-http-allow-list.md) | Better Auth's HTTP routes are an allow-list; a route joins only in the change that audits it | Accepted | M0-6 review |
 | [0023](0023-integration-credential-envelope-encryption.md) | Integration credentials: env-injected master key + local AES-256-GCM, not live KMS calls | Accepted, extends ADR-0020 | M1-1 review |
 | [0024](0024-shopify-integration-routes-nested-under-orgs.md) | Shopify connect/disconnect nested under `/v1/orgs/:id/integrations` | Accepted, narrows SPEC §10 | M1-1 review |
 | [0025](0025-shopify-oauth-state-token.md) | Shopify OAuth `state`: HMAC-signed token + single-use Redis nonce | Accepted | M1-1 review |
 | [0026](0026-event-workers-per-store-scope.md) | Event workers act under a one-store TenantScope, not a SystemScope (per-store ClickHouse inserts) | Accepted, refines ADR-0016 | M1-6 review |
 | [0027](0027-meta-warmup-token-registration.md) | Meta warm-up slice: token registration via an operator CLI, not OAuth | Accepted | M1-8 planning |
+| [0028](0028-audit-outbox-for-better-auth-commits.md) | A transactional outbox behind Better Auth audit writes, supersedes ADR-0021 | Accepted | issue #13 |
 
 **Decisions made during the review that are recorded in HLD §8 / SPEC v0.5 rather than as separate ADRs** (candidates to promote if they are ever revisited):
 - query-time delivered revenue via `order_status`;

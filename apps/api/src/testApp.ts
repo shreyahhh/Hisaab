@@ -2,7 +2,12 @@ import { Queue } from 'bullmq';
 import { Redis } from 'ioredis';
 import { createAuth, type Auth } from '@truepath/auth';
 import { createClickHouseClient } from '@truepath/clickhouse';
-import { createAuditLogRepository, createDb, type Db } from '@truepath/db';
+import {
+  createAuditLogRepository,
+  createAuditOutboxRepository,
+  createDb,
+  type Db,
+} from '@truepath/db';
 import { createShopifyAdapter } from '@truepath/integrations';
 import { createTestCredentialsCipher, createTestIdentityHasher } from '@truepath/privacy/testing';
 import {
@@ -48,7 +53,10 @@ export const testRedis = new Redis('redis://localhost:6379', {
   connectTimeout: 500,
 });
 
-export const testAudit = createAuditService(createAuditLogRepository(testDb));
+export const testAudit = createAuditService(
+  createAuditLogRepository(testDb),
+  createAuditOutboxRepository(testDb),
+);
 
 // Random keys, per test process, never written anywhere.
 export const testHasher = createTestIdentityHasher();

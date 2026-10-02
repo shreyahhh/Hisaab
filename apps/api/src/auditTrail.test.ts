@@ -1,6 +1,11 @@
 import { randomUUID } from 'node:crypto';
 import { and, eq, gte, inArray, sql } from 'drizzle-orm';
-import { createAuditLogRepository, schema, type AuditLogRepository } from '@truepath/db';
+import {
+  createAuditLogRepository,
+  createAuditOutboxRepository,
+  schema,
+  type AuditOutboxRepository,
+} from '@truepath/db';
 import type { OrganizationAuditEntry, PlatformAuditEntry } from '@truepath/shared';
 import { afterAll, afterEach, describe, expect, it } from 'vitest';
 import { createAuditService, type AuditFailureReport } from './audit.js';
@@ -54,30 +59,29 @@ function randomIp() {
   return `10.${o()}.${o()}.${o()}`;
 }
 
-// ---- A repository whose writes fail on demand ------------------------------------------------
+// ---- An outbox whose completion fails on demand (ADR-0028) ------------------------------------
+// The entry is still durably enqueued in `audit_outbox` as normal; this only fakes the step that
+// finally inserts into `audit_log` (`outbox.complete`), matching this suite's original intent —
+// "the audit write fails after Better Auth has committed" — against the new architecture.
 function flakyAudit(failures: number) {
-  const inner = createAuditLogRepository(testDb);
+  const innerOutbox = createAuditOutboxRepository(testDb);
   const state = { calls: 0, remaining: failures };
-  const gate = () => {
-    state.calls += 1;
-    if (state.remaining > 0) {
-      state.remaining -= 1;
-      throw new Error('audit database is down');
-    }
-  };
-  const log: AuditLogRepository = {
-    ...inner,
-    write: async (scope, entry) => {
-      gate();
-      return inner.write(scope, entry);
-    },
-    writePlatform: async (entry) => {
-      gate();
-      return inner.writePlatform(entry);
+  const outbox: AuditOutboxRepository = {
+    ...innerOutbox,
+    complete: async (outboxId) => {
+      state.calls += 1;
+      if (state.remaining > 0) {
+        state.remaining -= 1;
+        throw new Error('audit database is down');
+      }
+      return innerOutbox.complete(outboxId);
     },
   };
   const reports: AuditFailureReport[] = [];
-  const audit = createAuditService(log, { report: (r) => reports.push(r), retryDelayMs: 0 });
+  const audit = createAuditService(createAuditLogRepository(testDb), outbox, {
+    report: (r) => reports.push(r),
+    retryDelayMs: 0,
+  });
   return { audit, reports, state, app: buildTestApp({ audit }) };
 }
 
@@ -446,11 +450,12 @@ describe('when the audit write fails after Better Auth has committed (ADR-0021)'
   it('a broken reporter cannot fail the request either', async () => {
     const owner = await tenant('trail-reporter');
     const viewer = await member(owner, 'trail-reporter-viewer', 'viewer');
-    const inner = createAuditLogRepository(testDb);
+    const innerOutbox = createAuditOutboxRepository(testDb);
     const audit = createAuditService(
+      createAuditLogRepository(testDb),
       {
-        ...inner,
-        write: async () => {
+        ...innerOutbox,
+        complete: async () => {
           throw new Error('down');
         },
       },
@@ -478,21 +483,19 @@ describe('when the audit write fails after Better Auth has committed (ADR-0021)'
   it('does not retry, or log the metadata of, an entry that fails validation', async () => {
     const owner = await tenant('trail-invalid');
     const reports: AuditFailureReport[] = [];
+    const innerOutbox = createAuditOutboxRepository(testDb);
     let calls = 0;
-    const inner = createAuditLogRepository(testDb);
-    const audit = createAuditService(
-      {
-        ...inner,
-        write: async (scope, entry) => {
-          calls += 1;
-          return inner.write(scope, {
-            ...entry,
-            metadata: { email: 'someone@example.com' },
-          } as never);
-        },
+    const outbox: AuditOutboxRepository = {
+      ...innerOutbox,
+      complete: async (outboxId) => {
+        calls += 1;
+        return innerOutbox.complete(outboxId);
       },
-      { report: (r) => reports.push(r), retryDelayMs: 0 },
-    );
+    };
+    const audit = createAuditService(createAuditLogRepository(testDb), outbox, {
+      report: (r) => reports.push(r),
+      retryDelayMs: 0,
+    });
     await audit.afterCommit(
       {
         kind: 'tenant',
@@ -507,7 +510,9 @@ describe('when the audit write fails after Better Auth has committed (ADR-0021)'
         action: 'member_invited',
         targetType: 'invite',
         targetId: 'x',
-        metadata: { role: 'viewer' },
+        // Bypasses the type system, same as a caller that got past the compiler — metadata never
+        // matching 'member_invited''s schema (RoleSchema), so `complete` abandons the row.
+        metadata: { email: 'someone@example.com' } as never,
       },
     );
     expect(calls).toBe(1);
@@ -518,7 +523,18 @@ describe('when the audit write fails after Better Auth has committed (ADR-0021)'
 
   it('for our own read (viewing the audit log) the write is required: the request fails and returns no data', async () => {
     const owner = await tenant('trail-strict');
-    const { app } = flakyAudit(Infinity);
+    // This route writes audit_log_viewed through `audit.log` directly, before the response — not
+    // the Better Auth / outbox path `flakyAudit` exercises above — so the fake here breaks the
+    // underlying AuditLogRepository itself.
+    const brokenLog = {
+      ...createAuditLogRepository(testDb),
+      write: async () => {
+        throw new Error('audit database is down');
+      },
+    };
+    const app = buildTestApp({
+      audit: createAuditService(brokenLog, createAuditOutboxRepository(testDb)),
+    });
     await app.ready();
     try {
       const res = await app.inject({

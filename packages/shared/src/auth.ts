@@ -81,6 +81,7 @@ export const SYSTEM_REASONS = [
   'org_deletion',
   'webhook_delivery_prune',
   'attribution_confidence_backfill',
+  'audit_outbox_sweep',
 ] as const;
 export type SystemReason = (typeof SYSTEM_REASONS)[number];
 

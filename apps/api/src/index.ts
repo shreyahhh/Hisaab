@@ -4,7 +4,7 @@ import { Queue } from 'bullmq';
 import { Redis } from 'ioredis';
 import { createAuth } from '@truepath/auth';
 import { createClickHouseClient } from '@truepath/clickhouse';
-import { createAuditLogRepository, createDb } from '@truepath/db';
+import { createAuditLogRepository, createAuditOutboxRepository, createDb } from '@truepath/db';
 import { createShopifyAdapter } from '@truepath/integrations';
 import { createCredentialsCipher, createIdentityHasher } from '@truepath/privacy';
 import {
@@ -30,6 +30,7 @@ import {
 } from '@truepath/shared';
 import { buildApp, type AppDeps, type ShopifyDeps } from './app.js';
 import { createAuditService } from './audit.js';
+import { startAuditOutboxSweep } from './auditOutboxSweep.js';
 
 // Core API (Fastify): auth, tenants, integrations, reports, DPDP endpoints, webhooks (SPEC §10,
 // §4). `buildApp` (app.ts) has been fully built and tested since M0-4+; this file is the
@@ -121,16 +122,21 @@ function main(): void {
     ...(env.COLLECTOR_PUBLIC_URL ? { collectorUrl: env.COLLECTOR_PUBLIC_URL } : {}),
   };
 
+  const auditOutbox = createAuditOutboxRepository(db);
   const deps: AppDeps = {
     db,
     clickhouse,
     auth,
     trustedOrigin: env.DASHBOARD_URL,
-    audit: createAuditService(createAuditLogRepository(db)),
+    audit: createAuditService(createAuditLogRepository(db), auditOutbox),
     rateLimit: { redis, hasher },
     dpaVersion: env.DPA_VERSION,
     shopify,
   };
+
+  // ADR-0028, issue #13: finishes whatever an in-request afterCommit/afterCommitPlatform attempt
+  // couldn't, and prunes old finished rows. Never keeps the process alive on its own (unref'd).
+  startAuditOutboxSweep({ db, outbox: auditOutbox });
 
   const app = buildApp(deps);
   app

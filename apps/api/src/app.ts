@@ -5,7 +5,7 @@ import fastifyCors from '@fastify/cors';
 import type { Redis } from 'ioredis';
 import type { Auth } from '@truepath/auth';
 import type { ClickHouseClient } from '@truepath/clickhouse';
-import { createAuditLogRepository, type Db } from '@truepath/db';
+import { createAuditLogRepository, createAuditOutboxRepository, type Db } from '@truepath/db';
 import type { ShopifyAdapter } from '@truepath/integrations';
 import type { CredentialsCipher, IdentityHasher } from '@truepath/privacy';
 import type { DsrJob, IdentityStitchJob, ShopifySyncJob } from '@truepath/shared';
@@ -101,7 +101,9 @@ export function buildApp(deps: AppDeps): FastifyInstance {
   const tenantDeps: TenantScopeDeps = {
     auth: deps.auth,
     db: deps.db,
-    audit: deps.audit ?? createAuditService(createAuditLogRepository(deps.db)),
+    audit:
+      deps.audit ??
+      createAuditService(createAuditLogRepository(deps.db), createAuditOutboxRepository(deps.db)),
   };
   registerAuthErrorHandler(app, { report: deps.errorReporter });
 

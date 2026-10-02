@@ -1,7 +1,11 @@
 # 0021. Audit writes for Better Auth actions: after the commit, retried once, reported on failure
 
 ## Status
-Accepted (2026-09-26; refines privacy-dpdp.md §7 "audit writes are synchronous in the request transaction" for actions Better Auth performs)
+Superseded by [ADR-0028](0028-audit-outbox-for-better-auth-commits.md) (2026-10-02; issue #13's
+transactional outbox). This record's account of why the audit row can't be made atomic with Better
+Auth's own commit (its organization-plugin hooks don't run inside its transaction) still holds and
+is not repeated there. Originally: Accepted (2026-09-26; refines privacy-dpdp.md §7 "audit writes are
+synchronous in the request transaction" for actions Better Auth performs)
 
 ## Context
 Several audited actions are carried out by Better Auth, which commits its own change: creating and
