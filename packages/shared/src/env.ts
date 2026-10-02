@@ -72,6 +72,18 @@ export const dpaEnvSchema = z.object({
 });
 export type DpaEnv = z.infer<typeof dpaEnvSchema>;
 
+// HLD §8 "Consent-region gate" layer 2 (event-pipeline.md §4.4, issue #52): the default-on-region
+// detector's auto-pause action stays off — the collector config gate never treats a 'paused'
+// consent_health as a reason to go inactive — until a dev-store test (collector.md Q3c) confirms
+// the signal actually separates opt-in from default-on stores. Defaults to 'false' everywhere.
+export const consentDefaultOnEnvSchema = z.object({
+  CONSENT_DEFAULT_ON_PAUSE_ENABLED: z
+    .enum(['true', 'false'])
+    .default('false')
+    .transform((v) => v === 'true'),
+});
+export type ConsentDefaultOnEnv = z.infer<typeof consentDefaultOnEnvSchema>;
+
 type WithCommon<Schema extends z.ZodTypeAny> = z.ZodIntersection<typeof commonEnvSchema, Schema>;
 
 // Pure validation, no process access beyond reading `source` — this is what's unit tested.

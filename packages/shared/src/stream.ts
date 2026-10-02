@@ -34,6 +34,19 @@ export type CollectorDropReason = (typeof COLLECTOR_DROP_REASONS)[number];
 /** Default-on-region signal counters, incremented by `event-workers` (HLD §8). */
 export const DEFAULT_ON_STATS_FIELDS = ['new_visitors', 'new_visitors_initial_only'] as const;
 
+/**
+ * `yyyymmdd` of an instant in IST — the Collector's drop counters and `event-workers`' default-on
+ * signal are both bucketed by this (HLD §8, event-pipeline.md §4.4). One canonical definition so
+ * the two never disagree about where a day boundary falls.
+ */
+export function istDay(nowMs: number): string {
+  const ist = new Date(nowMs + 5.5 * 60 * 60 * 1000);
+  const y = ist.getUTCFullYear();
+  const m = String(ist.getUTCMonth() + 1).padStart(2, '0');
+  const d = String(ist.getUTCDate()).padStart(2, '0');
+  return `${y}${m}${d}`;
+}
+
 /** HLD §8: `dedupe:<store_id>:<event_id>` and `checkout:<store_id>:<order_id>` both expire after a day. */
 export const DEDUPE_TTL_SECONDS = 86_400;
 export const CHECKOUT_KEY_TTL_SECONDS = 86_400;

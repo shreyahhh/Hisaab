@@ -11,6 +11,7 @@ import {
   AD_SYNC_META_QUEUE,
   ATTRIBUTION_RUN_QUEUE,
   clickhouseEnvSchema,
+  consentDefaultOnEnvSchema,
   credentialsKeyEnvSchema,
   dpaEnvSchema,
   DSR_QUEUE,
@@ -55,7 +56,9 @@ export const workersEnvSchema = postgresEnvSchema
   .and(shopifyEnvSchema)
   // The DPA version a store's organization must have accepted for its collector config to be `active`
   // (republished by the suppression rebuild, #56) — the same variable the API requires.
-  .and(dpaEnvSchema);
+  .and(dpaEnvSchema)
+  // Issue #52: the default-on-region evaluator's auto-pause feature flag.
+  .and(consentDefaultOnEnvSchema);
 
 function main(): void {
   loadDotEnvIfPresent('../../.env');
@@ -209,6 +212,14 @@ function main(): void {
             stores,
             now: () => new Date(),
             newSessionId: () => uuidV7(Date.now(), randomBytes(16)),
+            defaultOnSignal: {
+              db,
+              redis,
+              cipher,
+              dpaVersion: env.DPA_VERSION,
+              consentPauseEnabled: env.CONSENT_DEFAULT_ON_PAUSE_ENABLED,
+              log,
+            },
           },
           entries,
           memo,
@@ -226,7 +237,11 @@ function main(): void {
     db,
     redis,
     log,
-    configs: { cipher, dpaVersion: env.DPA_VERSION },
+    configs: {
+      cipher,
+      dpaVersion: env.DPA_VERSION,
+      consentPauseEnabled: env.CONSENT_DEFAULT_ON_PAUSE_ENABLED,
+    },
     onUnavailable: async () => {
       await Promise.all([worker.pause(true), stitchWorker.pause(true), dsrWorker.pause(true)]);
     },

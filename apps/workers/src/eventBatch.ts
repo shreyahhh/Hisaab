@@ -30,6 +30,13 @@ import {
   type StreamEventEntry,
   type StreamSuppressionHit,
 } from '@truepath/shared';
+import {
+  applyConsentHealthEvaluation,
+  countDefaultOnSignal,
+  evaluateDefaultOnSignal,
+  incrementDefaultOnStats,
+  type ApplyConsentHealthDeps,
+} from './defaultOnSignal.js';
 import { assignSessions } from './sessionAssign.js';
 import {
   SuppressionNotReadyError,
@@ -60,6 +67,45 @@ export interface EventBatchDeps {
   readonly now: () => Date;
   /** A fresh UUID v7 for a session that starts. */
   readonly newSessionId: () => string;
+  /**
+   * HLD §8 "Consent-region gate" layer 2 (issue #52). Omitted only by tests that don't exercise the
+   * signal — every real deployment supplies it (apps/workers/src/index.ts).
+   */
+  readonly defaultOnSignal?: Omit<ApplyConsentHealthDeps, 'now' | 'log'> & {
+    readonly log?: (line: Record<string, unknown>) => void;
+  };
+}
+
+// "At most every 10 min per store (in-process timestamp)" (event-pipeline.md §4.4) — module-level,
+// so it survives across calls within one worker process but never coordinates across processes;
+// `applyConsentHealthEvaluation`'s own re-check against Postgres (not this timestamp) is what keeps
+// concurrent workers from double-auditing the same transition.
+const lastEvaluatedAt = new Map<string, number>();
+const EVALUATION_INTERVAL_MS = 10 * 60_000;
+
+async function maybeEvaluateDefaultOnSignal(
+  deps: EventBatchDeps,
+  storeIds: Iterable<string>,
+  nowMs: number,
+): Promise<void> {
+  const config = deps.defaultOnSignal;
+  if (!config) return;
+  const log = config.log ?? (() => undefined);
+  for (const storeId of storeIds) {
+    const last = lastEvaluatedAt.get(storeId) ?? 0;
+    if (nowMs - last < EVALUATION_INTERVAL_MS) continue;
+    lastEvaluatedAt.set(storeId, nowMs);
+    try {
+      const evaluation = await evaluateDefaultOnSignal(deps.redis, storeId, nowMs);
+      await applyConsentHealthEvaluation({ ...config, now: deps.now, log }, evaluation);
+    } catch (error) {
+      log({
+        event: 'default_on_signal_eval_failed',
+        store_id: storeId,
+        error_name: error instanceof Error ? error.name : 'unknown',
+      });
+    }
+  }
 }
 
 /**
@@ -634,6 +680,22 @@ export async function processEventBatch(
 
   for (const item of toWrite) ackIds.push(item.id);
   for (const hits of hitsByStore.values()) for (const hit of hits) ackIds.push(hit.id);
+
+  // Default-on signal (issue #52): counted from `toWrite` only — events suppression/dedupe already
+  // dropped were never really tracked, so they shouldn't count toward "is this store tracking
+  // without consent". Best-effort: a failure here must never cost the batch its ack.
+  try {
+    const defaultOnCounts = countDefaultOnSignal(
+      toWrite.map((item) => ({ storeId: item.e.store_id, entry: item.e })),
+    );
+    await incrementDefaultOnStats(deps.redis, defaultOnCounts, now.getTime());
+    await maybeEvaluateDefaultOnSignal(deps, eventsByStore.keys(), now.getTime());
+  } catch (error) {
+    (deps.defaultOnSignal?.log ?? (() => undefined))({
+      event: 'default_on_signal_failed',
+      error_name: error instanceof Error ? error.name : 'unknown',
+    });
+  }
 
   return {
     ackIds,

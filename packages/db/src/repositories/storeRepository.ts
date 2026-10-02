@@ -29,6 +29,15 @@ export interface ConfirmIndiaOptInResult {
   readonly alreadyConfirmed: boolean;
 }
 
+/** HLD §8 "Consent-region gate" layer 2 (event-pipeline.md §4.4, issue #52). */
+export interface ConsentHealthInput {
+  readonly status: 'ok' | 'warn' | 'paused';
+  readonly ratio: number;
+  readonly measuredAt: Date;
+  /** Only meaningful (and set) when `status === 'paused'`. */
+  readonly pausedAt?: Date;
+}
+
 export interface StoreRepository {
   listByOrganization(scope: Scope, organizationId: string): Promise<StoreRow[]>;
   getById(scope: Scope, storeId: string): Promise<StoreRow | null>;
@@ -48,6 +57,18 @@ export interface StoreRepository {
    * Idempotent: a repeat confirmation is a no-op that returns the existing timestamp.
    */
   confirmIndiaOptIn(scope: Scope, storeId: string): Promise<ConfirmIndiaOptInResult | null>;
+  /**
+   * Sets `privacy_config.consent_health` (HLD §8 "Consent-region gate" layer 2, issue #52) — the
+   * default-on-region evaluator's latest reading. Replaces the whole `consent_health` object (it's
+   * always one evaluation's complete result, never partial fields to merge), merging only into the
+   * surrounding `privacy_config` (one home per setting: `notice_version`, `grievance_contact` and
+   * `checklist` are left untouched). Returns null if the store doesn't exist.
+   */
+  updateConsentHealth(
+    scope: Scope,
+    storeId: string,
+    input: ConsentHealthInput,
+  ): Promise<StoreRow | null>;
   /**
    * Issue #25 (privacy-dpdp.md §4.7 step 3): the final step of `store_erasure` — `status='deleted'`
    * and `privacy_config` nulled back to `{}` (it can carry a grievance contact name/email/phone).
@@ -154,6 +175,28 @@ export function createStoreRepository(db: Db): StoreRepository {
         if (!updated) throw new Error('confirmIndiaOptIn: update did not return a row');
         return { store: updated, alreadyConfirmed: false };
       });
+    },
+    async updateConsentHealth(scope, storeId, input) {
+      assertStoreInScope(scope, storeId);
+      const rows = await db.select().from(stores).where(eq(stores.id, storeId)).limit(1);
+      const existing = rows[0];
+      if (!existing) return null;
+
+      const config = asRecord(existing.privacyConfig);
+      const consentHealth: Record<string, unknown> = {
+        status: input.status,
+        ratio: input.ratio,
+        measured_at: input.measuredAt.toISOString(),
+      };
+      if (input.pausedAt) consentHealth['paused_at'] = input.pausedAt.toISOString();
+
+      const [updated] = await db
+        .update(stores)
+        .set({ privacyConfig: { ...config, consent_health: consentHealth } })
+        .where(eq(stores.id, storeId))
+        .returning();
+      if (!updated) throw new Error('updateConsentHealth: update did not return a row');
+      return updated;
     },
     async markDeleted(scope, storeId) {
       assertStoreInScope(scope, storeId);
