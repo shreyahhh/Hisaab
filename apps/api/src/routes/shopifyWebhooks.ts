@@ -31,13 +31,14 @@ import {
   DSR_JOB_OPTIONS,
   IDENTITY_STITCH_JOB_OPTIONS,
   identityStitchJobId,
+  SHOPIFY_ORDER_REFRESH_DELAY_MS,
+  shopifyOrderRefreshJobId,
   STORE_ERASURE_DELAY_MS,
   type DsrJob,
   type IdentityStitchJob,
   type ShopifySyncJob,
   type TenantScope,
 } from '@truepath/shared';
-import { fetchOrderWithTokenRefresh } from '../shopifyOrderCredentials.js';
 import type { TenantScopeDeps } from '../tenantScope.js';
 
 // POST /webhooks/shopify/:topic (shopify-integration.md §2.2, §2.4, §4.2-§4.8). M1-1 built
@@ -327,23 +328,21 @@ async function handleOrderWebhook(
 }
 
 /**
- * `refunds/create` | `fulfillments/create` | `fulfillments/update` — a partial hint. Always
- * refetches the full order via GraphQL (M1-2 review item 1: this network call happens here, before
- * `applyOrderSnapshot` ever opens a transaction) — this also transparently handles the order not
- * existing locally yet (an out-of-order delivery), since `fetchOrder` returns the full snapshot
- * regardless of whether we've seen this order before.
+ * `refunds/create` | `fulfillments/create` | `fulfillments/update` — a partial hint. Issue #41:
+ * rather than refetching the full order synchronously (the original M1-2 approach, before the
+ * `shopify-sync` queue existed), this enqueues a **debounced** `order_refresh` job
+ * (shopify-integration.md §2.6) and returns immediately. A burst of hints for the same order —
+ * `orders/updated` is not routed here, but e.g. `refunds/create` followed by `fulfillments/update` —
+ * collapses into the one job BullMQ's `jobId` dedup gives us while it's waiting/delayed, ~30 s after
+ * the first hint. The generic webhook-delivery dedup gate (recorded by the caller once this returns)
+ * is this topic's own "idempotency and trail" row; the worker's `fetchOrder` + `applySnapshot` still
+ * transparently handles the order not existing locally yet, same as the old inline path did.
  */
 async function handleOrderHintWebhook(
-  deps: TenantScopeDeps,
-  scope: TenantScope,
+  shopifySyncQueue: Pick<ShopifyWebhookDeps['shopifySyncQueue'], 'add'>,
   storeId: string,
-  shop: string,
-  hasher: IdentityHasher,
-  identity: OrderApplyDeps,
-  credentialsDeps: { readonly adapter: ShopifyAdapter; readonly cipher: CredentialsCipher },
   shopifyTopic: (typeof ORDER_HINTS_TOPICS)[number],
   rawBody: Buffer,
-  webhookId: string,
 ): Promise<void> {
   let json: unknown;
   try {
@@ -362,36 +361,15 @@ async function handleOrderHintWebhook(
     return;
   }
 
-  const snapshot = await fetchOrderWithTokenRefresh(
-    { db: deps.db, adapter: credentialsDeps.adapter, cipher: credentialsDeps.cipher },
-    scope,
-    storeId,
-    shop,
-    String(parsed.data.order_id),
-  );
-  if (!snapshot) {
-    // Shopify has no such order — shouldn't happen for a refund/fulfillment hint in practice; ack
-    // and skip rather than retry forever (there is nothing to create the row from).
-    console.error(
-      JSON.stringify({
-        event: 'shopify_order_hint_order_not_found',
-        store_id: storeId,
-        topic: shopifyTopic,
-      }),
-    );
-    return;
-  }
-
-  const eventStatus = shopifyTopic === 'refunds/create' ? 'refund' : 'fulfillment';
-  await applyOrderSnapshot(
-    deps,
-    scope,
-    storeId,
-    hasher,
-    identity,
-    snapshot,
-    eventStatus,
-    webhookId,
+  const externalOrderId = String(parsed.data.order_id);
+  await shopifySyncQueue.add(
+    'order_refresh',
+    { storeId, mode: 'order_refresh', externalOrderIds: [externalOrderId] },
+    {
+      jobId: shopifyOrderRefreshJobId(storeId, externalOrderId),
+      delay: SHOPIFY_ORDER_REFRESH_DELAY_MS,
+      removeOnComplete: true,
+    },
   );
 }
 
@@ -551,16 +529,10 @@ export function registerShopifyWebhookRoutes(
           shopifyTopic === 'fulfillments/update'
         ) {
           await handleOrderHintWebhook(
-            deps,
-            scope,
+            webhook.shopifySyncQueue,
             resolved.id,
-            shopDomainHeader.toLowerCase(),
-            webhook.hasher,
-            webhook,
-            { adapter: webhook.adapter, cipher: webhook.cipher },
             shopifyTopic,
             rawBody,
-            webhookId,
           );
         } else if (shopifyTopic === 'bulk_operations/finish') {
           await handleBulkOperationFinish(webhook, resolved.id, shopifyTopic, rawBody);

@@ -16,9 +16,11 @@ import {
   IdentityStitchJobSchema,
   SHOPIFY_SYNC_MODES,
   SHOPIFY_SYNC_QUEUE,
+  SHOPIFY_ORDER_REFRESH_DELAY_MS,
   attributionRunJobId,
   identityStitchJobId,
   normaliseOrderId,
+  shopifyOrderRefreshJobId,
 } from './jobs.js';
 
 describe('shopify-sync job registry (HLD §8)', () => {
@@ -34,6 +36,21 @@ describe('shopify-sync job registry (HLD §8)', () => {
 
 // BullMQ 6.x: a custom job id containing ':' must have exactly three parts (Job.validateOptions).
 const bullmqAcceptsJobId = (id: string): boolean => !id.includes(':') || id.split(':').length === 3;
+
+describe('shopifyOrderRefreshJobId (shopify-integration.md §2.6)', () => {
+  it('builds a three-part job id BullMQ accepts, distinct per store and order', () => {
+    const a = shopifyOrderRefreshJobId('store-1', '5001');
+    const b = shopifyOrderRefreshJobId('store-1', '5002');
+    const c = shopifyOrderRefreshJobId('store-2', '5001');
+    expect(a).toBe('shopify-refresh:store-1:5001');
+    expect([a, b, c].every(bullmqAcceptsJobId)).toBe(true);
+    expect(new Set([a, b, c]).size).toBe(3);
+  });
+
+  it('debounces 30 s, per the LLD', () => {
+    expect(SHOPIFY_ORDER_REFRESH_DELAY_MS).toBe(30_000);
+  });
+});
 
 describe('identity-stitch / attribution-run registry (HLD §8)', () => {
   const orderId = '0192f3a4-7b1c-7c2d-8e3f-4a5b6c7d8e9f';

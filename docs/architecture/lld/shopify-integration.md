@@ -97,7 +97,7 @@ Web Pixel extension `extensions/truepath-pixel/shopify.extension.toml` (keys per
 |---|---|---|
 | `orders/create`, `orders/updated` | full snapshot apply (§4.4). On create also enqueue identity-stitch and a debounced `order_refresh` to fetch `customerJourneySummary` and refunds | payload `updated_at` |
 | `orders/cancelled` | snapshot apply; `cancelled` per HLD §8 precedence | payload `updated_at` |
-| `refunds/create`, `fulfillments/create`, `fulfillments/update` | Record `order_status_events` (idempotency and trail), then **debounced** `order_refresh`. These payloads are partial. | refund `created_at` / fulfillment `updated_at` for the event row |
+| `refunds/create`, `fulfillments/create`, `fulfillments/update` | **Debounced** `order_refresh` only (issue #41) — these payloads are partial, so nothing is applied from them directly. The generic `shopify_webhook_deliveries` dedup gate (§4.2 step 3, every topic) is this topic's own "idempotency and trail" row; the `order_status_events` row is written once the debounced job applies the full snapshot. | n/a at hint time; `refresh:<updatedAt>` once applied (§4.7) |
 | `app/uninstalled` | §4.8 | — |
 | `customers/data_request`, `customers/redact`, `shop/redact` | → `dsr_requests` ([privacy-dpdp.md §2.3](privacy-dpdp.md#23-webhooks-routed-into-the-dsr-pipeline)) | — |
 | `bulk_operations/finish` | enqueue `ShopifySyncJob{mode:'bulk_result', bulkOperationId}` | — |
@@ -387,21 +387,28 @@ never appears in the captured log output.
 
 ### 4.7 Backfill, bulk results, reconciliation, refresh (`shopify-sync`)
 
-**M1-3 / M1-3b status**: the `shopify-sync` BullMQ queue exists, and the OAuth callback enqueues
-`{mode:'backfill', days}` on every successful connect. `backfill` starts the bulk query and records
-`settings.backfill {days, status:'running', bulk_operation_id, started_at}`; the `bulk_operations/finish`
-webhook enqueues `bulk_result`, which streams the JSONL through §4.4 and finishes the record with
-`status`, `orders_applied`, `orders_reported` (Shopify's own `rootObjectCount`, for reconciliation),
-`invalid_lines` and `finished_at`. Both modes refresh an expired access token once on a 401.
-Deviations from the text below, all deliberate:
+**M1-3 / M1-3b / issue #41 status**: the `shopify-sync` BullMQ queue exists, and the OAuth callback
+enqueues `{mode:'backfill', days}` on every successful connect. `backfill` starts the bulk query and
+records `settings.backfill {days, status:'running', bulk_operation_id, started_at}`; the
+`bulk_operations/finish` webhook enqueues `bulk_result`, which streams the JSONL through §4.4,
+bulk-enqueues `IdentityStitchJob{attempt:2}` in chunks of 500, and finishes the record with `status`,
+`orders_applied`, `orders_reported` (Shopify's own `rootObjectCount`, for reconciliation),
+`invalid_lines` and `finished_at`. The order-hint webhooks (`refunds/create`, `fulfillments/create`,
+`fulfillments/update`) enqueue a debounced `order_refresh`, which re-fetches the order and applies it
+with one attempt-0 `IdentityStitchJob` (same as a direct `orders/*` webhook). All three modes refresh
+an expired access token once on a 401. Deviations from the text below, all deliberate:
 - The `bulk_result` job id is `bulk-result-<n>`, not `shopify-bulk:<id>` — BullMQ custom job ids can't
   contain `:`.
 - Orders are applied one at a time, each in its own transaction, not in batches of 1,000.
 - A result with any unreadable line applies the rest, then fails the job and marks the backfill
   `failed` (`error_code: invalid_lines`) instead of reporting a partly-read backfill as complete.
-- Not built, tracked in issue #41: the `partialDataUrl` restart, `IdentityStitchJob` enqueueing (waits
-  on the `identity-stitch` queue, M1-7), the audit row for backfill counts, `reconcile`,
-  `order_refresh`, the 60→90-day auto-extend, and the up-to-5-concurrent-queries accounting.
+- `order_refresh` records its apply as `eventStatus: 'updated'`, not the triggering topic's
+  `'refund'`/`'fulfillment'` — a burst of different hints for one order can collapse into the one
+  debounced job, and the job payload (HLD §8) carries no topic to attribute it to. The topic is still
+  visible in the `shopify_webhook_deliveries` row.
+- Not built, tracked in issue #41: the `partialDataUrl` restart, the audit row for backfill counts,
+  `reconcile`, the 60→90-day auto-extend, the up-to-5-concurrent-queries accounting, and `orders/create`'s
+  own additional debounced `order_refresh` for `customerJourneySummary`/refunds (row above).
 
 - **`backfill`**:
   - `startBulkOrders(since = now − days)`, where `days` = 60 without `read_all_orders`, else 90.
@@ -417,10 +424,10 @@ Deviations from the text below, all deliberate:
   - `ordersUpdatedSince(last_reconcile_at − 1 h)`, 250 per page, applied through §4.4. More than 10,000 changed orders → bulk instead.
   - Refreshes `shop_hosts` and republishes the collector config on change. Keeps the refresh token in use.
   - **Consent-region check** (SPEC v0.6, if the scope is approved): `consentPolicy(countryCode: IN) { consentRequired }` ([consentPolicy](https://shopify.dev/docs/api/admin-graphql/latest/queries/consentPolicy)). `consentRequired = false` → republish the collector config `inactive` (`consent_policy_not_required`), with a banner and email (privacy-dpdp §4.13). The query also runs at onboarding step 8. The required access scope isn't documented — **VERIFY** in a dev store (pending in HLD §8).
-- **`order_refresh`**: `fetchOrder` → §4.4 (debounced as in §2.6). **Not built in M1-2**: M1-2's
-  `refunds/*`/`fulfillments/*` handlers call `fetchOrder` synchronously inline instead (§4.4), since
-  no `shopify-sync` queue exists yet to debounce into. Issue #27 tracks adding this job and moving
-  hint-triggered refreshes onto it.
+- **`order_refresh`** (issue #41, built): `fetchOrder` → §4.4 (debounced as in §2.6), applied with
+  `eventStatus: 'updated'` and `raw_ref = refresh:<updatedAt>`, enqueuing one attempt-0
+  `IdentityStitchJob`. `refunds/*`/`fulfillments/*` enqueue this instead of M1-2's original
+  synchronous inline `fetchOrder` call.
 - **Rate limits** ([GraphQL rate limits](https://shopify.dev/docs/apps/build/apis/graphql-admin/rate-limits)):
   - The calculated-cost leaky bucket restores 100 points/s (Standard), 200 (Advanced), 1,000 (Plus), 2,000 (Commerce Components).
   - A single query may not exceed 1,000 points.

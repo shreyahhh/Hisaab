@@ -29,9 +29,10 @@ import {
 } from '@truepath/shared';
 
 // The `shopify-sync` queue's processor (HLD §8; shopify-integration.md §4.7). Implements
-// `mode: 'backfill'` (start the bulk order query, M1-3) and `mode: 'bulk_result'` (stream and apply
-// its JSONL, M1-3b). `reconcile`, `order_refresh` and the 60→90-day auto-extend are deferred
-// (issue #41); nothing enqueues them yet.
+// `mode: 'backfill'` (start the bulk order query, M1-3), `mode: 'bulk_result'` (stream and apply its
+// JSONL, M1-3b), and `mode: 'order_refresh'` (re-fetch and apply one order, issue #41 — the debounced
+// job `apps/api/src/routes/shopifyWebhooks.ts`'s hint handler now enqueues). `reconcile` and the
+// 60→90-day auto-extend are still deferred (issue #41).
 
 export interface ShopifySyncDeps {
   readonly db: Db;
@@ -41,8 +42,11 @@ export interface ShopifySyncDeps {
   readonly hasher: IdentityHasher;
   /** Durable Redis, read for the erased-identity list when an order is stored (HLD §6b). */
   readonly redis: SuppressionReader;
-  /** HLD §8 `identity-stitch`: backfilled orders enter at attempt 2 (identity-stitching.md §5). */
-  readonly identityStitchQueue: Pick<Queue<IdentityStitchJob>, 'addBulk'>;
+  /**
+   * HLD §8 `identity-stitch`: backfilled orders enter at attempt 2 in bulk (identity-stitching.md
+   * §5); a single `order_refresh` apply enqueues one attempt-0 job, the same as a webhook (`add`).
+   */
+  readonly identityStitchQueue: Pick<Queue<IdentityStitchJob>, 'addBulk' | 'add'>;
 }
 
 function decryptCredentials(
@@ -148,21 +152,26 @@ async function runBackfill(deps: ShopifySyncDeps, job: ShopifySyncJob): Promise<
   });
 }
 
+type ApplySnapshotOutcome =
+  { outcome: 'applied'; orderId: string } | { outcome: 'skipped_non_inr'; orderId?: undefined };
+
 /**
- * Applies one order from the bulk result. Mirrors the API's `applyOrderSnapshot` (webhook path):
- * a non-INR order is skipped (this codebase has no per-row FX handling — an MVP limitation, SPEC §2),
- * and the money-sanity flag is logged but the order is still stored (LLD §7). The two copies are
- * kept in step by hand for now — deduplicating them needs a home that both `packages/db` (which
- * must not import the adapter, see `orderRepository.ts`) and the API can share; tracked in issue #41.
+ * Applies one order snapshot (shopify-integration.md §4.4/§4.5), regardless of whether it came from
+ * a bulk result line or a GraphQL `fetchOrder` call. Mirrors the API's `applyOrderSnapshot` (webhook
+ * path): a non-INR order is skipped (this codebase has no per-row FX handling — an MVP limitation,
+ * SPEC §2), and the money-sanity flag is logged but the order is still stored (LLD §7). The two
+ * copies are kept in step by hand for now — deduplicating them needs a home that both `packages/db`
+ * (which must not import the adapter, see `orderRepository.ts`) and the API can share; tracked in
+ * issue #41.
  */
-async function applyBulkOrder(
+async function applyOrderSnapshotInWorker(
   deps: ShopifySyncDeps,
   scope: Scope,
   storeId: string,
   snapshot: ShopifyOrderSnapshot,
-): Promise<
-  { outcome: 'applied'; orderId: string } | { outcome: 'skipped_non_inr'; orderId?: undefined }
-> {
+  eventStatus: 'updated' | 'refund' | 'fulfillment',
+  rawRef: string,
+): Promise<ApplySnapshotOutcome> {
   if (snapshot.currency !== 'INR') return { outcome: 'skipped_non_inr' };
 
   const fields = mapOrderSnapshot(snapshot, storeId, deps.hasher);
@@ -199,12 +208,31 @@ async function applyBulkOrder(
     noteAttributes: fields.noteAttributes,
     discountCodes: fields.discountCodes,
     sourceTimestamp: new Date(snapshot.updatedAtPlatform),
-    eventStatus: 'updated',
-    // LLD §4.7: `recon:<updatedAt>`. Re-running the same bulk result re-derives the same keys, so
-    // `applySnapshot`'s (order, source, raw_ref) unique constraint makes the whole job idempotent.
-    rawRef: `recon:${snapshot.updatedAtPlatform}`,
+    eventStatus,
+    rawRef,
   });
   return { outcome: 'applied', orderId: applied.orderId };
+}
+
+/**
+ * Applies one order from the bulk result. Re-running the same bulk result re-derives the same
+ * `recon:<updatedAt>` key, so `applySnapshot`'s (order, source, raw_ref) unique constraint makes the
+ * whole job idempotent.
+ */
+function applyBulkOrder(
+  deps: ShopifySyncDeps,
+  scope: Scope,
+  storeId: string,
+  snapshot: ShopifyOrderSnapshot,
+): Promise<ApplySnapshotOutcome> {
+  return applyOrderSnapshotInWorker(
+    deps,
+    scope,
+    storeId,
+    snapshot,
+    'updated',
+    `recon:${snapshot.updatedAtPlatform}`,
+  );
 }
 
 // Shopify's terminal-but-unsuccessful bulk statuses. CREATED/RUNNING/CANCELING are "not done yet".
@@ -333,6 +361,64 @@ async function enqueueStitch(
   );
 }
 
+/**
+ * `order_refresh` (shopify-integration.md §2.6/§4.7): the debounced follow-up to an `orders/updated`,
+ * `refunds/create` or `fulfillments/*` hint. The producer (the webhook handler) already collapsed a
+ * burst of hints for one order into this single job, so by the time it runs there is no reliable way
+ * to say which topic(s) triggered it — `eventStatus: 'updated'` records it as a generic re-sync
+ * (**decision for review**: the original hint's topic is not reflected in the resulting
+ * `order_status_events` row; it remains visible in the `shopify_webhook_deliveries` trail instead).
+ * `fetchOrder` returning `null` means Shopify has no such order — logged and acked, not retried
+ * forever, same as the webhook path this replaces.
+ */
+async function runOrderRefresh(deps: ShopifySyncDeps, job: ShopifySyncJob): Promise<void> {
+  const externalOrderId = job.externalOrderIds?.[0];
+  if (!externalOrderId || job.externalOrderIds!.length !== 1) {
+    throw new Error(
+      `shopify-sync order_refresh: expected exactly one externalOrderId, got ${JSON.stringify(job.externalOrderIds)}`,
+    );
+  }
+  const loaded = await loadStoreAndIntegration(deps, job);
+  if (!loaded) return;
+  const { scope, store, integration } = loaded;
+
+  const snapshot = await withTokenRefresh(
+    deps,
+    scope,
+    job.storeId,
+    store.shopDomain,
+    integration,
+    (creds) => deps.adapter.fetchOrder(store.shopDomain, creds, externalOrderId),
+  );
+  if (!snapshot) {
+    console.error(
+      JSON.stringify({
+        event: 'shopify_order_refresh_not_found',
+        store_id: job.storeId,
+      }),
+    );
+    return;
+  }
+
+  const result = await applyOrderSnapshotInWorker(
+    deps,
+    scope,
+    job.storeId,
+    snapshot,
+    'updated',
+    `refresh:${snapshot.updatedAtPlatform}`,
+  );
+  if (result.outcome !== 'applied') return;
+
+  // One job per refresh, same as a webhook's own apply (shopifyWebhooks.ts `applyOrderSnapshot`) —
+  // unlike the bulk backfill path, there is exactly one order here, so no batching is needed.
+  await deps.identityStitchQueue.add(
+    'stitch',
+    { storeId: job.storeId, orderId: result.orderId, attempt: 0 },
+    { jobId: identityStitchJobId(result.orderId, 0), ...IDENTITY_STITCH_JOB_OPTIONS },
+  );
+}
+
 export function createShopifySyncProcessor(deps: ShopifySyncDeps) {
   return async function processShopifySyncJob(job: Job<ShopifySyncJob>): Promise<void> {
     switch (job.data.mode) {
@@ -340,8 +426,9 @@ export function createShopifySyncProcessor(deps: ShopifySyncDeps) {
         return runBackfill(deps, job.data);
       case 'bulk_result':
         return runBulkResult(deps, job.data);
-      case 'reconcile':
       case 'order_refresh':
+        return runOrderRefresh(deps, job.data);
+      case 'reconcile':
         throw new Error(`shopify-sync: mode '${job.data.mode}' is not implemented yet`);
     }
   };
