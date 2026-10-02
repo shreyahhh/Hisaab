@@ -44,6 +44,7 @@ interface FakeAdapterOptions {
   readonly bulkOperation?: ReturnType<typeof vi.fn>;
   readonly lines?: readonly ShopifyBulkOrderLine[];
   readonly fetchOrder?: ReturnType<typeof vi.fn>;
+  readonly ordersUpdatedSince?: ReturnType<typeof vi.fn>;
 }
 
 function fakeAdapter(options: FakeAdapterOptions = {}) {
@@ -55,6 +56,9 @@ function fakeAdapter(options: FakeAdapterOptions = {}) {
     for (const line of options.lines ?? []) yield line;
   });
   const fetchOrder = options.fetchOrder ?? vi.fn().mockRejectedValue(new Error('not used'));
+  const ordersUpdatedSince =
+    options.ordersUpdatedSince ??
+    vi.fn().mockResolvedValue({ orders: [], hasNextPage: false, endCursor: null });
   const adapter: ShopifyAdapter = {
     provider: 'shopify',
     authUrl: () => '',
@@ -67,10 +71,19 @@ function fakeAdapter(options: FakeAdapterOptions = {}) {
     startBulkOrders,
     bulkOperation,
     streamBulkOrders,
+    ordersUpdatedSince,
     upsertWebPixel: () => Promise.reject(new Error('not used')),
     uninstallApp: () => Promise.reject(new Error('not used')),
   };
-  return { adapter, startBulkOrders, refresh, bulkOperation, streamBulkOrders, fetchOrder };
+  return {
+    adapter,
+    startBulkOrders,
+    refresh,
+    bulkOperation,
+    streamBulkOrders,
+    fetchOrder,
+    ordersUpdatedSince,
+  };
 }
 
 // No shopper is erased and no stitch queue is real unless a test says so.
@@ -801,11 +814,207 @@ describe('shopify-sync processor — mode: order_refresh (shopify-integration.md
   });
 });
 
-describe('shopify-sync processor — unimplemented modes', () => {
-  it.each(['reconcile'] as const)('throws a clear error for %s (not built yet)', async (mode) => {
-    const { adapter } = fakeAdapter();
-    await expect(
-      createShopifySyncProcessor(depsFor(adapter))(job({ storeId: 'irrelevant', mode })),
-    ).rejects.toThrow(`'${mode}' is not implemented yet`);
+describe('shopify-sync processor — mode: reconcile (shopify-integration.md §4.7)', () => {
+  const reconcileJob = (storeId: string) => job({ storeId, mode: 'reconcile' });
+
+  async function settingsOf(tenant: { organizationId: string; storeId: string }) {
+    const row = await createIntegrationRepository(db).getActiveByStore(
+      jobScope(tenant.organizationId, tenant.storeId),
+      tenant.storeId,
+      'shopify',
+    );
+    return (row?.settings ?? {}) as { last_reconcile_at?: string };
+  }
+
+  it('applies every page of orders and advances last_reconcile_at to the run start time', async () => {
+    const tenant = await seedTestTenant('shopify-sync-reconcile-pages');
+    try {
+      await connectStore(tenant);
+      const before = Date.now();
+      const ordersUpdatedSince = vi
+        .fn()
+        .mockResolvedValueOnce({
+          orders: [snapshot({ externalOrderId: '9001' })],
+          hasNextPage: true,
+          endCursor: 'cursor-1',
+        })
+        .mockResolvedValueOnce({
+          orders: [snapshot({ externalOrderId: '9002' })],
+          hasNextPage: false,
+          endCursor: null,
+        });
+      const { adapter } = fakeAdapter({ ordersUpdatedSince });
+
+      await createShopifySyncProcessor(depsFor(adapter))(reconcileJob(tenant.storeId));
+
+      expect(ordersUpdatedSince).toHaveBeenCalledTimes(2);
+      expect(ordersUpdatedSince.mock.calls[0]![3]).toBeNull(); // no cursor on the first page
+      expect(ordersUpdatedSince.mock.calls[1]![3]).toBe('cursor-1'); // the first page's endCursor
+      expect((await ordersOf(tenant.storeId)).map((r) => r.externalOrderId).sort()).toEqual([
+        '9001',
+        '9002',
+      ]);
+      const { last_reconcile_at } = await settingsOf(tenant);
+      expect(last_reconcile_at).toBeDefined();
+      expect(Math.abs(new Date(last_reconcile_at!).getTime() - before)).toBeLessThan(5000);
+    } finally {
+      await cleanupTestTenant(tenant);
+    }
+  });
+
+  it('enqueues an attempt-0 identity-stitch job for every applied order, none for a skipped non-INR one', async () => {
+    const tenant = await seedTestTenant('shopify-sync-reconcile-stitch');
+    try {
+      await connectStore(tenant);
+      const ordersUpdatedSince = vi.fn().mockResolvedValue({
+        orders: [
+          snapshot({ externalOrderId: '9201' }),
+          snapshot({ externalOrderId: '9202', currency: 'USD' }),
+        ],
+        hasNextPage: false,
+        endCursor: null,
+      });
+      vi.spyOn(console, 'error').mockImplementation(() => undefined);
+      const addBulk = vi.fn(async (_jobs: unknown[]) => []);
+      const { adapter } = fakeAdapter({ ordersUpdatedSince });
+
+      await createShopifySyncProcessor(
+        depsFor(adapter, { identityStitchQueue: { addBulk } as never }),
+      )(reconcileJob(tenant.storeId));
+
+      expect(addBulk).toHaveBeenCalledTimes(1);
+      const jobs = addBulk.mock.calls[0]![0] as Array<{
+        data: { orderId: string; attempt: number };
+      }>;
+      expect(jobs).toHaveLength(1); // only the applied order, not the skipped non-INR one
+      expect(jobs[0]!.data.attempt).toBe(0);
+    } finally {
+      await cleanupTestTenant(tenant);
+    }
+  });
+
+  it('defaults to a ~25h lookback on a store with no prior last_reconcile_at', async () => {
+    const tenant = await seedTestTenant('shopify-sync-reconcile-first-run');
+    try {
+      await connectStore(tenant);
+      const before = Date.now();
+      const { adapter, ordersUpdatedSince } = fakeAdapter();
+
+      await createShopifySyncProcessor(depsFor(adapter))(reconcileJob(tenant.storeId));
+
+      const sinceIso = ordersUpdatedSince.mock.calls[0]![2] as string;
+      const expectedMs = before - 25 * 60 * 60 * 1000;
+      expect(Math.abs(new Date(sinceIso).getTime() - expectedMs)).toBeLessThan(5000);
+    } finally {
+      await cleanupTestTenant(tenant);
+    }
+  });
+
+  it('computes the next run from last_reconcile_at minus a 1h overlap', async () => {
+    const tenant = await seedTestTenant('shopify-sync-reconcile-watermark');
+    try {
+      const { scope } = await connectStore(tenant);
+      const lastReconcileAt = '2026-09-20T03:30:00.000Z';
+      await createIntegrationRepository(db).patchShopifySettings(scope, tenant.storeId, {
+        last_reconcile_at: lastReconcileAt,
+      });
+      const { adapter, ordersUpdatedSince } = fakeAdapter();
+
+      await createShopifySyncProcessor(depsFor(adapter))(reconcileJob(tenant.storeId));
+
+      const sinceIso = ordersUpdatedSince.mock.calls[0]![2] as string;
+      expect(sinceIso).toBe('2026-09-20T02:30:00.000Z');
+    } finally {
+      await cleanupTestTenant(tenant);
+    }
+  });
+
+  it('does not advance the watermark and stops paging once the order cap is reached mid-run', async () => {
+    const tenant = await seedTestTenant('shopify-sync-reconcile-cap');
+    try {
+      const { scope } = await connectStore(tenant);
+      await createIntegrationRepository(db).patchShopifySettings(scope, tenant.storeId, {
+        last_reconcile_at: '2026-09-20T03:30:00.000Z',
+      });
+      let calls = 0;
+      const ordersUpdatedSince = vi.fn(async () => {
+        calls += 1;
+        return {
+          orders: [snapshot({ externalOrderId: `cap-${calls}` })],
+          hasNextPage: true,
+          endCursor: `cursor-${calls}`,
+        };
+      });
+      vi.spyOn(console, 'error').mockImplementation(() => undefined);
+      const { adapter } = fakeAdapter({ ordersUpdatedSince });
+
+      // Injected cap of 2 (1 order/page) keeps this test fast — production uses the real 10,000.
+      await createShopifySyncProcessor(depsFor(adapter, { reconcileMaxOrdersPerRun: 2 }))(
+        reconcileJob(tenant.storeId),
+      );
+
+      expect(ordersUpdatedSince).toHaveBeenCalledTimes(2);
+      const { last_reconcile_at } = await settingsOf(tenant);
+      expect(last_reconcile_at).toBe('2026-09-20T03:30:00.000Z'); // unchanged
+    } finally {
+      await cleanupTestTenant(tenant);
+    }
+  });
+
+  it('skips non-INR orders without failing the run', async () => {
+    const tenant = await seedTestTenant('shopify-sync-reconcile-non-inr');
+    try {
+      await connectStore(tenant);
+      const ordersUpdatedSince = vi.fn().mockResolvedValue({
+        orders: [
+          snapshot({ externalOrderId: '9101', currency: 'USD' }),
+          snapshot({ externalOrderId: '9102' }),
+        ],
+        hasNextPage: false,
+        endCursor: null,
+      });
+      vi.spyOn(console, 'error').mockImplementation(() => undefined);
+      const { adapter } = fakeAdapter({ ordersUpdatedSince });
+
+      await createShopifySyncProcessor(depsFor(adapter))(reconcileJob(tenant.storeId));
+
+      expect((await ordersOf(tenant.storeId)).map((r) => r.externalOrderId)).toEqual(['9102']);
+    } finally {
+      await cleanupTestTenant(tenant);
+    }
+  });
+
+  it('on a 401 refreshes once, stores the rotated credentials, and retries with them', async () => {
+    const tenant = await seedTestTenant('shopify-sync-reconcile-refresh');
+    try {
+      const { repo, scope } = await connectStore(tenant);
+      const refreshed: ShopifyCredentials = { ...CREDENTIALS, accessToken: 'shpat_rotated' };
+      const ordersUpdatedSince = vi
+        .fn()
+        .mockRejectedValueOnce(new ShopifyUnauthorizedError())
+        .mockResolvedValueOnce({ orders: [], hasNextPage: false, endCursor: null });
+      const refresh = vi.fn().mockResolvedValue(refreshed);
+      const { adapter } = fakeAdapter({ ordersUpdatedSince, refresh });
+
+      await createShopifySyncProcessor(depsFor(adapter))(reconcileJob(tenant.storeId));
+
+      expect(refresh).toHaveBeenCalledTimes(1);
+      expect(ordersUpdatedSince).toHaveBeenCalledTimes(2);
+      const stored = await repo.getActiveByStore(scope, tenant.storeId, 'shopify');
+      const decrypted = JSON.parse(
+        cipher.decrypt({ integrationId: stored!.id }, stored!.encryptedCredentials!),
+      ) as ShopifyCredentials;
+      expect(decrypted.accessToken).toBe('shpat_rotated');
+    } finally {
+      await cleanupTestTenant(tenant);
+    }
+  });
+
+  it('is a no-op when the store no longer exists', async () => {
+    const { adapter, ordersUpdatedSince } = fakeAdapter();
+    await createShopifySyncProcessor(depsFor(adapter))(
+      job({ storeId: '00000000-0000-0000-0000-000000000000', mode: 'reconcile' }),
+    );
+    expect(ordersUpdatedSince).not.toHaveBeenCalled();
   });
 });

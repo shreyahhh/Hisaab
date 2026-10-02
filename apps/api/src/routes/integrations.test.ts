@@ -102,6 +102,9 @@ function fakeShopifyAdapter(options: FakeAdapterOptions = {}): ShopifyAdapter {
     async *streamBulkOrders() {
       // no result rows
     },
+    async ordersUpdatedSince() {
+      return { orders: [], hasNextPage: false, endCursor: null };
+    },
     async upsertWebPixel() {
       return { pixelId: 'gid://shopify/WebPixel/test' };
     },

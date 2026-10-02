@@ -61,7 +61,8 @@ export type ShopifySyncMode = (typeof SHOPIFY_SYNC_MODES)[number];
  * - `backfill`: starts a bulk order query for the last `days` days (shopify-integration.md §4.7).
  * - `bulk_result`: processes the JSONL result of `bulkOperationId`.
  * - `order_refresh`: re-fetches one order (`externalOrderIds` has length 1) via `fetchOrder`,
- *   debounced 30 s at the producer (issue #41). `reconcile` is not yet built.
+ *   debounced 30 s at the producer (issue #41).
+ * - `reconcile`: pages through orders updated since the store's last run (issue #41).
  */
 export interface ShopifySyncJob {
   readonly storeId: string;
@@ -69,6 +70,20 @@ export interface ShopifySyncJob {
   readonly days?: number;
   readonly bulkOperationId?: string;
   readonly externalOrderIds?: readonly string[];
+}
+
+/**
+ * shopify-integration.md §4.7 `reconcile`: daily at 03:30 IST, registered per store as a BullMQ Job
+ * Scheduler on `shopify-sync` — same mechanism as `meta-warmup`'s per-store `upsertJobScheduler`
+ * (apps/workers/src/index.ts), rather than a single fan-out trigger job: `ShopifySyncJob`'s payload
+ * shape (HLD §8) is already fixed to one store, and this avoids a new, uncanonical job/queue name.
+ */
+export const SHOPIFY_RECONCILE_CRON = '30 3 * * *';
+export const SHOPIFY_RECONCILE_TZ = 'Asia/Kolkata';
+
+/** BullMQ Job Scheduler id, stable per store so re-registering it on every Workers boot is idempotent. */
+export function shopifyReconcileSchedulerId(storeId: string): string {
+  return `shopify-reconcile-${storeId}`;
 }
 
 /**

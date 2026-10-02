@@ -9,6 +9,7 @@ import type {
   ShopifyCredentials,
   ShopifyHealthStatus,
   ShopifyOrderSnapshot,
+  ShopifyOrdersPage,
   ShopifyShopInfo,
   WebPixelSettings,
 } from './types.js';
@@ -106,6 +107,20 @@ export interface ShopifyAdapter {
    * by the caller — it is a network read.
    */
   streamBulkOrders(url: string): AsyncGenerator<ShopifyBulkOrderLine, void, void>;
+  /**
+   * One page (up to 250) of orders updated at or after `sinceIso`, newest-updated-last
+   * (shopify-integration.md §4.7 `reconcile`). Pass the previous page's `endCursor` as `after` to
+   * continue. Retries a throttled response once, the same small fixed delay as `fetchOrder` — this
+   * is a scheduled job, not a webhook, but reconcile pages are small and frequent enough that the
+   * LLD's full cost-based backoff (§4.7 "Rate limits") isn't built yet; tracked as a gap, not silently
+   * assumed away.
+   */
+  ordersUpdatedSince(
+    shop: string,
+    creds: ShopifyCredentials,
+    sinceIso: string,
+    after?: string | null,
+  ): Promise<ShopifyOrdersPage>;
   /**
    * Creates the app's Web Pixel with `settings`, or updates it if one already exists (shopify-
    * integration.md §4.1 step 6) — safe to call on every (re)connect and on key rotation. Requires the
@@ -367,6 +382,74 @@ async function fetchOrder(
   // Unreachable: every loop iteration above returns, throws, or (on the last attempt) throws —
   // this satisfies the return type for a plain `for` loop, which TS can't otherwise prove exhaustive.
   throw new Error('fetchOrder: exhausted attempts without a result');
+}
+
+const ORDERS_UPDATED_SINCE_QUERY = `
+  query($query: String!, $after: String) {
+    orders(first: 250, after: $after, query: $query, sortKey: UPDATED_AT) {
+      pageInfo { hasNextPage endCursor }
+      edges { node { ${ORDER_FIELDS} } }
+    }
+  }
+`;
+
+const OrdersUpdatedSinceResponse = z.object({
+  data: z.object({
+    orders: z.object({
+      pageInfo: z.object({ hasNextPage: z.boolean(), endCursor: z.string().nullable() }),
+      edges: z.array(z.object({ node: OrderNode })),
+    }),
+  }),
+});
+
+async function ordersUpdatedSince(
+  shop: string,
+  creds: ShopifyCredentials,
+  sinceIso: string,
+  after?: string | null,
+): Promise<ShopifyOrdersPage> {
+  // Shopify's search query syntax (not a GraphQL variable type) — `>=` needs the value quoted.
+  const query = `updated_at:>='${sinceIso}'`;
+  for (let attempt = 1; attempt <= ORDER_FETCH_MAX_ATTEMPTS; attempt += 1) {
+    const response = await fetch(`https://${shop}/admin/api/${SHOPIFY_API_VERSION}/graphql.json`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'X-Shopify-Access-Token': creds.accessToken,
+      },
+      body: JSON.stringify({
+        query: ORDERS_UPDATED_SINCE_QUERY,
+        variables: { query, after: after ?? null },
+      }),
+    });
+    if (response.status === 401) {
+      throw new ShopifyUnauthorizedError();
+    }
+    if (!response.ok && response.status !== 429) {
+      throw new Error(`Shopify orders query returned ${response.status}`);
+    }
+    const body: unknown = await response.json();
+    if (isThrottledResponse(response.status, body)) {
+      if (attempt < ORDER_FETCH_MAX_ATTEMPTS) {
+        await sleep(ORDER_FETCH_RETRY_DELAY_MS);
+        continue;
+      }
+      throw new Error(
+        'Shopify orders query throttled after retrying; the reconcile job will retry on its next run',
+      );
+    }
+    const parsed = OrdersUpdatedSinceResponse.safeParse(body);
+    if (!parsed.success) {
+      throw new Error('Shopify orders query returned an unexpected response shape');
+    }
+    const { pageInfo, edges } = parsed.data.data.orders;
+    return {
+      orders: edges.map((edge) => mapOrderNodeToSnapshot(edge.node)),
+      hasNextPage: pageInfo.hasNextPage,
+      endCursor: pageInfo.hasNextPage ? pageInfo.endCursor : null,
+    };
+  }
+  throw new Error('ordersUpdatedSince: exhausted attempts without a result');
 }
 
 const BulkOperationRunQueryResponse = z.object({
@@ -704,6 +787,8 @@ export function createShopifyAdapter(config: ShopifyAdapterConfig): ShopifyAdapt
     bulkOperation,
 
     streamBulkOrders,
+
+    ordersUpdatedSince,
 
     upsertWebPixel,
 

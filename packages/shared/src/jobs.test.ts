@@ -17,10 +17,13 @@ import {
   SHOPIFY_SYNC_MODES,
   SHOPIFY_SYNC_QUEUE,
   SHOPIFY_ORDER_REFRESH_DELAY_MS,
+  SHOPIFY_RECONCILE_CRON,
+  SHOPIFY_RECONCILE_TZ,
   attributionRunJobId,
   identityStitchJobId,
   normaliseOrderId,
   shopifyOrderRefreshJobId,
+  shopifyReconcileSchedulerId,
 } from './jobs.js';
 
 describe('shopify-sync job registry (HLD §8)', () => {
@@ -49,6 +52,20 @@ describe('shopifyOrderRefreshJobId (shopify-integration.md §2.6)', () => {
 
   it('debounces 30 s, per the LLD', () => {
     expect(SHOPIFY_ORDER_REFRESH_DELAY_MS).toBe(30_000);
+  });
+});
+
+describe('shopifyReconcileSchedulerId (shopify-integration.md §4.7)', () => {
+  it('builds a stable, distinct id per store with no colons (not a BullMQ custom job id)', () => {
+    const a = shopifyReconcileSchedulerId('store-1');
+    const b = shopifyReconcileSchedulerId('store-2');
+    expect(a).toBe('shopify-reconcile-store-1');
+    expect(a).not.toBe(b);
+  });
+
+  it('runs daily at 03:30 IST', () => {
+    expect(SHOPIFY_RECONCILE_CRON).toBe('30 3 * * *');
+    expect(SHOPIFY_RECONCILE_TZ).toBe('Asia/Kolkata');
   });
 });
 

@@ -44,6 +44,11 @@ export {
   type WarmupStore,
 } from './repositories/metaWarmupSchedulingRepository.js';
 export {
+  createShopifyReconcileSchedulingRepository,
+  type ReconcileStore,
+  type ShopifyReconcileSchedulingRepository,
+} from './repositories/shopifyReconcileSchedulingRepository.js';
+export {
   createDsrRequestRepository,
   type AppendFollowupInput,
   type CompleteDsrRequestInput,

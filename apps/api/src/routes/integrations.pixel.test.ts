@@ -69,6 +69,7 @@ function fakeAdapter(upsertWebPixel: ShopifyAdapter['upsertWebPixel']): ShopifyA
     async *streamBulkOrders() {
       // none
     },
+    ordersUpdatedSince: async () => ({ orders: [], hasNextPage: false, endCursor: null }),
     upsertWebPixel,
     uninstallApp: async () => ({ success: true, errorCount: 0 }),
   };
