@@ -59,9 +59,9 @@ export type ShopifySyncMode = (typeof SHOPIFY_SYNC_MODES)[number];
 /**
  * HLD §8: `ShopifySyncJob{storeId, mode, bulkOperationId?, externalOrderIds?}`.
  * - `backfill`: starts a bulk order query for the last `days` days (shopify-integration.md §4.7).
- * - `bulk_result`: processes the JSONL result of `bulkOperationId` (not yet built — tracked
- *   separately; this mode/field exists so the payload shape doesn't need to change later).
- * - `reconcile` / `order_refresh`: not yet built.
+ * - `bulk_result`: processes the JSONL result of `bulkOperationId`.
+ * - `order_refresh`: re-fetches one order (`externalOrderIds` has length 1) via `fetchOrder`,
+ *   debounced 30 s at the producer (issue #41). `reconcile` is not yet built.
  */
 export interface ShopifySyncJob {
   readonly storeId: string;
@@ -69,6 +69,23 @@ export interface ShopifySyncJob {
   readonly days?: number;
   readonly bulkOperationId?: string;
   readonly externalOrderIds?: readonly string[];
+}
+
+/**
+ * shopify-integration.md §2.6: a burst of `orders/updated`/`refunds/create`/`fulfillments/*` hints
+ * for one order collapses into a single `order_refresh` fetch ~30 s after the first hint, since the
+ * webhook payloads are partial and the full state is only available via a GraphQL `fetchOrder`.
+ */
+export const SHOPIFY_ORDER_REFRESH_DELAY_MS = 30_000;
+
+/**
+ * `shopify-refresh:<storeId>:<externalOrderId>` — exactly three `:`-delimited parts, same constraint
+ * as `identityStitchJobId`. While a job with this id is waiting or delayed, BullMQ ignores further
+ * `add` calls with the same `jobId` (same mechanism the LLD relies on for the debounce), so a burst of
+ * hints for one order collapses into the one job.
+ */
+export function shopifyOrderRefreshJobId(storeId: string, externalOrderId: string): string {
+  return `shopify-refresh:${storeId}:${externalOrderId}`;
 }
 
 /** HLD §8: `identity-stitch`. */

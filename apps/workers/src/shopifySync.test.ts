@@ -11,7 +11,7 @@ import {
 } from '@truepath/integrations';
 import { storeContext } from '@truepath/privacy';
 import { createTestCredentialsCipher, createTestIdentityHasher } from '@truepath/privacy/testing';
-import type { ShopifySyncJob, TenantScope } from '@truepath/shared';
+import type { IdentityStitchJob, ShopifySyncJob, TenantScope } from '@truepath/shared';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createShopifySyncProcessor, type ShopifySyncDeps } from './shopifySync.js';
 
@@ -43,6 +43,7 @@ interface FakeAdapterOptions {
   readonly refresh?: ReturnType<typeof vi.fn>;
   readonly bulkOperation?: ReturnType<typeof vi.fn>;
   readonly lines?: readonly ShopifyBulkOrderLine[];
+  readonly fetchOrder?: ReturnType<typeof vi.fn>;
 }
 
 function fakeAdapter(options: FakeAdapterOptions = {}) {
@@ -53,6 +54,7 @@ function fakeAdapter(options: FakeAdapterOptions = {}) {
   const streamBulkOrders = vi.fn(async function* () {
     for (const line of options.lines ?? []) yield line;
   });
+  const fetchOrder = options.fetchOrder ?? vi.fn().mockRejectedValue(new Error('not used'));
   const adapter: ShopifyAdapter = {
     provider: 'shopify',
     authUrl: () => '',
@@ -61,14 +63,14 @@ function fakeAdapter(options: FakeAdapterOptions = {}) {
     shopInfo: () => Promise.reject(new Error('not used')),
     healthCheck: () => Promise.resolve({ healthy: true }),
     verifyWebhook: () => true,
-    fetchOrder: () => Promise.reject(new Error('not used')),
+    fetchOrder,
     startBulkOrders,
     bulkOperation,
     streamBulkOrders,
     upsertWebPixel: () => Promise.reject(new Error('not used')),
     uninstallApp: () => Promise.reject(new Error('not used')),
   };
-  return { adapter, startBulkOrders, refresh, bulkOperation, streamBulkOrders };
+  return { adapter, startBulkOrders, refresh, bulkOperation, streamBulkOrders, fetchOrder };
 }
 
 // No shopper is erased and no stitch queue is real unless a test says so.
@@ -82,6 +84,7 @@ function depsFor(adapter: ShopifyAdapter, over: Partial<ShopifySyncDeps> = {}): 
     redis: noSuppression,
     identityStitchQueue: {
       addBulk: vi.fn(async () => []),
+      add: vi.fn(async () => ({}) as never),
     } as unknown as ShopifySyncDeps['identityStitchQueue'],
     ...over,
   };
@@ -645,14 +648,164 @@ describe('shopify-sync processor — bulk_result: identity stitching and erased 
   });
 });
 
+describe('shopify-sync processor — mode: order_refresh (shopify-integration.md §2.6/§4.7)', () => {
+  const refreshJob = (storeId: string, externalOrderId: string) =>
+    job({ storeId, mode: 'order_refresh', externalOrderIds: [externalOrderId] });
+
+  it('fetches the order and applies it as a generic update, with a refresh: raw_ref', async () => {
+    const tenant = await seedTestTenant('shopify-sync-refresh-apply');
+    try {
+      await connectStore(tenant);
+      const { adapter, fetchOrder } = fakeAdapter({
+        fetchOrder: vi.fn().mockResolvedValue(snapshot({ externalOrderId: '5001' })),
+      });
+
+      await createShopifySyncProcessor(depsFor(adapter))(refreshJob(tenant.storeId, '5001'));
+
+      expect(fetchOrder).toHaveBeenCalledTimes(1);
+      const [shop, creds, externalOrderId] = fetchOrder.mock.calls[0]!;
+      expect(shop).toMatch(/\.myshopify\.com$/);
+      expect(creds).toEqual(CREDENTIALS);
+      expect(externalOrderId).toBe('5001');
+
+      const rows = await ordersOf(tenant.storeId);
+      expect(rows).toHaveLength(1);
+      expect(rows[0]!.externalOrderId).toBe('5001');
+      const events = (await db.select().from(schema.orderStatusEvents)).filter(
+        (e) => e.orderId === rows[0]!.id,
+      );
+      expect(events).toHaveLength(1);
+      expect(events[0]!.status).toBe('updated');
+      expect(events[0]!.rawRef).toBe('refresh:2026-09-20T10:05:00Z');
+    } finally {
+      await cleanupTestTenant(tenant);
+    }
+  });
+
+  it('enqueues a single attempt-0 identity-stitch job, same as a webhook apply', async () => {
+    const tenant = await seedTestTenant('shopify-sync-refresh-stitch');
+    try {
+      await connectStore(tenant);
+      const { adapter } = fakeAdapter({
+        fetchOrder: vi.fn().mockResolvedValue(snapshot({ externalOrderId: '5001' })),
+      });
+      const add = vi.fn(
+        async (_name: string, _data: IdentityStitchJob, _opts: unknown) => ({}) as never,
+      );
+
+      await createShopifySyncProcessor(depsFor(adapter, { identityStitchQueue: { add } as never }))(
+        refreshJob(tenant.storeId, '5001'),
+      );
+
+      expect(add).toHaveBeenCalledTimes(1);
+      const [name, data, opts] = add.mock.calls[0]!;
+      expect(name).toBe('stitch');
+      expect(data.attempt).toBe(0);
+      expect((opts as { jobId: string }).jobId).toMatch(/^stitch:.+:0$/);
+    } finally {
+      await cleanupTestTenant(tenant);
+    }
+  });
+
+  it('acks and skips when Shopify has no such order (never retries forever)', async () => {
+    const tenant = await seedTestTenant('shopify-sync-refresh-missing');
+    try {
+      await connectStore(tenant);
+      const { adapter } = fakeAdapter({ fetchOrder: vi.fn().mockResolvedValue(null) });
+      vi.spyOn(console, 'error').mockImplementation(() => undefined);
+
+      await createShopifySyncProcessor(depsFor(adapter))(refreshJob(tenant.storeId, '9999'));
+
+      expect(await ordersOf(tenant.storeId)).toHaveLength(0);
+    } finally {
+      await cleanupTestTenant(tenant);
+    }
+  });
+
+  it('skips a non-INR order (no FX handling in the MVP)', async () => {
+    const tenant = await seedTestTenant('shopify-sync-refresh-non-inr');
+    try {
+      await connectStore(tenant);
+      const { adapter } = fakeAdapter({
+        fetchOrder: vi
+          .fn()
+          .mockResolvedValue(snapshot({ externalOrderId: '5001', currency: 'USD' })),
+      });
+      vi.spyOn(console, 'error').mockImplementation(() => undefined);
+
+      await createShopifySyncProcessor(depsFor(adapter))(refreshJob(tenant.storeId, '5001'));
+
+      expect(await ordersOf(tenant.storeId)).toHaveLength(0);
+    } finally {
+      await cleanupTestTenant(tenant);
+    }
+  });
+
+  it('is idempotent: re-running the same refresh adds no second order_status_events row', async () => {
+    const tenant = await seedTestTenant('shopify-sync-refresh-idempotent');
+    try {
+      await connectStore(tenant);
+      const { adapter } = fakeAdapter({
+        fetchOrder: vi.fn().mockResolvedValue(snapshot({ externalOrderId: '5001' })),
+      });
+      const process = createShopifySyncProcessor(depsFor(adapter));
+
+      await process(refreshJob(tenant.storeId, '5001'));
+      await process(refreshJob(tenant.storeId, '5001'));
+
+      const rows = await ordersOf(tenant.storeId);
+      expect(rows).toHaveLength(1);
+      const events = (await db.select().from(schema.orderStatusEvents)).filter(
+        (e) => e.orderId === rows[0]!.id,
+      );
+      expect(events).toHaveLength(1);
+    } finally {
+      await cleanupTestTenant(tenant);
+    }
+  });
+
+  it('on a 401 refreshes once, stores the rotated credentials, and retries with them', async () => {
+    const tenant = await seedTestTenant('shopify-sync-refresh-token-refresh');
+    try {
+      const { repo, scope } = await connectStore(tenant);
+      const refreshed: ShopifyCredentials = { ...CREDENTIALS, accessToken: 'shpat_rotated' };
+      const fetchOrder = vi
+        .fn()
+        .mockRejectedValueOnce(new ShopifyUnauthorizedError())
+        .mockResolvedValueOnce(snapshot({ externalOrderId: '5001' }));
+      const refresh = vi.fn().mockResolvedValue(refreshed);
+      const { adapter } = fakeAdapter({ fetchOrder, refresh });
+
+      await createShopifySyncProcessor(depsFor(adapter))(refreshJob(tenant.storeId, '5001'));
+
+      expect(refresh).toHaveBeenCalledTimes(1);
+      expect(fetchOrder).toHaveBeenCalledTimes(2);
+      expect(fetchOrder.mock.calls[1]![1]).toEqual(refreshed);
+      const stored = await repo.getActiveByStore(scope, tenant.storeId, 'shopify');
+      const decrypted = JSON.parse(
+        cipher.decrypt({ integrationId: stored!.id }, stored!.encryptedCredentials!),
+      ) as ShopifyCredentials;
+      expect(decrypted.accessToken).toBe('shpat_rotated');
+    } finally {
+      await cleanupTestTenant(tenant);
+    }
+  });
+
+  it('throws when the job carries no externalOrderIds (defensive — the producer always sets one)', async () => {
+    const { adapter } = fakeAdapter();
+    await expect(
+      createShopifySyncProcessor(depsFor(adapter))(
+        job({ storeId: 'irrelevant', mode: 'order_refresh' }),
+      ),
+    ).rejects.toThrow('expected exactly one externalOrderId');
+  });
+});
+
 describe('shopify-sync processor — unimplemented modes', () => {
-  it.each(['reconcile', 'order_refresh'] as const)(
-    'throws a clear error for %s (not built yet)',
-    async (mode) => {
-      const { adapter } = fakeAdapter();
-      await expect(
-        createShopifySyncProcessor(depsFor(adapter))(job({ storeId: 'irrelevant', mode })),
-      ).rejects.toThrow(`'${mode}' is not implemented yet`);
-    },
-  );
+  it.each(['reconcile'] as const)('throws a clear error for %s (not built yet)', async (mode) => {
+    const { adapter } = fakeAdapter();
+    await expect(
+      createShopifySyncProcessor(depsFor(adapter))(job({ storeId: 'irrelevant', mode })),
+    ).rejects.toThrow(`'${mode}' is not implemented yet`);
+  });
 });

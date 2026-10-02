@@ -1,9 +1,14 @@
 import { createHmac, randomUUID } from 'node:crypto';
 import { cleanupTestTenant, seedTestTenant, type TestTenant } from '@truepath/db/testing';
 import { storeContext } from '@truepath/privacy';
-import { collectorStoreKey, storeBoundScope, suppressionSetKey } from '@truepath/shared';
+import {
+  collectorStoreKey,
+  SHOPIFY_ORDER_REFRESH_DELAY_MS,
+  shopifyOrderRefreshJobId,
+  storeBoundScope,
+  suppressionSetKey,
+} from '@truepath/shared';
 import { createIntegrationRepository, jobScope, schema, type Db } from '@truepath/db';
-import type { ShopifyAdapter, ShopifyOrderSnapshot } from '@truepath/integrations';
 import { eq } from 'drizzle-orm';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
@@ -14,7 +19,6 @@ import {
   testHasher,
   testIdentityStitchQueue,
   testRedis,
-  testShopify,
   testShopifySyncQueue,
 } from '../testApp.js';
 
@@ -30,37 +34,6 @@ function orderWebhookPayload(overrides: Record<string, unknown> = {}) {
     financial_status: 'paid',
     fulfillment_status: null,
     payment_gateway_names: ['razorpay'],
-    ...overrides,
-  };
-}
-
-/** A ShopifyAdapter whose fetchOrder is controllable, for the refund/fulfillment hint tests. */
-function appWithFetchOrder(fetchOrderImpl: ShopifyAdapter['fetchOrder']) {
-  return buildTestApp({
-    shopify: { ...testShopify, adapter: { ...testShopify.adapter, fetchOrder: fetchOrderImpl } },
-  });
-}
-
-function graphQlSnapshot(overrides: Partial<ShopifyOrderSnapshot> = {}): ShopifyOrderSnapshot {
-  return {
-    externalOrderId: '1001',
-    createdAtPlatform: '2026-09-01T10:00:00Z',
-    updatedAtPlatform: '2026-09-01T10:05:00Z',
-    cancelledAt: null,
-    currency: 'INR',
-    totalPrice: '1299.00',
-    totalRefunded: '100.00',
-    totalOutstanding: '0.00',
-    financialStatus: 'PAID',
-    fulfillmentStatus: 'UNFULFILLED',
-    paymentGatewayNames: ['razorpay'],
-    email: null,
-    phone: null,
-    shippingAddressZip: null,
-    landingSite: null,
-    referringSite: null,
-    noteAttributes: [],
-    discountCodes: [],
     ...overrides,
   };
 }
@@ -897,176 +870,107 @@ describe('POST /webhooks/shopify/orders — validation failures log field paths 
   });
 });
 
-describe('POST /webhooks/shopify/order-hints — refunds/fulfillments (M1-2)', () => {
-  async function tenantWithIntegration(label: string) {
+describe('POST /webhooks/shopify/order-hints — refunds/fulfillments (issue #41)', () => {
+  // Issue #41: these hints no longer call `fetchOrder` synchronously (M1-2's original approach) —
+  // they enqueue a debounced `order_refresh` job and return. The worker-side apply (including the
+  // out-of-order-delivery and "Shopify has no such order" cases) is covered by
+  // `apps/workers/src/shopifySync.test.ts`'s `order_refresh` suite.
+  async function storeDomain(label: string) {
     const t = await tenant(label);
-    await createIntegrationRepository(testDb).upsertShopify(jobScope(t.organizationId, t.storeId), {
-      storeId: t.storeId,
-      externalAccountId: `gid://shopify/Shop/${label}`,
-      credentialsJson: JSON.stringify({
-        accessToken: 'shpat_test',
-        accessTokenExpiresAt: new Date(Date.now() + 3600_000).toISOString(),
-        refreshToken: 'shprt_test',
-        refreshTokenExpiresAt: new Date(Date.now() + 7_776_000_000).toISOString(),
-        scope: 'read_orders',
-      }),
-      scopes: ['read_orders'],
-      cipher: testCredentialsCipher,
-    });
-    return t;
+    const [store] = await testDb
+      .select()
+      .from(schema.stores)
+      .where(eq(schema.stores.id, t.storeId));
+    return { t, shopDomain: store!.shopDomain };
   }
 
-  it('refunds/create fetches the full order and updates refunded_amount_paise', async () => {
-    const t = await tenantWithIntegration('webhook-refund-hint');
-    const [store] = await testDb
-      .select()
-      .from(schema.stores)
-      .where(eq(schema.stores.id, t.storeId));
-    const app2 = appWithFetchOrder(async () => graphQlSnapshot());
-    try {
-      const payload = JSON.stringify({ order_id: 1001, created_at: '2026-09-01T11:00:00Z' });
-      const res = await app2.inject({
-        method: 'POST',
-        url: '/webhooks/shopify/order-hints',
-        payload,
-        headers: {
-          'content-type': 'application/json',
-          'x-shopify-hmac-sha256': sign(payload),
-          'x-shopify-shop-domain': store!.shopDomain,
-          'x-shopify-topic': 'refunds/create',
-          'x-shopify-webhook-id': randomUUID(),
-        },
-      });
-      expect(res.statusCode).toBe(200);
+  // Mirrors the `bulk_operations/finish` describe block below: the real local queue, cleaned up so a
+  // worker running against the same Redis never picks up a leftover test job.
+  async function jobFor(storeId: string, externalOrderId: string) {
+    const job = await testShopifySyncQueue.getJob(shopifyOrderRefreshJobId(storeId, externalOrderId));
+    if (job) cleanups.push(async () => void (await job.remove().catch(() => undefined)));
+    return job;
+  }
 
-      const [row] = await testDb
-        .select()
-        .from(schema.orders)
-        .where(eq(schema.orders.storeId, t.storeId));
-      expect(row?.externalOrderId).toBe('1001');
-      expect(row?.refundedAmountPaise).toBe(10000);
-    } finally {
-      await app2.close();
-    }
-  });
-
-  it('a hint for an order that does not exist yet creates it from the fetched snapshot (out-of-order delivery)', async () => {
-    const t = await tenantWithIntegration('webhook-hint-order-not-yet-created');
-    const [store] = await testDb
-      .select()
-      .from(schema.stores)
-      .where(eq(schema.stores.id, t.storeId));
-    const app2 = appWithFetchOrder(async () => graphQlSnapshot({ externalOrderId: '5001' }));
-    try {
-      const payload = JSON.stringify({ order_id: 5001, updated_at: '2026-09-01T11:00:00Z' });
-      const res = await app2.inject({
-        method: 'POST',
-        url: '/webhooks/shopify/order-hints',
-        payload,
-        headers: {
-          'content-type': 'application/json',
-          'x-shopify-hmac-sha256': sign(payload),
-          'x-shopify-shop-domain': store!.shopDomain,
-          'x-shopify-topic': 'fulfillments/create',
-          'x-shopify-webhook-id': randomUUID(),
-        },
-      });
-      expect(res.statusCode).toBe(200);
-      const [row] = await testDb
-        .select()
-        .from(schema.orders)
-        .where(eq(schema.orders.storeId, t.storeId));
-      expect(row?.externalOrderId).toBe('5001'); // created purely from the hint's fetchOrder call
-    } finally {
-      await app2.close();
-    }
-  });
-
-  it('acks and skips when Shopify has no such order (never retries forever)', async () => {
-    const t = await tenantWithIntegration('webhook-hint-order-missing');
-    const [store] = await testDb
-      .select()
-      .from(schema.stores)
-      .where(eq(schema.stores.id, t.storeId));
-    const app2 = appWithFetchOrder(async () => null);
-    try {
-      const payload = JSON.stringify({ order_id: 9999 });
-      const res = await app2.inject({
-        method: 'POST',
-        url: '/webhooks/shopify/order-hints',
-        payload,
-        headers: {
-          'content-type': 'application/json',
-          'x-shopify-hmac-sha256': sign(payload),
-          'x-shopify-shop-domain': store!.shopDomain,
-          'x-shopify-topic': 'refunds/create',
-          'x-shopify-webhook-id': randomUUID(),
-        },
-      });
-      expect(res.statusCode).toBe(200);
-      const rows = await testDb
-        .select()
-        .from(schema.orders)
-        .where(eq(schema.orders.storeId, t.storeId));
-      expect(rows).toHaveLength(0);
-    } finally {
-      await app2.close();
-    }
-  });
-
-  it('calls fetchOrder before ever touching the database — never inside a transaction (M1-2 review item 1)', async () => {
-    const t = await tenantWithIntegration('webhook-hint-fetch-order');
-    const [store] = await testDb
-      .select()
-      .from(schema.stores)
-      .where(eq(schema.stores.id, t.storeId));
-    const callOrder: string[] = [];
-    const realTransaction = testDb.transaction.bind(testDb);
-    const spiedDb = new Proxy(testDb, {
-      get(target, prop, receiver) {
-        if (prop === 'transaction') {
-          return (...args: Parameters<typeof realTransaction>) => {
-            callOrder.push('transaction-start');
-            return realTransaction(...args);
-          };
-        }
-        const value = Reflect.get(target, prop, receiver);
-        return typeof value === 'function' ? value.bind(target) : value;
-      },
+  it('refunds/create enqueues a debounced order_refresh job, tied to the store and order', async () => {
+    const { t, shopDomain } = await storeDomain('webhook-refund-hint');
+    const res = await sendWebhook({
+      topic: 'order-hints',
+      shopifyTopic: 'refunds/create',
+      shopDomain,
+      body: { order_id: 1001, created_at: '2026-09-01T11:00:00Z' },
     });
-    const app2 = buildTestApp({
-      db: spiedDb,
-      shopify: {
-        ...testShopify,
-        adapter: {
-          ...testShopify.adapter,
-          fetchOrder: async () => {
-            callOrder.push('fetch-order');
-            return graphQlSnapshot();
-          },
-        },
-      },
+    expect(res.statusCode).toBe(200);
+
+    const job = await jobFor(t.storeId, '1001');
+    expect(job?.data).toEqual({
+      storeId: t.storeId,
+      mode: 'order_refresh',
+      externalOrderIds: ['1001'],
     });
-    try {
-      const payload = JSON.stringify({ order_id: 1001 });
-      await app2.inject({
-        method: 'POST',
-        url: '/webhooks/shopify/order-hints',
-        payload,
-        headers: {
-          'content-type': 'application/json',
-          'x-shopify-hmac-sha256': sign(payload),
-          'x-shopify-shop-domain': store!.shopDomain,
-          'x-shopify-topic': 'refunds/create',
-          'x-shopify-webhook-id': randomUUID(),
-        },
+    expect(job?.opts.delay).toBe(SHOPIFY_ORDER_REFRESH_DELAY_MS);
+    expect(job?.opts.removeOnComplete).toBe(true);
+    // Nothing is applied synchronously — that's the worker's job once the debounce elapses.
+    expect(
+      await testDb.select().from(schema.orders).where(eq(schema.orders.storeId, t.storeId)),
+    ).toHaveLength(0);
+  });
+
+  it('collapses a burst of hints for the same order into one debounced job', async () => {
+    const { t, shopDomain } = await storeDomain('webhook-hint-burst');
+    for (const shopifyTopic of ['refunds/create', 'fulfillments/create', 'fulfillments/update']) {
+      const res = await sendWebhook({
+        topic: 'order-hints',
+        shopifyTopic,
+        shopDomain,
+        body: { order_id: 2002 },
       });
-      expect(callOrder[0]).toBe('fetch-order');
-      expect(callOrder).toContain('transaction-start');
-      expect(callOrder.indexOf('fetch-order')).toBeLessThan(callOrder.indexOf('transaction-start'));
-    } finally {
-      await app2.close();
+      expect(res.statusCode).toBe(200);
     }
+    const jobs = await testShopifySyncQueue.getJobs([
+      'waiting',
+      'delayed',
+      'active',
+      'completed',
+      'failed',
+    ]);
+    const matching = jobs.filter(
+      (j) => j.data.storeId === t.storeId && j.data.externalOrderIds?.[0] === '2002',
+    );
+    expect(matching).toHaveLength(1);
+    await jobFor(t.storeId, '2002');
+  });
+
+  it('a numeric and a string order_id for the same order collapse into the same job id', async () => {
+    const { t, shopDomain } = await storeDomain('webhook-hint-id-shapes');
+    await sendWebhook({
+      topic: 'order-hints',
+      shopifyTopic: 'refunds/create',
+      shopDomain,
+      body: { order_id: 3003 },
+    });
+    await sendWebhook({
+      topic: 'order-hints',
+      shopifyTopic: 'fulfillments/create',
+      shopDomain,
+      body: { order_id: '3003' },
+    });
+    const jobs = await testShopifySyncQueue.getJobs(['waiting', 'delayed', 'active']);
+    expect(jobs.filter((j) => j.data.storeId === t.storeId)).toHaveLength(1);
+    await jobFor(t.storeId, '3003');
+  });
+
+  it('acks and enqueues nothing for a malformed payload', async () => {
+    const { t, shopDomain } = await storeDomain('webhook-hint-malformed');
+    const res = await sendWebhook({
+      topic: 'order-hints',
+      shopifyTopic: 'refunds/create',
+      shopDomain,
+      body: { not_an_order_id: true },
+    });
+    expect(res.statusCode).toBe(200);
+    const jobs = await testShopifySyncQueue.getJobs(['waiting', 'delayed', 'active']);
+    expect(jobs.filter((j) => j.data.storeId === t.storeId)).toHaveLength(0);
   });
 });
 
