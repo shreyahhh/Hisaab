@@ -862,6 +862,37 @@ describe('shopify-sync processor — mode: reconcile (shopify-integration.md §4
     }
   });
 
+  it('enqueues an attempt-0 identity-stitch job for every applied order, none for a skipped non-INR one', async () => {
+    const tenant = await seedTestTenant('shopify-sync-reconcile-stitch');
+    try {
+      await connectStore(tenant);
+      const ordersUpdatedSince = vi.fn().mockResolvedValue({
+        orders: [
+          snapshot({ externalOrderId: '9201' }),
+          snapshot({ externalOrderId: '9202', currency: 'USD' }),
+        ],
+        hasNextPage: false,
+        endCursor: null,
+      });
+      vi.spyOn(console, 'error').mockImplementation(() => undefined);
+      const addBulk = vi.fn(async (_jobs: unknown[]) => []);
+      const { adapter } = fakeAdapter({ ordersUpdatedSince });
+
+      await createShopifySyncProcessor(
+        depsFor(adapter, { identityStitchQueue: { addBulk } as never }),
+      )(reconcileJob(tenant.storeId));
+
+      expect(addBulk).toHaveBeenCalledTimes(1);
+      const jobs = addBulk.mock.calls[0]![0] as Array<{
+        data: { orderId: string; attempt: number };
+      }>;
+      expect(jobs).toHaveLength(1); // only the applied order, not the skipped non-INR one
+      expect(jobs[0]!.data.attempt).toBe(0);
+    } finally {
+      await cleanupTestTenant(tenant);
+    }
+  });
+
   it('defaults to a ~25h lookback on a store with no prior last_reconcile_at', async () => {
     const tenant = await seedTestTenant('shopify-sync-reconcile-first-run');
     try {

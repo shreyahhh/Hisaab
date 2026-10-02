@@ -46,8 +46,10 @@ export interface ShopifySyncDeps {
   /** Durable Redis, read for the erased-identity list when an order is stored (HLD §6b). */
   readonly redis: SuppressionReader;
   /**
-   * HLD §8 `identity-stitch`: backfilled orders enter at attempt 2 in bulk (identity-stitching.md
-   * §5); a single `order_refresh` apply enqueues one attempt-0 job, the same as a webhook (`add`).
+   * HLD §8 `identity-stitch`: `bulk_result`'s backfilled orders enter at attempt 2 in bulk
+   * (identity-stitching.md §5); `reconcile` bulk-enqueues attempt 0 (same chunking, same reasoning,
+   * different entry point — its orders are recent updates, not an old-history backfill); a single
+   * `order_refresh` apply enqueues one attempt-0 job, the same as a webhook (`add`).
    */
   readonly identityStitchQueue: Pick<Queue<IdentityStitchJob>, 'addBulk' | 'add'>;
   /**
@@ -303,13 +305,13 @@ async function runBulkResult(deps: ShopifySyncDeps, job: ShopifySyncJob): Promis
         applied += 1;
         toStitch.push(result.orderId);
         if (toStitch.length >= STITCH_ENQUEUE_CHUNK)
-          await enqueueStitch(deps, job.storeId, toStitch.splice(0));
+          await enqueueStitch(deps, job.storeId, toStitch.splice(0), 2);
       } else {
         skippedNonInr += 1;
       }
     }
   }
-  await enqueueStitch(deps, job.storeId, toStitch.splice(0));
+  await enqueueStitch(deps, job.storeId, toStitch.splice(0), 2);
 
   if (skippedNonInr > 0) {
     console.error(
@@ -350,21 +352,25 @@ async function runBulkResult(deps: ShopifySyncDeps, job: ShopifySyncJob): Promis
 const STITCH_ENQUEUE_CHUNK = 500;
 
 /**
- * Backfilled orders have no pixel data to wait for, so they enter the stitch chain at its last attempt:
- * the HMAC fallback, then the UTM fallback (identity-stitching.md §5, shopify-integration.md §4.7).
- * The job ids dedupe a re-run of the same bulk result.
+ * Enqueued on every apply, not only a new order: a crash between the apply and this call would
+ * otherwise lose the job for good, and the job id dedupes the repeats (same reasoning as the API's
+ * own `applyOrderSnapshot`). Backfilled orders (`attempt: 2`) have no pixel data to wait for, so they
+ * enter the stitch chain at its last attempt: the HMAC fallback, then the UTM fallback
+ * (identity-stitching.md §5, shopify-integration.md §4.7). `order_refresh`/`reconcile` use `attempt: 0`,
+ * the same entry point a direct webhook apply uses.
  */
 async function enqueueStitch(
   deps: ShopifySyncDeps,
   storeId: string,
   orderIds: readonly string[],
+  attempt: 0 | 1 | 2,
 ): Promise<void> {
   if (orderIds.length === 0) return;
   await deps.identityStitchQueue.addBulk(
     orderIds.map((orderId) => ({
       name: 'stitch',
-      data: { storeId, orderId, attempt: 2 as const },
-      opts: { jobId: identityStitchJobId(orderId, 2), ...IDENTITY_STITCH_JOB_OPTIONS },
+      data: { storeId, orderId, attempt },
+      opts: { jobId: identityStitchJobId(orderId, attempt), ...IDENTITY_STITCH_JOB_OPTIONS },
     })),
   );
 }
@@ -471,6 +477,7 @@ async function runReconcile(deps: ShopifySyncDeps, job: ShopifySyncJob): Promise
   let after: string | null = null;
   let hasNextPage = true;
   let capReached = false;
+  const toStitch: string[] = [];
 
   while (hasNextPage) {
     const page = await withTokenRefresh(
@@ -490,8 +497,16 @@ async function runReconcile(deps: ShopifySyncDeps, job: ShopifySyncJob): Promise
         'updated',
         `recon:${snapshot.updatedAtPlatform}`,
       );
-      if (result.outcome === 'applied') applied += 1;
-      else skippedNonInr += 1;
+      if (result.outcome === 'applied') {
+        applied += 1;
+        toStitch.push(result.orderId);
+        // Attempt 0, the same entry point a direct webhook apply uses — reconciled orders are recent
+        // updates, not an old-history backfill with no pixel data to wait for (unlike bulk_result).
+        if (toStitch.length >= STITCH_ENQUEUE_CHUNK)
+          await enqueueStitch(deps, job.storeId, toStitch.splice(0), 0);
+      } else {
+        skippedNonInr += 1;
+      }
     }
     processed += page.orders.length;
     hasNextPage = page.hasNextPage;
@@ -511,6 +526,7 @@ async function runReconcile(deps: ShopifySyncDeps, job: ShopifySyncJob): Promise
       break;
     }
   }
+  await enqueueStitch(deps, job.storeId, toStitch.splice(0), 0);
 
   if (skippedNonInr > 0) {
     console.error(
