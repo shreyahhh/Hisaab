@@ -1,5 +1,7 @@
 import UAParser from 'ua-parser-js';
-import type { PixelEvent } from '@truepath/shared';
+import { istDay, type PixelEvent } from '@truepath/shared';
+
+export { istDay };
 
 // Data minimisation for one event (collector.md §4 step 9, SPEC §5.4): what is kept from the user
 // agent, how properties are flattened to the allowlisted stream shape, the clock rules and the IST
@@ -108,15 +110,6 @@ export function applyClockRules(occurredAtIso: string, receivedAtMs: number): Cl
   if (Number.isNaN(occurred) || occurred < receivedAtMs - STALE_EVENT_MS) return { kind: 'stale' };
   const clamped = occurred > receivedAtMs + FUTURE_TOLERANCE_MS ? receivedAtMs : occurred;
   return { kind: 'ok', occurredAt: new Date(clamped).toISOString() };
-}
-
-/** `yyyymmdd` of an instant in IST — the day drop counters and the default-on signal are bucketed by (HLD §8). */
-export function istDay(nowMs: number): string {
-  const ist = new Date(nowMs + 5.5 * 60 * 60 * 1000);
-  const y = ist.getUTCFullYear();
-  const m = String(ist.getUTCMonth() + 1).padStart(2, '0');
-  const d = String(ist.getUTCDate()).padStart(2, '0');
-  return `${y}${m}${d}`;
 }
 
 /** Whether a page URL's host is one of the store's own hosts (collector.md §4 step 4). */

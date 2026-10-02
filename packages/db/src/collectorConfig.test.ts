@@ -10,6 +10,7 @@ import {
 import { createDpaAcceptanceRepository } from './repositories/dpaAcceptanceRepository.js';
 import { createIntegrationRepository } from './repositories/integrationRepository.js';
 import { createOrganizationRepository } from './repositories/organizationRepository.js';
+import { createStoreRepository } from './repositories/storeRepository.js';
 import {
   cleanupTestTenant,
   confirmIndiaOptIn,
@@ -180,6 +181,118 @@ describe('publishCollectorConfig — organization status (issue #8)', () => {
       );
       expect(config).toMatchObject({ status: 'active', inactiveReason: null });
       expect(sink.calls.has(`collector:store:${storeKey}`)).toBe(true);
+    } finally {
+      await cleanupTestTenant(tenant);
+    }
+  });
+});
+
+describe('publishCollectorConfig — consent_health gate (issue #52)', () => {
+  it('stays active when consent_health is paused but consentPauseEnabled is omitted (default false)', async () => {
+    const { tenant, storeKey } = await seedFullyGatedStore('collector-config-pause-flag-off');
+    try {
+      const scope = jobScope(tenant.organizationId, tenant.storeId);
+      await createStoreRepository(db).updateConsentHealth(scope, tenant.storeId, {
+        status: 'paused',
+        ratio: 0.6,
+        measuredAt: new Date(),
+        pausedAt: new Date(),
+      });
+
+      const sink = recordingSink();
+      const config = await publishCollectorConfig(
+        { db, cipher, sink, dpaVersion: DPA_VERSION },
+        scope,
+        tenant.storeId,
+      );
+      expect(config).toMatchObject({ status: 'active', inactiveReason: null });
+      expect(sink.calls.has(`collector:store:${storeKey}`)).toBe(true);
+    } finally {
+      await cleanupTestTenant(tenant);
+    }
+  });
+
+  it('becomes inactive with consent_default_on_detected when consentPauseEnabled is true', async () => {
+    const { tenant } = await seedFullyGatedStore('collector-config-pause-flag-on');
+    try {
+      const scope = jobScope(tenant.organizationId, tenant.storeId);
+      await createStoreRepository(db).updateConsentHealth(scope, tenant.storeId, {
+        status: 'paused',
+        ratio: 0.6,
+        measuredAt: new Date(),
+        pausedAt: new Date(),
+      });
+
+      const sink = recordingSink();
+      const config = await publishCollectorConfig(
+        { db, cipher, sink, dpaVersion: DPA_VERSION, consentPauseEnabled: true },
+        scope,
+        tenant.storeId,
+      );
+      expect(config).toMatchObject({
+        status: 'inactive',
+        inactiveReason: 'consent_default_on_detected',
+      });
+    } finally {
+      await cleanupTestTenant(tenant);
+    }
+  });
+
+  it('a warn (not paused) consent_health never deactivates the config, flag on or off', async () => {
+    const { tenant } = await seedFullyGatedStore('collector-config-warn-not-paused');
+    try {
+      const scope = jobScope(tenant.organizationId, tenant.storeId);
+      await createStoreRepository(db).updateConsentHealth(scope, tenant.storeId, {
+        status: 'warn',
+        ratio: 0.25,
+        measuredAt: new Date(),
+      });
+
+      const sink = recordingSink();
+      const config = await publishCollectorConfig(
+        { db, cipher, sink, dpaVersion: DPA_VERSION, consentPauseEnabled: true },
+        scope,
+        tenant.storeId,
+      );
+      expect(config).toMatchObject({ status: 'active', inactiveReason: null });
+    } finally {
+      await cleanupTestTenant(tenant);
+    }
+  });
+
+  it('dpa_missing is still reported first even with a paused consent_health (deletion/dpa/opt-in gates precede it)', async () => {
+    const tenant = await seedTestTenant('collector-config-pause-after-dpa-missing');
+    try {
+      const scope = jobScope(tenant.organizationId, tenant.storeId);
+      const storeKey = newStoreKey();
+      await createIntegrationRepository(db).upsertShopify(scope, {
+        storeId: tenant.storeId,
+        externalAccountId: 'gid://shopify/Shop/2',
+        credentialsJson: JSON.stringify({
+          accessToken: 'shpat_test',
+          pixelSigningKeys: [{ kid: 's1', secret: 's'.repeat(40) }],
+        }),
+        scopes: ['read_orders'],
+        cipher,
+      });
+      await createIntegrationRepository(db).patchShopifySettings(scope, tenant.storeId, {
+        store_key: storeKey,
+      });
+      await createStoreRepository(db).updateConsentHealth(scope, tenant.storeId, {
+        status: 'paused',
+        ratio: 0.6,
+        measuredAt: new Date(),
+        pausedAt: new Date(),
+      });
+      // No DPA acceptance, no India opt-in confirmed — those gates are checked first.
+
+      const sink = recordingSink();
+      const config = await publishCollectorConfig(
+        { db, cipher, sink, dpaVersion: DPA_VERSION, consentPauseEnabled: true },
+        scope,
+        tenant.storeId,
+      );
+      expect(config).toMatchObject({ status: 'inactive', inactiveReason: 'dpa_missing' });
     } finally {
       await cleanupTestTenant(tenant);
     }

@@ -1,6 +1,6 @@
-import { and, eq, ne, sql } from 'drizzle-orm';
+import { and, eq, inArray, ne, sql } from 'drizzle-orm';
 import { assertOrganizationInScope, type Scope } from '@truepath/shared';
-import { organizations } from '../schema/index.js';
+import { memberships, organizations, users } from '../schema/index.js';
 import type { DbExecutor } from './auditLogRepository.js';
 import { SystemScopeRequiredError } from './suppressionRebuildRepository.js';
 
@@ -56,6 +56,11 @@ export interface OrganizationRepository {
    * and `dsr_requests` are untouched — neither holds shopper or org-identifying data beyond ids.
    */
   markDeleted(scope: Scope, organizationId: string): Promise<OrganizationRow | null>;
+  /**
+   * Issue #52 (event-pipeline.md §4.4): who the default-on-region auto-pause email goes to. Emails
+   * only — never used to join against any shopper-identity hash.
+   */
+  listOwnerAndAdminEmails(scope: Scope, organizationId: string): Promise<string[]>;
 }
 
 /** The only sanctioned way to read/write `organizations`' deletion lifecycle (ADR-0016). */
@@ -143,6 +148,21 @@ export function createOrganizationRepository(db: DbExecutor): OrganizationReposi
         .where(and(eq(organizations.id, organizationId), ne(organizations.status, 'deleted')))
         .returning();
       return row ?? null;
+    },
+
+    async listOwnerAndAdminEmails(scope, organizationId) {
+      assertOrganizationInScope(scope, organizationId);
+      const rows = await db
+        .select({ email: users.email })
+        .from(memberships)
+        .innerJoin(users, eq(users.id, memberships.userId))
+        .where(
+          and(
+            eq(memberships.organizationId, organizationId),
+            inArray(memberships.role, ['owner', 'admin']),
+          ),
+        );
+      return rows.map((r) => r.email);
     },
   };
 }

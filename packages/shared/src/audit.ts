@@ -225,8 +225,10 @@ export const AUDIT_ACTION_OWNERS = {
     'M1-9 / #72',
     'apps/api/src/routes/privacyDashboard.test.ts',
   ),
-  consent_default_on_warned: pending('M1-6'),
-  consent_default_on_paused: pending('M1-6'),
+  // HLD §8 "Consent-region gate" layer 2 (issue #52). `consent_default_on_resumed` stays pending:
+  // resuming is a merchant action (re-confirming the banner is opt-in) with no producer yet.
+  consent_default_on_warned: implemented('#52', 'apps/workers/src/defaultOnSignal.test.ts'),
+  consent_default_on_paused: implemented('#52', 'apps/workers/src/defaultOnSignal.test.ts'),
   consent_default_on_resumed: pending('M1-6'),
   dsr_created: implemented(
     'M1-1 / M1-2 / M1-6b / M4-2',

@@ -35,7 +35,12 @@ export interface RebuildDeps {
    * durable Redis is lost those keys are gone, and without them the Collector rejects the pixel of
    * every store until each is re-saved. Omitted only by tests that don't seed integrations.
    */
-  readonly configs?: { readonly cipher: CredentialsCipher; readonly dpaVersion: string };
+  readonly configs?: {
+    readonly cipher: CredentialsCipher;
+    readonly dpaVersion: string;
+    /** Issue #52: whether a `paused` consent_health actually deactivates the config. */
+    readonly consentPauseEnabled?: boolean;
+  };
   /** Counts and error names only. */
   readonly log?: (line: Record<string, unknown>) => void;
 }
@@ -157,6 +162,7 @@ async function republishConfigs(
           cipher: configs.cipher,
           sink: deps.redis,
           dpaVersion: configs.dpaVersion,
+          consentPauseEnabled: configs.consentPauseEnabled,
         },
         jobScope(organizationId, storeId),
         storeId,

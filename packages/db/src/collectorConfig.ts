@@ -43,6 +43,14 @@ export interface CollectorConfigDeps {
   readonly sink: CollectorConfigSink;
   /** The DPA version organizations must have accepted (env DPA_VERSION). */
   readonly dpaVersion: string;
+  /**
+   * HLD §8 "Consent-region gate" layer 2 (event-pipeline.md §4.4, issue #52): whether a `paused`
+   * `consent_health` actually deactivates the config. Defaults to `false` (the LLD's own
+   * instruction: enforcement stays off until a dev-store test confirms the signal). Only the
+   * default-on evaluator that sets `consent_health.status = 'paused'` needs to pass `true` — every
+   * other caller can omit this and get the safe default.
+   */
+  readonly consentPauseEnabled?: boolean;
 }
 
 function asRecord(value: unknown): Record<string, unknown> {
@@ -65,6 +73,11 @@ function indiaOptInConfirmed(privacyConfig: unknown): boolean {
   return typeof at === 'string' && at !== '';
 }
 
+function consentHealthPaused(privacyConfig: unknown): boolean {
+  const health = asRecord(asRecord(privacyConfig)['consent_health']);
+  return health['status'] === 'paused';
+}
+
 function signingKeysOf(credentialsJson: string): { kid: string; secret: string }[] {
   const parsed = asRecord(JSON.parse(credentialsJson));
   const keys = parsed['pixelSigningKeys'];
@@ -80,9 +93,10 @@ function signingKeysOf(credentialsJson: string): { kid: string; secret: string }
 /**
  * Builds and writes `collector:store:<store_key>` from the store's current state (HLD §8): `active` only
  * with the org's DPA accepted at the current version AND the merchant's India opt-in confirmation on
- * record (privacy-dpdp §4.10 / SPEC v0.6 P-1) AND the organization not `pending_deletion` (issue #8) —
- * until all three, the Collector drops everything for the store. Idempotent, so it can be re-run
- * whenever a gate changes (issue #22) or after a Redis loss.
+ * record (privacy-dpdp §4.10 / SPEC v0.6 P-1) AND the organization not `pending_deletion` (issue #8)
+ * AND (when `consentPauseEnabled`) `consent_health.status` not `paused` (issue #52) — until all of
+ * those, the Collector drops everything for the store. Idempotent, so it can be re-run whenever a
+ * gate changes (issue #22) or after a Redis loss.
  *
  * `scope` must cover the store (ADR-0016; callers use a one-store scope, ADR-0026). Returns the config it
  * wrote, or null if the store has no active Shopify integration or no keys yet (nothing to publish).
@@ -130,6 +144,9 @@ export async function publishCollectorConfig(
   else if (organization?.status === 'pending_deletion') inactiveReason = 'org_deletion';
   else if (!dpa) inactiveReason = 'dpa_missing';
   else if (!indiaOptInConfirmed(store.privacyConfig)) inactiveReason = 'consent_region_unconfirmed';
+  else if (deps.consentPauseEnabled && consentHealthPaused(store.privacyConfig)) {
+    inactiveReason = 'consent_default_on_detected';
+  }
 
   const config = CollectorStoreConfig.parse({
     storeId: store.id,
