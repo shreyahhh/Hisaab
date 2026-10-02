@@ -1,6 +1,12 @@
 import { sql } from 'drizzle-orm';
 import { index, jsonb, pgTable, text, timestamp, uniqueIndex, uuid } from 'drizzle-orm/pg-core';
-import { AUDIT_ACTIONS, CONSENT_SOURCES, DSR_STATUSES, DSR_TYPES } from '@truepath/shared';
+import {
+  AUDIT_ACTIONS,
+  AUDIT_OUTBOX_STATUSES,
+  CONSENT_SOURCES,
+  DSR_STATUSES,
+  DSR_TYPES,
+} from '@truepath/shared';
 import {
   auditActorTypeEnum,
   consentStateEnum,
@@ -123,6 +129,35 @@ export const auditLog = pgTable(
     ),
     actorUserIdx: index('audit_log_actor_user_id_idx').on(table.actorUserId),
     actionCheck: checkOneOf('audit_log_action_check', table.action, AUDIT_ACTIONS),
+  }),
+);
+
+// ADR-0028 (supersedes ADR-0021), issue #13: durably records the *intent* to write an audit row for
+// a Better Auth action, before the real `audit_log` insert is attempted — so a crash between Better
+// Auth's own commit and our insert (or an insert outage longer than the retry) still leaves a row a
+// sweeper can complete, rather than only a log line. No FK to organizations/users, same reasoning as
+// `audit_log` itself: this table must outlive either without being blocked by or losing its
+// reference to them.
+export const auditOutbox = pgTable(
+  'audit_outbox',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    organizationId: uuid('organization_id'), // null for platform-wide entries
+    // The full OrganizationAuditEntry | PlatformAuditEntry (packages/shared), captured the moment
+    // it's known — already validated metadata-shape-wise only once, at the point this is finally
+    // written to audit_log (insertAuditRow), never here.
+    entry: jsonb('entry').notNull(),
+    status: text('status').notNull().default('pending'),
+    auditLogId: uuid('audit_log_id'), // set once a writer (request or sweep) completes this row
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => ({
+    // Backs the sweep's "pending rows older than the grace period" scan.
+    statusCreatedAtIdx: index('audit_outbox_status_created_at_idx').on(
+      table.status,
+      table.createdAt,
+    ),
+    statusCheck: checkOneOf('audit_outbox_status_check', table.status, AUDIT_OUTBOX_STATUSES),
   }),
 );
 

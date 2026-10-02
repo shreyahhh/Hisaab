@@ -123,6 +123,11 @@ export const IntegrationStatus = z.enum(INTEGRATION_STATUSES);
 export const DSR_STATUSES = ['pending', 'in_progress', 'completed', 'failed'] as const; // privacy-dpdp.md §3, §4.3
 export const DsrStatus = z.enum(DSR_STATUSES);
 
+// ADR-0028 (supersedes ADR-0021), issue #13: `pending` until a writer (the request itself, or the
+// sweeper) completes or abandons it.
+export const AUDIT_OUTBOX_STATUSES = ['pending', 'done', 'abandoned'] as const;
+export const AuditOutboxStatus = z.enum(AUDIT_OUTBOX_STATUSES);
+
 export const CAPI_DISPATCH_STATUSES = ['queued', 'sent', 'skipped', 'failed'] as const; // meta-integration.md §4.7
 export const CapiDispatchStatus = z.enum(CAPI_DISPATCH_STATUSES);
 

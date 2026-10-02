@@ -1,7 +1,11 @@
 import { randomUUID } from 'node:crypto';
 import { sql } from 'drizzle-orm';
 import Fastify from 'fastify';
-import { createAuditLogRepository, type AuditLogRepository } from '@truepath/db';
+import {
+  createAuditLogRepository,
+  createAuditOutboxRepository,
+  type AuditLogRepository,
+} from '@truepath/db';
 import { afterEach, describe, expect, it } from 'vitest';
 import { createAuditService } from './audit.js';
 import { registerAuthErrorHandler } from './errors.js';
@@ -136,7 +140,10 @@ describe('global error handler — a thrown non-database error', () => {
         throw new TypeError('a programmer bug, not a database error, reached the handler');
       },
     };
-    const app = buildTestApp({ errorReporter: report, audit: createAuditService(brokenLog) });
+    const app = buildTestApp({
+      errorReporter: report,
+      audit: createAuditService(brokenLog, createAuditOutboxRepository(testDb)),
+    });
 
     try {
       const res = await app.inject({

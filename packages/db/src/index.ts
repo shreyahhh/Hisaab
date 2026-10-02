@@ -119,6 +119,11 @@ export {
   type ListAuditLogOptions,
 } from './repositories/auditLogRepository.js';
 export {
+  createAuditOutboxRepository,
+  type AuditOutboxRepository,
+  type AuditOutboxRow,
+} from './repositories/auditOutboxRepository.js';
+export {
   createDpaAcceptanceRepository,
   type DpaAcceptanceRepository,
   type DpaAcceptanceRow,
