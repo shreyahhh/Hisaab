@@ -887,7 +887,9 @@ describe('POST /webhooks/shopify/order-hints — refunds/fulfillments (issue #41
   // Mirrors the `bulk_operations/finish` describe block below: the real local queue, cleaned up so a
   // worker running against the same Redis never picks up a leftover test job.
   async function jobFor(storeId: string, externalOrderId: string) {
-    const job = await testShopifySyncQueue.getJob(shopifyOrderRefreshJobId(storeId, externalOrderId));
+    const job = await testShopifySyncQueue.getJob(
+      shopifyOrderRefreshJobId(storeId, externalOrderId),
+    );
     if (job) cleanups.push(async () => void (await job.remove().catch(() => undefined)));
     return job;
   }

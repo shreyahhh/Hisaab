@@ -153,8 +153,7 @@ async function runBackfill(deps: ShopifySyncDeps, job: ShopifySyncJob): Promise<
 }
 
 type ApplySnapshotOutcome =
-  | { outcome: 'applied'; orderId: string }
-  | { outcome: 'skipped_non_inr'; orderId?: undefined };
+  { outcome: 'applied'; orderId: string } | { outcome: 'skipped_non_inr'; orderId?: undefined };
 
 /**
  * Applies one order snapshot (shopify-integration.md §4.4/§4.5), regardless of whether it came from

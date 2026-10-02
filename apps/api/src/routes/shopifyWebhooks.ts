@@ -528,7 +528,12 @@ export function registerShopifyWebhookRoutes(
           shopifyTopic === 'fulfillments/create' ||
           shopifyTopic === 'fulfillments/update'
         ) {
-          await handleOrderHintWebhook(webhook.shopifySyncQueue, resolved.id, shopifyTopic, rawBody);
+          await handleOrderHintWebhook(
+            webhook.shopifySyncQueue,
+            resolved.id,
+            shopifyTopic,
+            rawBody,
+          );
         } else if (shopifyTopic === 'bulk_operations/finish') {
           await handleBulkOperationFinish(webhook, resolved.id, shopifyTopic, rawBody);
         }
