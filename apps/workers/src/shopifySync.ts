@@ -30,9 +30,12 @@ import {
 
 // The `shopify-sync` queue's processor (HLD §8; shopify-integration.md §4.7). Implements
 // `mode: 'backfill'` (start the bulk order query, M1-3), `mode: 'bulk_result'` (stream and apply its
-// JSONL, M1-3b), and `mode: 'order_refresh'` (re-fetch and apply one order, issue #41 — the debounced
-// job `apps/api/src/routes/shopifyWebhooks.ts`'s hint handler now enqueues). `reconcile` and the
-// 60→90-day auto-extend are still deferred (issue #41).
+// JSONL, M1-3b), `mode: 'order_refresh'` (re-fetch and apply one order, issue #41 — the debounced job
+// `apps/api/src/routes/shopifyWebhooks.ts`'s hint handler enqueues), and `mode: 'reconcile'` (page
+// through orders updated since the store's last run, issue #41 — registered as a daily per-store
+// BullMQ Job Scheduler, `apps/workers/src/index.ts`). The 60→90-day auto-extend, the `reconcile`
+// shop_hosts refresh / collector-config republish, and its >10,000-orders bulk fallback are still
+// deferred (issue #41).
 
 export interface ShopifySyncDeps {
   readonly db: Db;
@@ -47,6 +50,11 @@ export interface ShopifySyncDeps {
    * §5); a single `order_refresh` apply enqueues one attempt-0 job, the same as a webhook (`add`).
    */
   readonly identityStitchQueue: Pick<Queue<IdentityStitchJob>, 'addBulk' | 'add'>;
+  /**
+   * `reconcile`'s defensive per-run cap (default `RECONCILE_MAX_ORDERS_PER_RUN`, 10,000) — overridable
+   * so a test can exercise the cap path without writing 10,000 real rows.
+   */
+  readonly reconcileMaxOrdersPerRun?: number;
 }
 
 function decryptCredentials(
@@ -419,6 +427,117 @@ async function runOrderRefresh(deps: ShopifySyncDeps, job: ShopifySyncJob): Prom
   );
 }
 
+// LLD: `ordersUpdatedSince(last_reconcile_at - 1h)` — the 1h overlap covers an order whose update
+// landed just before the previous run's watermark was stamped (its own re-application is a no-op,
+// §4.4's out-of-order guard / the `recon:<updatedAt>` raw_ref being identical either way).
+const RECONCILE_WATERMARK_OVERLAP_MS = 60 * 60 * 1000;
+// No prior `last_reconcile_at` (first run for this store): cover a bit over 24h, so a store connected
+// just after yesterday's run time isn't missing part of a day once this job starts running for it.
+const RECONCILE_FIRST_RUN_LOOKBACK_MS = 25 * 60 * 60 * 1000;
+/**
+ * Defensive cap, not the LLD's own design: §4.7 says ">10,000 changed orders in a run should switch
+ * to a bulk query instead," but `startBulkOrders` only filters by *creation* date, not `updated_at` —
+ * reconcile needs orders *changed* since a watermark, a different query Shopify's bulk API doesn't
+ * expose today. Rather than build a new, untested bulk-query shape for a volume no MVP-sized store
+ * (SPEC §2: ₹10L–5Cr GMV) is likely to hit, this stops the run and logs instead of looping unboundedly
+ * or silently dropping the excess. Tracked as a real gap in issue #41, not silently assumed away.
+ */
+const RECONCILE_MAX_ORDERS_PER_RUN = 10_000;
+
+/**
+ * `reconcile` (shopify-integration.md §4.7): daily per store. Pages `ordersUpdatedSince` 250 at a
+ * time and applies each through the same §4.4 path as every other mode, advancing
+ * `settings.last_reconcile_at` only after a full, uncapped page-through — if the cap is hit, the
+ * watermark is left where it was so the next run retries the same window rather than silently
+ * skipping whatever this run didn't reach. Not built here (issue #41, explicitly scoped out): the
+ * `shop_hosts` refresh / collector-config republish, and the consent-policy check (SPEC v0.6, pending
+ * the access scope).
+ */
+async function runReconcile(deps: ShopifySyncDeps, job: ShopifySyncJob): Promise<void> {
+  const loaded = await loadStoreAndIntegration(deps, job);
+  if (!loaded) return;
+  const { scope, store, integration } = loaded;
+
+  const settings = (integration.settings ?? null) as { last_reconcile_at?: string } | null;
+  const runStartedAt = new Date();
+  const sinceMs = settings?.last_reconcile_at
+    ? new Date(settings.last_reconcile_at).getTime() - RECONCILE_WATERMARK_OVERLAP_MS
+    : runStartedAt.getTime() - RECONCILE_FIRST_RUN_LOOKBACK_MS;
+  const sinceIso = new Date(sinceMs).toISOString();
+
+  let applied = 0;
+  let skippedNonInr = 0;
+  let processed = 0;
+  let after: string | null = null;
+  let hasNextPage = true;
+  let capReached = false;
+
+  while (hasNextPage) {
+    const page = await withTokenRefresh(
+      deps,
+      scope,
+      job.storeId,
+      store.shopDomain,
+      integration,
+      (creds) => deps.adapter.ordersUpdatedSince(store.shopDomain, creds, sinceIso, after),
+    );
+    for (const snapshot of page.orders) {
+      const result = await applyOrderSnapshotInWorker(
+        deps,
+        scope,
+        job.storeId,
+        snapshot,
+        'updated',
+        `recon:${snapshot.updatedAtPlatform}`,
+      );
+      if (result.outcome === 'applied') applied += 1;
+      else skippedNonInr += 1;
+    }
+    processed += page.orders.length;
+    hasNextPage = page.hasNextPage;
+    after = page.endCursor;
+    if (
+      hasNextPage &&
+      processed >= (deps.reconcileMaxOrdersPerRun ?? RECONCILE_MAX_ORDERS_PER_RUN)
+    ) {
+      capReached = true;
+      console.error(
+        JSON.stringify({
+          event: 'shopify_reconcile_order_cap_reached',
+          store_id: job.storeId,
+          processed,
+        }),
+      );
+      break;
+    }
+  }
+
+  if (skippedNonInr > 0) {
+    console.error(
+      JSON.stringify({
+        event: 'shopify_order_non_inr_skipped',
+        store_id: job.storeId,
+        count: skippedNonInr,
+      }),
+    );
+  }
+
+  if (!capReached) {
+    await createIntegrationRepository(deps.db).patchShopifySettings(scope, job.storeId, {
+      last_reconcile_at: runStartedAt.toISOString(),
+    });
+  }
+  console.log(
+    JSON.stringify({
+      event: 'shopify_reconcile_completed',
+      store_id: job.storeId,
+      applied,
+      skipped_non_inr: skippedNonInr,
+      cap_reached: capReached,
+    }),
+  );
+}
+
 export function createShopifySyncProcessor(deps: ShopifySyncDeps) {
   return async function processShopifySyncJob(job: Job<ShopifySyncJob>): Promise<void> {
     switch (job.data.mode) {
@@ -429,7 +548,7 @@ export function createShopifySyncProcessor(deps: ShopifySyncDeps) {
       case 'order_refresh':
         return runOrderRefresh(deps, job.data);
       case 'reconcile':
-        throw new Error(`shopify-sync: mode '${job.data.mode}' is not implemented yet`);
+        return runReconcile(deps, job.data);
     }
   };
 }

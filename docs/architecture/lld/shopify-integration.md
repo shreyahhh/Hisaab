@@ -395,8 +395,11 @@ bulk-enqueues `IdentityStitchJob{attempt:2}` in chunks of 500, and finishes the 
 `orders_applied`, `orders_reported` (Shopify's own `rootObjectCount`, for reconciliation),
 `invalid_lines` and `finished_at`. The order-hint webhooks (`refunds/create`, `fulfillments/create`,
 `fulfillments/update`) enqueue a debounced `order_refresh`, which re-fetches the order and applies it
-with one attempt-0 `IdentityStitchJob` (same as a direct `orders/*` webhook). All three modes refresh
-an expired access token once on a 401. Deviations from the text below, all deliberate:
+with one attempt-0 `IdentityStitchJob` (same as a direct `orders/*` webhook). `reconcile` is
+registered as a daily 03:30 IST **per-store** BullMQ Job Scheduler on `shopify-sync`
+(`apps/workers/src/index.ts`, same `upsertJobScheduler` mechanism as `meta-warmup`) — not a single
+fan-out trigger job, since `ShopifySyncJob`'s payload (HLD §8) is already one store per job. All four
+modes refresh an expired access token once on a 401. Deviations from the text below, all deliberate:
 - The `bulk_result` job id is `bulk-result-<n>`, not `shopify-bulk:<id>` — BullMQ custom job ids can't
   contain `:`.
 - Orders are applied one at a time, each in its own transaction, not in batches of 1,000.
@@ -406,9 +409,16 @@ an expired access token once on a 401. Deviations from the text below, all delib
   `'refund'`/`'fulfillment'` — a burst of different hints for one order can collapse into the one
   debounced job, and the job payload (HLD §8) carries no topic to attribute it to. The topic is still
   visible in the `shopify_webhook_deliveries` row.
+- `reconcile`'s defensive order cap (10,000 changed orders/run, injectable for tests) stops the run and
+  leaves `last_reconcile_at` unchanged rather than switching to a bulk query — `startBulkOrders` only
+  filters by *creation* date, not `updated_at`, so the LLD's own ">10,000 → bulk instead" isn't
+  buildable without a new, untested bulk-query shape. Logged (`shopify_reconcile_order_cap_reached`),
+  not silently dropped.
 - Not built, tracked in issue #41: the `partialDataUrl` restart, the audit row for backfill counts,
-  `reconcile`, the 60→90-day auto-extend, the up-to-5-concurrent-queries accounting, and `orders/create`'s
-  own additional debounced `order_refresh` for `customerJourneySummary`/refunds (row above).
+  `reconcile`'s `shop_hosts` refresh / collector-config republish and its >10,000-orders bulk fallback
+  (above), the consent-policy check (pending the access scope, same as always), the 60→90-day
+  auto-extend, the up-to-5-concurrent-queries accounting, and `orders/create`'s own additional
+  debounced `order_refresh` for `customerJourneySummary`/refunds (row above).
 
 - **`backfill`**:
   - `startBulkOrders(since = now − days)`, where `days` = 60 without `read_all_orders`, else 90.
@@ -420,10 +430,10 @@ an expired access token once on a 401. Deviations from the text below, all delib
   - Bulk-enqueue `IdentityStitchJob{attempt:2}` and project each batch.
   - If only `partialDataUrl` is available, process it and restart from the last `createdAt` seen.
   - Set `settings.backfill.status='done'`, `last_synced_at`; audit counts.
-- **`reconcile`** (daily 03:30 IST, `SystemScope` fan-out):
-  - `ordersUpdatedSince(last_reconcile_at − 1 h)`, 250 per page, applied through §4.4. More than 10,000 changed orders → bulk instead.
-  - Refreshes `shop_hosts` and republishes the collector config on change. Keeps the refresh token in use.
-  - **Consent-region check** (SPEC v0.6, if the scope is approved): `consentPolicy(countryCode: IN) { consentRequired }` ([consentPolicy](https://shopify.dev/docs/api/admin-graphql/latest/queries/consentPolicy)). `consentRequired = false` → republish the collector config `inactive` (`consent_policy_not_required`), with a banner and email (privacy-dpdp §4.13). The query also runs at onboarding step 8. The required access scope isn't documented — **VERIFY** in a dev store (pending in HLD §8).
+- **`reconcile`** (issue #41, built: the order-reconciliation pass only; daily 03:30 IST per-store scheduler):
+  - `ordersUpdatedSince(last_reconcile_at − 1 h, or ~25h ago on a store's first run)`, 250 per page, applied through §4.4 with `raw_ref = recon:<updatedAt>` (same key shape as `bulk_result`, so a page re-applied by a retry is idempotent).
+  - `last_reconcile_at` only advances once every page has been applied without hitting the 10,000-order cap (above) — a capped run retries the same window next time rather than silently skipping what it didn't reach.
+  - **Not built here** (issue #41 follow-up): refreshing `shop_hosts` and republishing the collector config on change; the consent-policy check (SPEC v0.6, if the scope is approved): `consentPolicy(countryCode: IN) { consentRequired }` ([consentPolicy](https://shopify.dev/docs/api/admin-graphql/latest/queries/consentPolicy)) — `consentRequired = false` would republish the collector config `inactive` (`consent_policy_not_required`), with a banner and email (privacy-dpdp §4.13); the required access scope isn't documented — **VERIFY** in a dev store (pending in HLD §8). The query also runs at onboarding step 8.
 - **`order_refresh`** (issue #41, built): `fetchOrder` → §4.4 (debounced as in §2.6), applied with
   `eventStatus: 'updated'` and `raw_ref = refresh:<updatedAt>`, enqueuing one attempt-0
   `IdentityStitchJob`. `refunds/*`/`fulfillments/*` enqueue this instead of M1-2's original

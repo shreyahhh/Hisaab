@@ -1,8 +1,8 @@
 // Shopify adapter types (shopify-integration.md §2.7, SPEC §8's IntegrationAdapter). M1-1 covered
 // OAuth install/uninstall; M1-2 added order-webhook mapping (fetchOrder, ShopifyOrderSnapshot);
-// M1-3 adds startBulkOrders (begin the backfill bulk query only — see adapter.ts's docstring on it
-// for what's deferred). upsertWebPixel, bulkResultUrl, ordersUpdatedSince and fetchOrderContact
-// still land with M1-3's follow-up / M1-4.
+// M1-3/#41 add startBulkOrders, bulkOperation, streamBulkOrders and ordersUpdatedSince (begin/stream
+// the backfill and reconcile — see adapter.ts's docstrings for what's deferred). upsertWebPixel and
+// fetchOrderContact still land with M1-4.
 
 /** A pixel signing key (shopify-integration.md §4.1 step 5): `kid` is public, `secret` is not stored anywhere but here. */
 export interface PixelSigningKey {
@@ -96,3 +96,11 @@ export interface ShopifyBulkOperation {
 export type ShopifyBulkOrderLine =
   | { readonly kind: 'order'; readonly snapshot: ShopifyOrderSnapshot }
   | { readonly kind: 'invalid' };
+
+/** One page of `ordersUpdatedSince` (shopify-integration.md §4.7 `reconcile`). */
+export interface ShopifyOrdersPage {
+  readonly orders: readonly ShopifyOrderSnapshot[];
+  readonly hasNextPage: boolean;
+  /** Pass back as `after` to fetch the next page; `null` once `hasNextPage` is false. */
+  readonly endCursor: string | null;
+}

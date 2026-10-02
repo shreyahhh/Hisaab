@@ -48,6 +48,11 @@ export interface ShopifySettingsPatch {
   readonly pixel_status?: 'installed' | 'failed' | 'not_configured';
   /** Shopify userError codes only (e.g. INVALID_SETTINGS), comma-joined — never a message. */
   readonly pixel_error_codes?: string;
+  /**
+   * shopify-integration.md §4.7 `reconcile`: the watermark the next run's `ordersUpdatedSince(last_reconcile_at - 1h)`
+   * is computed from. ISO 8601, stamped with the reconcile job's own start time (not Shopify's clock).
+   */
+  readonly last_reconcile_at?: string;
 }
 
 export interface UpsertMetaIntegrationInput {

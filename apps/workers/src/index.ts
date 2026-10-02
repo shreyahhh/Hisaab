@@ -4,7 +4,12 @@ import { fileURLToPath } from 'node:url';
 import { Queue, Worker } from 'bullmq';
 import { Redis } from 'ioredis';
 import { createClickHouseClient } from '@truepath/clickhouse';
-import { createDb, createMetaWarmupSchedulingRepository, createSystemScope } from '@truepath/db';
+import {
+  createDb,
+  createMetaWarmupSchedulingRepository,
+  createShopifyReconcileSchedulingRepository,
+  createSystemScope,
+} from '@truepath/db';
 import { createMetaAdapter, createShopifyAdapter } from '@truepath/integrations';
 import { createCredentialsCipher, createIdentityHasher } from '@truepath/privacy';
 import {
@@ -23,13 +28,17 @@ import {
   postgresEnvSchema,
   redisDurableEnvSchema,
   SHOPIFY_OAUTH_SCOPES,
+  SHOPIFY_RECONCILE_CRON,
+  SHOPIFY_RECONCILE_TZ,
   SHOPIFY_SYNC_QUEUE,
   shopifyEnvSchema,
+  shopifyReconcileSchedulerId,
   uuidV7,
   type AdSyncMetaJob,
   type AttributionRunJob,
   type DsrJob,
   type IdentityStitchJob,
+  type ShopifySyncJob,
 } from '@truepath/shared';
 import { processEventBatch } from './eventBatch.js';
 import { EventConsumer } from './eventConsumer.js';
@@ -105,6 +114,29 @@ function main(): void {
   });
 
   console.log(`apps/workers: shopify-sync worker listening (NODE_ENV=${env.NODE_ENV})`);
+
+  // `reconcile` (issue #41, shopify-integration.md §4.7): registers the daily 03:30 IST repeatable job
+  // for every store with an active Shopify integration — same per-store-scheduler pattern as
+  // meta-warmup above (`upsertJobScheduler` keyed on a stable per-store id is idempotent), rather than
+  // a single fan-out trigger job, since `ShopifySyncJob`'s payload shape (HLD §8) is already one store
+  // per job. A store connected *after* boot isn't picked up until the next Workers restart — the same
+  // acceptable gap meta-warmup already has for M1.
+  void (async () => {
+    const shopifySyncQueue = new Queue<ShopifySyncJob>(SHOPIFY_SYNC_QUEUE, { connection });
+    const scope = await createSystemScope(db, 'scheduler_fanout', {
+      metadata: { for: 'shopify_reconcile' },
+    });
+    const reconcileStores =
+      await createShopifyReconcileSchedulingRepository(db).listReconcileStores(scope);
+    for (const { storeId } of reconcileStores) {
+      await shopifySyncQueue.upsertJobScheduler(
+        shopifyReconcileSchedulerId(storeId),
+        { pattern: SHOPIFY_RECONCILE_CRON, tz: SHOPIFY_RECONCILE_TZ },
+        { name: 'reconcile', data: { storeId, mode: 'reconcile' } },
+      );
+    }
+    log({ event: 'shopify_reconcile_scheduled', stores: reconcileStores.length });
+  })();
 
   // identity-stitch (M1-7): links each order to its visitor(s), then hands it to attribution (whose
   // consumer lands with M3-2). A job's last failure is copied to `identity-stitch-failed` (HLD §8).

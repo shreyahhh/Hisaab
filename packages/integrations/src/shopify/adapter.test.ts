@@ -692,6 +692,154 @@ describe('createShopifyAdapter: streamBulkOrders', () => {
   });
 });
 
+describe('createShopifyAdapter: ordersUpdatedSince (shopify-integration.md §4.7 reconcile)', () => {
+  const creds: ShopifyCredentials = {
+    accessToken: 'shpat_abc123',
+    accessTokenExpiresAt: new Date().toISOString(),
+    refreshToken: 'shprt_def456',
+    refreshTokenExpiresAt: new Date().toISOString(),
+    scope: 'read_orders',
+  };
+
+  const ORDER_NODE = {
+    id: 'gid://shopify/Order/3001',
+    createdAt: '2026-09-15T10:00:00Z',
+    updatedAt: '2026-09-15T11:00:00Z',
+    cancelledAt: null,
+    email: null,
+    phone: null,
+    totalPriceSet: { shopMoney: { amount: '999.00', currencyCode: 'INR' } },
+    totalRefundedSet: { shopMoney: { amount: '0.00' } },
+    totalOutstandingSet: { shopMoney: { amount: '0.00' } },
+    paymentGatewayNames: ['razorpay'],
+    displayFinancialStatus: 'PAID',
+    displayFulfillmentStatus: 'FULFILLED',
+    discountCodes: [],
+    shippingAddress: { zip: '400001', phone: null },
+  };
+
+  it('sends a quoted updated_at search query and maps each edge to a snapshot', async () => {
+    let receivedVariables: unknown;
+    server.use(
+      http.post(`https://${SHOP}/admin/api/*/graphql.json`, async ({ request }) => {
+        const body = (await request.json()) as { variables?: unknown };
+        receivedVariables = body.variables;
+        return HttpResponse.json({
+          data: {
+            orders: {
+              pageInfo: { hasNextPage: false, endCursor: null },
+              edges: [{ node: ORDER_NODE }],
+            },
+          },
+        });
+      }),
+    );
+    const adapter = createShopifyAdapter(CONFIG);
+    const page = await adapter.ordersUpdatedSince(SHOP, creds, '2026-09-15T00:00:00Z');
+
+    expect(receivedVariables).toEqual({
+      query: "updated_at:>='2026-09-15T00:00:00Z'",
+      after: null,
+    });
+    expect(page.hasNextPage).toBe(false);
+    expect(page.endCursor).toBeNull();
+    expect(page.orders).toHaveLength(1);
+    expect(page.orders[0]).toMatchObject({ externalOrderId: '3001', totalPrice: '999.00' });
+  });
+
+  it('passes `after` through as the cursor, and reports hasNextPage/endCursor for a middle page', async () => {
+    let receivedVariables: unknown;
+    server.use(
+      http.post(`https://${SHOP}/admin/api/*/graphql.json`, async ({ request }) => {
+        const body = (await request.json()) as { variables?: unknown };
+        receivedVariables = body.variables;
+        return HttpResponse.json({
+          data: {
+            orders: {
+              pageInfo: { hasNextPage: true, endCursor: 'cursor-2' },
+              edges: [{ node: ORDER_NODE }],
+            },
+          },
+        });
+      }),
+    );
+    const adapter = createShopifyAdapter(CONFIG);
+    const page = await adapter.ordersUpdatedSince(SHOP, creds, '2026-09-15T00:00:00Z', 'cursor-1');
+
+    expect(receivedVariables).toMatchObject({ after: 'cursor-1' });
+    expect(page.hasNextPage).toBe(true);
+    expect(page.endCursor).toBe('cursor-2');
+  });
+
+  it('nulls endCursor when hasNextPage is false, even if Shopify still returns a cursor value', async () => {
+    server.use(
+      http.post(`https://${SHOP}/admin/api/*/graphql.json`, () =>
+        HttpResponse.json({
+          data: {
+            orders: {
+              pageInfo: { hasNextPage: false, endCursor: 'stale-cursor' },
+              edges: [],
+            },
+          },
+        }),
+      ),
+    );
+    const adapter = createShopifyAdapter(CONFIG);
+    const page = await adapter.ordersUpdatedSince(SHOP, creds, '2026-09-15T00:00:00Z');
+    expect(page.endCursor).toBeNull();
+    expect(page.orders).toEqual([]);
+  });
+
+  it('throws ShopifyUnauthorizedError on a 401, with no retry', async () => {
+    let callCount = 0;
+    server.use(
+      http.post(`https://${SHOP}/admin/api/*/graphql.json`, () => {
+        callCount += 1;
+        return HttpResponse.json(
+          { errors: [{ message: 'Invalid access token' }] },
+          { status: 401 },
+        );
+      }),
+    );
+    const adapter = createShopifyAdapter(CONFIG);
+    await expect(
+      adapter.ordersUpdatedSince(SHOP, creds, '2026-09-15T00:00:00Z'),
+    ).rejects.toBeInstanceOf(ShopifyUnauthorizedError);
+    expect(callCount).toBe(1);
+  });
+
+  it('retries exactly once on a throttled (HTTP 429) response, then succeeds if it clears', async () => {
+    let callCount = 0;
+    server.use(
+      http.post(`https://${SHOP}/admin/api/*/graphql.json`, () => {
+        callCount += 1;
+        if (callCount === 1) {
+          return HttpResponse.json({ errors: [{ message: 'Throttled' }] }, { status: 429 });
+        }
+        return HttpResponse.json({
+          data: { orders: { pageInfo: { hasNextPage: false, endCursor: null }, edges: [] } },
+        });
+      }),
+    );
+    const adapter = createShopifyAdapter(CONFIG);
+    const page = await adapter.ordersUpdatedSince(SHOP, creds, '2026-09-15T00:00:00Z');
+    expect(callCount).toBe(2);
+    expect(page.orders).toEqual([]);
+  });
+
+  it('fails fast after exhausting retries under sustained throttling', async () => {
+    server.use(
+      http.post(`https://${SHOP}/admin/api/*/graphql.json`, () =>
+        HttpResponse.json({ errors: [{ message: 'Throttled' }] }, { status: 429 }),
+      ),
+    );
+    const adapter = createShopifyAdapter(CONFIG);
+    await expect(adapter.ordersUpdatedSince(SHOP, creds, '2026-09-15T00:00:00Z')).rejects.toThrow(
+      /throttled/i,
+    );
+  });
+});
+
 describe('createShopifyAdapter: refresh keeps the rest of the credentials envelope', () => {
   it('carries pixelSigningKeys through a token rotation', async () => {
     server.use(
