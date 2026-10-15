@@ -60,6 +60,18 @@ export const EXPOSED_AUTH_ROUTES = [
     reason:
       'Audited as password_reset_completed via the onPasswordReset hook (betterAuth.ts), which only fires after the token is verified, consumed and the password actually changed — an invalid/expired token never reaches it.',
   },
+  {
+    method: 'POST',
+    path: '/send-verification-email',
+    reason:
+      'Resends the verification email for any syntactically valid address, with a constant-time response so an unknown or already-verified email is indistinguishable from a real, unverified one — same no-enumeration shape as /request-password-reset. No state changes, so nothing to audit here; the completion is audited at /verify-email.',
+  },
+  {
+    method: 'GET',
+    path: '/verify-email',
+    reason:
+      'Audited as email_verified via the afterEmailVerification hook (betterAuth.ts), which only fires once the token is verified and emailVerified is actually set — an invalid/expired token redirects or 401s before reaching it. requireEmailVerification: true means this is also the only way a real signup can ever complete — it could not safely stay disabled.',
+  },
 ] as const satisfies readonly ExposedAuthRoute[];
 
 /**
@@ -93,9 +105,8 @@ export const DISABLED_AUTH_PATHS = [
   // Password, email and profile.
   '/change-password',
   // /request-password-reset and /reset-password (+ /reset-password/:token, which this list can't
-  // hold a literal match for) are exposed and audited (issue #16) — see EXPOSED_AUTH_ROUTES.
-  '/send-verification-email',
-  '/verify-email',
+  // hold a literal match for), /send-verification-email and /verify-email are exposed and audited
+  // (issue #16) — see EXPOSED_AUTH_ROUTES.
   '/change-email',
   '/update-user',
   '/delete-user',

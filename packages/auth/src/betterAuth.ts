@@ -133,6 +133,21 @@ export function createAuth(options: CreateAuthOptions) {
     emailVerification: {
       sendVerificationEmail: async ({ user, url }) =>
         emailSender.sendVerificationEmail({ to: user.email, url }),
+      // Issue #16: /verify-email is bridged straight to Better Auth's own HTTP router (ADR-0022),
+      // which runs outside our route handlers, so this lifecycle callback is the only place that
+      // sees it. It only fires once the token is verified and emailVerified is actually set (never
+      // for an expired/invalid token, which redirects or 401s before reaching here) — so there is
+      // nothing to additionally gate, and metadata is target_user_id only, never the email.
+      afterEmailVerification: async (user) => {
+        await createAuditLogRepository(db).writePlatform({
+          actorUserId: user.id,
+          actorType: 'user',
+          action: 'email_verified',
+          targetType: 'auth',
+          targetId: 'email_verification',
+          metadata: { target_user_id: user.id },
+        });
+      },
     },
     socialProviders: {
       google: {

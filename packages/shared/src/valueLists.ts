@@ -58,6 +58,7 @@ export const AUDIT_ACTIONS = [
   'login_failed',
   'password_reset_requested',
   'password_reset_completed',
+  'email_verified',
   'member_invited',
   'member_invite_accepted',
   'member_role_changed',

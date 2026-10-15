@@ -66,8 +66,16 @@ const ALLOW_LIST_ONLY = ['/reset-password/:token'];
 // a real body and a real audit row, in the dedicated tests further down this file instead.
 const PAYLOAD_OVERRIDES: Record<string, unknown> = {
   '/request-password-reset': { email: 'auth-bridge-smoke-test@example.invalid' },
+  // Constant-time, no-enumeration response for any syntactically valid email — same reasoning as
+  // /request-password-reset above; the real verify-then-audit path is tested properly below.
+  '/send-verification-email': { email: 'auth-bridge-smoke-test@example.invalid' },
 };
-const NOT_PLAIN_200 = new Set(['/reset-password', '/reset-password/:token']);
+const NOT_PLAIN_200 = new Set([
+  '/reset-password',
+  '/reset-password/:token',
+  // Requires a real token in its query string; tested properly, with a real one, below.
+  '/verify-email',
+]);
 
 const json = { origin: ORIGIN, 'content-type': 'application/json' };
 function viaApp(e: Endpoint) {
@@ -457,6 +465,163 @@ describe('password reset (issue #16)', () => {
       expect((await passwordResetAuditRows('password_reset_completed')).length).toBe(before);
     } finally {
       await reset.app.close();
+    }
+  });
+});
+
+describe('email verification (issue #16)', () => {
+  function buildVerifyTestApp() {
+    const sentUrls: string[] = [];
+    const auth = createAuth({
+      db: testDb,
+      env: {
+        BETTER_AUTH_SECRET: 'a'.repeat(32),
+        BETTER_AUTH_URL: 'http://localhost:3000',
+        DASHBOARD_URL: 'http://localhost:5173',
+        GOOGLE_CLIENT_ID: 'test-google-client-id',
+        GOOGLE_CLIENT_SECRET: 'test-google-client-secret',
+      },
+      redisDurableUrl: 'redis://localhost:6379',
+      allowInsecureCookies: true,
+      emailSender: {
+        ...noopEmailSender,
+        async sendVerificationEmail({ url }) {
+          sentUrls.push(url);
+        },
+      },
+    });
+    return { app: buildTestApp({ auth }), auth, sentUrls };
+  }
+
+  function tokenFromVerifyUrl(url: string): string {
+    const match = /[?&]token=([^&]+)/.exec(url);
+    if (!match) throw new Error(`tokenFromVerifyUrl: no token in ${url}`);
+    return match[1]!;
+  }
+
+  async function emailVerifiedAuditRows() {
+    return testDb
+      .select()
+      .from(schema.auditLog)
+      .where(
+        and(
+          eq(schema.auditLog.action, 'email_verified'),
+          eq(schema.auditLog.targetId, 'email_verification'),
+        ),
+      );
+  }
+
+  // Signup requires verification (requireEmailVerification: true) and does not auto-verify —
+  // seedRealTenant flips emailVerified directly to get a usable session without going through this
+  // flow, so a dedicated signUpEmail call is used here instead, to get a real, pending verification.
+  async function signUpUnverified(verify: ReturnType<typeof buildVerifyTestApp>, label: string) {
+    const email = `verify-${label}-${Date.now()}-${Math.random().toString(36).slice(2)}@example.invalid`;
+    const signUp = await verify.auth.api.signUpEmail({
+      body: { email, password: 'a-very-long-password-123', name: `Verify ${label}` },
+    });
+    return { userId: signUp.user.id, email };
+  }
+
+  // No org/membership exists for these (signUpEmail only, no createOrganization) — just the
+  // user and what Better Auth created alongside it, same tables cleanupRealUser deletes.
+  async function cleanupVerifyUser(userId: string): Promise<void> {
+    await testDb.delete(schema.authAccounts).where(eq(schema.authAccounts.userId, userId));
+    await testDb.delete(schema.sessions).where(eq(schema.sessions.userId, userId));
+    await testDb.delete(schema.users).where(eq(schema.users.id, userId));
+  }
+
+  it('signing up sends a verification email with a usable token, and does not auto-verify', async () => {
+    const verify = buildVerifyTestApp();
+    let userId: string | undefined;
+    try {
+      ({ userId } = await signUpUnverified(verify, 'signup'));
+      expect(verify.sentUrls).toHaveLength(1);
+      tokenFromVerifyUrl(verify.sentUrls[0]!); // throws if the URL doesn't carry one
+
+      const [user] = await testDb.select().from(schema.users).where(eq(schema.users.id, userId));
+      expect(user?.emailVerified).toBe(false);
+    } finally {
+      if (userId) await cleanupVerifyUser(userId);
+      await verify.app.close();
+    }
+  });
+
+  it('visiting the real link verifies the user and audits email_verified with target_user_id only', async () => {
+    const verify = buildVerifyTestApp();
+    let userId: string | undefined;
+    try {
+      const signedUp = await signUpUnverified(verify, 'verify-ok');
+      userId = signedUp.userId;
+      const email = signedUp.email;
+      const token = tokenFromVerifyUrl(verify.sentUrls[0]!);
+      const before = (await emailVerifiedAuditRows()).length;
+
+      const res = await verify.app.inject({
+        method: 'GET',
+        url: `${AUTH_BASE_PATH}/verify-email?token=${encodeURIComponent(token)}`,
+        headers: { ...json, 'x-forwarded-for': '10.96.1.5' },
+        remoteAddress: '10.96.1.5',
+      });
+      expect(res.statusCode).toBe(200);
+
+      const [user] = await testDb.select().from(schema.users).where(eq(schema.users.id, userId));
+      expect(user?.emailVerified).toBe(true);
+
+      const rows = await emailVerifiedAuditRows();
+      expect(rows.length).toBe(before + 1);
+      const latest = rows.sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime())[0]!;
+      expect(latest).toMatchObject({
+        organizationId: null,
+        actorUserId: userId,
+        actorType: 'user',
+        metadata: { target_user_id: userId },
+      });
+      expect(JSON.stringify(latest.metadata)).not.toContain(email);
+
+      // Now verified, this user can sign in (requireEmailVerification: true would otherwise block it).
+      const signIn = await verify.auth.api.signInEmail({
+        body: { email, password: 'a-very-long-password-123' },
+      });
+      expect(signIn.user.id).toBe(userId);
+    } finally {
+      if (userId) await cleanupVerifyUser(userId);
+      await verify.app.close();
+    }
+  });
+
+  it('an invalid token is rejected and audits nothing (failure path)', async () => {
+    const verify = buildVerifyTestApp();
+    try {
+      const before = (await emailVerifiedAuditRows()).length;
+      const res = await verify.app.inject({
+        method: 'GET',
+        url: `${AUTH_BASE_PATH}/verify-email?token=not-a-real-token`,
+        headers: { ...json, 'x-forwarded-for': '10.96.1.6' },
+        remoteAddress: '10.96.1.6',
+      });
+      expect(res.statusCode).toBe(401);
+      expect((await emailVerifiedAuditRows()).length).toBe(before);
+    } finally {
+      await verify.app.close();
+    }
+  });
+
+  it('requesting a resend for an unknown email is still 200, and audits nothing', async () => {
+    const verify = buildVerifyTestApp();
+    try {
+      const before = (await emailVerifiedAuditRows()).length;
+      const res = await verify.app.inject({
+        method: 'POST',
+        url: `${AUTH_BASE_PATH}/send-verification-email`,
+        headers: { ...json, 'x-forwarded-for': '10.96.1.7' },
+        remoteAddress: '10.96.1.7',
+        payload: { email: 'verify-unknown@example.invalid' },
+      });
+      expect(res.statusCode).toBe(200);
+      expect((await emailVerifiedAuditRows()).length).toBe(before);
+      expect(verify.sentUrls).toHaveLength(0); // no email is sent for an unknown address either
+    } finally {
+      await verify.app.close();
     }
   });
 });
