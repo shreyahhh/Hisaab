@@ -24,9 +24,11 @@ import { requireSession, type TenantScopeDeps } from '../tenantScope.js';
  * login_failed's metadata holds no email and no hash of one (privacy-dpdp.md: audit metadata is ids
  * and counts only). It says which account the attempt targeted — `target_user_id` when the attempted
  * email belongs to a user, `unknown_account: true` when it doesn't — so an attack on one account is
- * visible in the trail without it storing what was typed. login_succeeded carries no such metadata
- * (nothing to say beyond "it happened"), so it records `actorUserId` instead — also the fix for
- * issue #57: a platform-wide row's own test can no longer be confused with a concurrent suite's.
+ * visible in the trail without it storing what was typed. login_succeeded's metadata is just
+ * `method: 'password'` (issue #16 — Google sign-in writes the same action with `method: 'google'`
+ * from a databaseHooks hook instead, packages/auth/src/hooks.ts), and it records `actorUserId` too —
+ * also the fix for issue #57: a platform-wide row's own test can no longer be confused with a
+ * concurrent suite's.
  */
 export function registerAuthWrapperRoutes(
   app: FastifyInstance,
@@ -80,6 +82,7 @@ export function registerAuthWrapperRoutes(
         action: 'login_succeeded',
         targetType: 'auth',
         targetId: 'login',
+        metadata: { method: 'password' },
       });
       await forwardResponse(reply, response);
     },

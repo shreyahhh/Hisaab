@@ -19,7 +19,7 @@ describe('validateAuditMetadata', () => {
     expect(validateAuditMetadata('login_failed', { target_user_id: UUID })).toEqual({
       target_user_id: UUID,
     });
-    expect(validateAuditMetadata('login_succeeded', undefined)).toEqual({});
+    expect(validateAuditMetadata('member_invite_accepted', undefined)).toEqual({});
     expect(validateAuditMetadata('retention_run', { events: 4, touchpoints: 0 })).toEqual({
       events: 4,
       touchpoints: 0,

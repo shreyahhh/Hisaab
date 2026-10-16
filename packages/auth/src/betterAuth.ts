@@ -8,7 +8,7 @@ import type { AuthEnv } from '@truepath/shared';
 import { ac, adminRole, analystRole, ownerRole, viewerRole } from './accessControl.js';
 import { noopEmailSender, type AuthEmailSender } from './email.js';
 import { AUTH_BASE_PATH, DISABLED_AUTH_PATHS } from './exposure.js';
-import { nullGoogleTokensAfterCreate, truncateIp } from './hooks.js';
+import { auditGoogleSessionCreate, nullGoogleTokensAfterCreate, truncateIp } from './hooks.js';
 
 export type { AuthEnv };
 
@@ -162,6 +162,7 @@ export function createAuth(options: CreateAuthOptions) {
           before: async (session) => ({
             data: { ...session, ipAddress: truncateIp(session.ipAddress) },
           }),
+          after: async (session, ctx) => auditGoogleSessionCreate(db, session, ctx),
         },
       },
       account: {

@@ -70,7 +70,10 @@ export const AUDIT_METADATA_SCHEMAS = {
   integration_connected: z.object({ provider }).strict(),
   integration_disconnected: z.object({ provider }).strict(),
   integration_settings_changed: z.object({ provider, changed_fields: changedFields }).strict(),
-  login_succeeded: empty,
+  // Issue #16: which path authenticated the user, never anything about the account itself. Written
+  // by the /v1/auth/login wrapper (method: 'password') and by the auditGoogleSessionCreate
+  // databaseHooks.session.create.after hook (packages/auth/src/hooks.ts, method: 'google').
+  login_succeeded: z.object({ method: z.enum(['password', 'google']) }).strict(),
   // Which account an attempt targeted, never what was typed: no email and no hash of one.
   login_failed: z.union([
     z.object({ target_user_id: z.string().uuid() }).strict(),
@@ -204,7 +207,11 @@ export const AUDIT_ACTION_OWNERS = {
     'apps/api/src/routes/shopifyWebhooks.test.ts',
   ),
   integration_settings_changed: pending('M1-2 / M2-1'),
-  login_succeeded: implemented('M0-4', 'apps/api/src/auditTrail.test.ts'),
+  login_succeeded: implemented(
+    'M0-4',
+    'apps/api/src/auditTrail.test.ts',
+    'packages/auth/src/hooks.test.ts',
+  ),
   login_failed: implemented('M0-4', 'apps/api/src/loginAudit.test.ts'),
   password_reset_requested: implemented('#16', 'apps/api/src/authBridge.test.ts'),
   password_reset_completed: implemented('#16', 'apps/api/src/authBridge.test.ts'),
