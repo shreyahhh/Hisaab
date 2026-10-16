@@ -19,6 +19,8 @@ export const PLATFORM_AUDIT_ACTIONS = [
   'login_failed',
   'password_reset_requested',
   'password_reset_completed',
+  'email_verified',
+  'password_changed',
   'retention_run',
   'suppression_rebuilt',
   'webhook_deliveries_pruned',
@@ -82,6 +84,16 @@ export const AUDIT_METADATA_SCHEMAS = {
   // unknown_account branch not existing here).
   password_reset_requested: z.object({ target_user_id: z.string().uuid() }).strict(),
   password_reset_completed: z.object({ target_user_id: z.string().uuid() }).strict(),
+  // Issue #16: fires from the afterEmailVerification hook, which only runs once the token is
+  // verified and emailVerified is actually set — never the email itself (privacy-dpdp.md's rule).
+  email_verified: z.object({ target_user_id: z.string().uuid() }).strict(),
+  // Issue #16: fires from the generic hooks.after middleware (betterAuth.ts), matched on
+  // ctx.path === '/change-password', which only runs once the endpoint actually succeeds (a wrong
+  // currentPassword throws before reaching it). revoked_other_sessions records the client-supplied
+  // revokeOtherSessions flag, never the password itself.
+  password_changed: z
+    .object({ target_user_id: z.string().uuid(), revoked_other_sessions: z.boolean() })
+    .strict(),
   member_invited: z.object({ role: RoleSchema }).strict(),
   member_invite_accepted: empty,
   member_role_changed: z.object({ from: RoleSchema, to: RoleSchema }).strict(),
@@ -208,6 +220,8 @@ export const AUDIT_ACTION_OWNERS = {
   login_failed: implemented('M0-4', 'apps/api/src/loginAudit.test.ts'),
   password_reset_requested: implemented('#16', 'apps/api/src/authBridge.test.ts'),
   password_reset_completed: implemented('#16', 'apps/api/src/authBridge.test.ts'),
+  email_verified: implemented('#16', 'apps/api/src/authBridge.test.ts'),
+  password_changed: implemented('#16', 'apps/api/src/authBridge.test.ts'),
   member_invited: implemented('M0-4', 'apps/api/src/auditTrail.test.ts'),
   member_invite_accepted: implemented('M0-4', 'apps/api/src/auditTrail.test.ts'),
   member_role_changed: implemented('M0-4', 'apps/api/src/auditTrail.test.ts'),

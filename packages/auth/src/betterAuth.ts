@@ -1,4 +1,5 @@
 import { betterAuth } from 'better-auth';
+import { APIError, createAuthMiddleware } from 'better-auth/api';
 import { drizzleAdapter } from 'better-auth/adapters/drizzle';
 import { organization } from 'better-auth/plugins/organization';
 import { redisStorage } from '@better-auth/redis-storage';
@@ -133,6 +134,21 @@ export function createAuth(options: CreateAuthOptions) {
     emailVerification: {
       sendVerificationEmail: async ({ user, url }) =>
         emailSender.sendVerificationEmail({ to: user.email, url }),
+      // Issue #16: /verify-email is bridged straight to Better Auth's own HTTP router (ADR-0022),
+      // which runs outside our route handlers, so this lifecycle callback is the only place that
+      // sees it. It only fires once the token is verified and emailVerified is actually set (never
+      // for an expired/invalid token, which redirects or 401s before reaching here) — so there is
+      // nothing to additionally gate, and metadata is target_user_id only, never the email.
+      afterEmailVerification: async (user) => {
+        await createAuditLogRepository(db).writePlatform({
+          actorUserId: user.id,
+          actorType: 'user',
+          action: 'email_verified',
+          targetType: 'auth',
+          targetId: 'email_verification',
+          metadata: { target_user_id: user.id },
+        });
+      },
     },
     socialProviders: {
       google: {
@@ -169,6 +185,32 @@ export function createAuth(options: CreateAuthOptions) {
           after: async (account) => nullGoogleTokensAfterCreate(db, account),
         },
       },
+    },
+    // Generic per-endpoint audit hook (issue #16), distinct from databaseHooks above (model-level,
+    // not path-level). /change-password is bridged straight to Better Auth's own HTTP router
+    // (ADR-0022), which runs outside our Fastify route handlers, so this is the only place that
+    // sees a real, authenticated password change. Unlike the plugin-level callbacks above,
+    // `hooks.after` runs whether or not the endpoint succeeded (verified: a wrong currentPassword
+    // still reached this hook), so a failed change must be told apart from a real one explicitly —
+    // `ctx.context.returned instanceof APIError` is Better Auth's own signal for that.
+    hooks: {
+      after: createAuthMiddleware(async (ctx) => {
+        if (ctx.path !== '/change-password') return;
+        if (ctx.context.returned instanceof APIError) return;
+        const session = ctx.context.session;
+        if (!session) return;
+        await createAuditLogRepository(db).writePlatform({
+          actorUserId: session.user.id,
+          actorType: 'user',
+          action: 'password_changed',
+          targetType: 'auth',
+          targetId: 'password_change',
+          metadata: {
+            target_user_id: session.user.id,
+            revoked_other_sessions: Boolean(ctx.body?.revokeOtherSessions),
+          },
+        });
+      }),
     },
     plugins: [
       organization({

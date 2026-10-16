@@ -60,6 +60,24 @@ export const EXPOSED_AUTH_ROUTES = [
     reason:
       'Audited as password_reset_completed via the onPasswordReset hook (betterAuth.ts), which only fires after the token is verified, consumed and the password actually changed — an invalid/expired token never reaches it.',
   },
+  {
+    method: 'POST',
+    path: '/send-verification-email',
+    reason:
+      'Resends the verification email for any syntactically valid address, with a constant-time response so an unknown or already-verified email is indistinguishable from a real, unverified one — same no-enumeration shape as /request-password-reset. No state changes, so nothing to audit here; the completion is audited at /verify-email.',
+  },
+  {
+    method: 'GET',
+    path: '/verify-email',
+    reason:
+      'Audited as email_verified via the afterEmailVerification hook (betterAuth.ts), which only fires once the token is verified and emailVerified is actually set — an invalid/expired token redirects or 401s before reaching it. requireEmailVerification: true means this is also the only way a real signup can ever complete — it could not safely stay disabled.',
+  },
+  {
+    method: 'POST',
+    path: '/change-password',
+    reason:
+      "Audited as password_changed via the generic hooks.after middleware (betterAuth.ts), matched on ctx.path — the only place that sees it, since this runs through Better Auth's own HTTP router (ADR-0022). Unlike the plugin-level callbacks the other routes above use, this hook runs whether or not the endpoint succeeded, so it explicitly skips when ctx.context.returned is an APIError (a wrong currentPassword) before writing anything. revokeOtherSessions is the client-supplied request body flag Better Auth already honours; metadata records only whether it was set, never the password.",
+  },
 ] as const satisfies readonly ExposedAuthRoute[];
 
 /**
@@ -91,11 +109,9 @@ export const DISABLED_AUTH_PATHS = [
   '/refresh-token',
   '/verify-password',
   // Password, email and profile.
-  '/change-password',
-  // /request-password-reset and /reset-password (+ /reset-password/:token, which this list can't
-  // hold a literal match for) are exposed and audited (issue #16) — see EXPOSED_AUTH_ROUTES.
-  '/send-verification-email',
-  '/verify-email',
+  // /request-password-reset, /reset-password (+ /reset-password/:token, which this list can't hold
+  // a literal match for), /send-verification-email, /verify-email and /change-password are exposed
+  // and audited (issue #16) — see EXPOSED_AUTH_ROUTES.
   '/change-email',
   '/update-user',
   '/delete-user',
