@@ -101,7 +101,10 @@ describe('auditGoogleSessionCreate (issue #16)', () => {
   async function withUser(fn: (userId: string) => Promise<void>) {
     const [user] = await db
       .insert(schema.users)
-      .values({ email: `hooks-test-google-${Date.now()}-${Math.random()}@example.invalid`, name: 'Hooks Test' })
+      .values({
+        email: `hooks-test-google-${Date.now()}-${Math.random()}@example.invalid`,
+        name: 'Hooks Test',
+      })
       .returning({ id: schema.users.id });
     if (!user) throw new Error('setup: user insert failed');
     try {
@@ -116,7 +119,9 @@ describe('auditGoogleSessionCreate (issue #16)', () => {
     return db
       .select()
       .from(schema.auditLog)
-      .where(and(eq(schema.auditLog.action, 'login_succeeded'), eq(schema.auditLog.actorUserId, userId)));
+      .where(
+        and(eq(schema.auditLog.action, 'login_succeeded'), eq(schema.auditLog.actorUserId, userId)),
+      );
   }
 
   it('audits login_succeeded with method: google for a completed OAuth callback (ctx.path = /callback/:id, params.id = google)', () =>
