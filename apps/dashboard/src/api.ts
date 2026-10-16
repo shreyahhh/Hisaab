@@ -156,10 +156,22 @@ export interface AuditLogEntry {
   created_at: string;
 }
 
+export interface MetaWarmupSummary {
+  store_id: string;
+  calls_total: number;
+  calls_success: number;
+  calls_error: number;
+  error_rate: number | null;
+  last_run_at: string | null;
+  last_error_code: string | null;
+  meets_advanced_access_bar: boolean;
+}
+
 export interface SystemStatus {
   api: string;
   suppress_ready_at: number | null;
   stream_events_raw_length: number | null;
   stream_events_dead_length: number | null;
   queues: { name: string; waiting: number | null; active: number | null; failed: number | null }[];
+  meta_warmup: MetaWarmupSummary[];
 }

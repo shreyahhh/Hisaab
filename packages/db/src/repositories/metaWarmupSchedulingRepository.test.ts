@@ -145,3 +145,91 @@ describe('MetaWarmupSchedulingRepository.listWarmupStores', () => {
     }
   });
 });
+
+describe('MetaWarmupSchedulingRepository.listWarmupStates (issue #63)', () => {
+  it('reports null warmup for a store with an active integration but no run yet', async () => {
+    const t = await seedTestTenant('warmup-state-none');
+    try {
+      await createIntegrationRepository(db).upsertMeta(jobScope(t), {
+        storeId: t.storeId,
+        externalAccountId: 'biz_x',
+        credentialsJson: '{}',
+        scopes: [],
+        cipher,
+      });
+      const rows = (await repo.listWarmupStates(system)).filter((r) => r.storeId === t.storeId);
+      expect(rows).toEqual([
+        { storeId: t.storeId, organizationId: t.organizationId, warmup: null },
+      ]);
+    } finally {
+      await cleanupTestTenant(t);
+    }
+  });
+
+  it('reports the ledger once patchMetaWarmupState has run, with no registered ad account required', async () => {
+    const t = await seedTestTenant('warmup-state-ledger');
+    try {
+      const scope = jobScope(t);
+      await createIntegrationRepository(db).upsertMeta(scope, {
+        storeId: t.storeId,
+        externalAccountId: 'biz_x',
+        credentialsJson: '{}',
+        scopes: [],
+        cipher,
+      });
+      await createIntegrationRepository(db).patchMetaWarmupState(scope, t.storeId, {
+        calls_total: 10,
+        calls_success: 9,
+        calls_error: 1,
+        last_run_at: '2026-10-16T00:00:00.000Z',
+      });
+      const rows = (await repo.listWarmupStates(system)).filter((r) => r.storeId === t.storeId);
+      expect(rows).toEqual([
+        {
+          storeId: t.storeId,
+          organizationId: t.organizationId,
+          warmup: {
+            calls_total: 10,
+            calls_success: 9,
+            calls_error: 1,
+            last_run_at: '2026-10-16T00:00:00.000Z',
+          },
+        },
+      ]);
+    } finally {
+      await cleanupTestTenant(t);
+    }
+  });
+
+  it('leaves out a revoked integration', async () => {
+    const t = await seedTestTenant('warmup-state-revoked');
+    try {
+      const scope = jobScope(t);
+      const integration = await createIntegrationRepository(db).upsertMeta(scope, {
+        storeId: t.storeId,
+        externalAccountId: 'biz_x',
+        credentialsJson: '{}',
+        scopes: [],
+        cipher,
+      });
+      await createIntegrationRepository(db).revokeForOrganization(
+        scope,
+        t.organizationId,
+        integration.id,
+      );
+      const rows = (await repo.listWarmupStates(system)).filter((r) => r.storeId === t.storeId);
+      expect(rows).toEqual([]);
+    } finally {
+      await cleanupTestTenant(t);
+    }
+  });
+
+  it('refuses a TenantScope — listing across stores needs an audited SystemScope (ADR-0016)', async () => {
+    const t = await seedTestTenant('warmup-state-scope');
+    try {
+      await expect(repo.listWarmupStates(jobScope(t))).rejects.toThrow(SystemScopeRequiredError);
+    } finally {
+      await cleanupTestTenant(t);
+    }
+  });
+});

@@ -41,6 +41,7 @@ export {
 export {
   createMetaWarmupSchedulingRepository,
   type MetaWarmupSchedulingRepository,
+  type WarmupState,
   type WarmupStore,
 } from './repositories/metaWarmupSchedulingRepository.js';
 export {

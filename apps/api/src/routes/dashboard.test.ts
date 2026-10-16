@@ -1,4 +1,8 @@
 import { afterAll, afterEach, describe, expect, it } from 'vitest';
+import { createIntegrationRepository } from '@truepath/db';
+import { createTestCredentialsCipher } from '@truepath/privacy/testing';
+import { storeBoundScope } from '@truepath/shared';
+import { resetMetaWarmupCacheForTests } from './systemStatus.js';
 import { buildTestApp, testAuth, testDb } from '../testApp.js';
 import { cleanupRealTenant, seedRealTenant, type RealTenant } from '../testAuthTenant.js';
 
@@ -114,5 +118,95 @@ describe('dashboard read endpoints', () => {
 
     const anon = await app.inject({ method: 'GET', url: '/v1/system/status' });
     expect(anon.statusCode).toBe(401);
+  });
+
+  // issue #63: the Meta warm-up ratio on the same route, since it needs a seeded integration +
+  // ledger rather than a freshly created store's defaults.
+  it('GET /v1/system/status — meta_warmup reports the ledger for a store with an active Meta integration', async () => {
+    const t = await tenant('dash-system-status-warmup');
+    const scope = storeBoundScope(t.storeId);
+    const cipher = createTestCredentialsCipher();
+    await createIntegrationRepository(testDb).upsertMeta(scope, {
+      storeId: t.storeId,
+      externalAccountId: `biz_${t.storeId}`,
+      credentialsJson: '{}',
+      scopes: [],
+      cipher,
+    });
+    await createIntegrationRepository(testDb).patchMetaWarmupState(scope, t.storeId, {
+      calls_total: 100,
+      calls_success: 80,
+      calls_error: 20,
+      last_run_at: '2026-10-16T00:00:00.000Z',
+    });
+    // The route caches this cross-tenant read for 30s (systemStatus.ts) — a previous test in this
+    // file may have already populated it before this store existed.
+    resetMetaWarmupCacheForTests();
+
+    const res = await app.inject({
+      method: 'GET',
+      url: '/v1/system/status',
+      headers: { cookie: t.cookie },
+    });
+    expect(res.statusCode).toBe(200);
+    const row = (res.json().meta_warmup as Array<{ store_id: string }>).find(
+      (r) => r.store_id === t.storeId,
+    );
+    expect(row).toMatchObject({
+      calls_total: 100,
+      calls_success: 80,
+      calls_error: 20,
+      error_rate: 0.2,
+      last_run_at: '2026-10-16T00:00:00.000Z',
+      last_error_code: null,
+      meets_advanced_access_bar: false, // calls_total < 1500
+    });
+  });
+
+  it('GET /v1/system/status — meta_warmup is cached for 30s, so a ledger update is not visible until the cache is reset', async () => {
+    const t = await tenant('dash-system-status-warmup-cache');
+    const scope = storeBoundScope(t.storeId);
+    const cipher = createTestCredentialsCipher();
+    await createIntegrationRepository(testDb).upsertMeta(scope, {
+      storeId: t.storeId,
+      externalAccountId: `biz_${t.storeId}`,
+      credentialsJson: '{}',
+      scopes: [],
+      cipher,
+    });
+    await createIntegrationRepository(testDb).patchMetaWarmupState(scope, t.storeId, {
+      calls_total: 1,
+    });
+    resetMetaWarmupCacheForTests();
+
+    const findRow = (body: unknown) =>
+      (body as { meta_warmup: Array<{ store_id: string; calls_total: number }> }).meta_warmup.find(
+        (r) => r.store_id === t.storeId,
+      );
+
+    const first = await app.inject({
+      method: 'GET',
+      url: '/v1/system/status',
+      headers: { cookie: t.cookie },
+    });
+    expect(findRow(first.json())?.calls_total).toBe(1);
+
+    await createIntegrationRepository(testDb).patchMetaWarmupState(scope, t.storeId, {
+      calls_total: 2,
+    });
+    const second = await app.inject({
+      method: 'GET',
+      url: '/v1/system/status',
+      headers: { cookie: t.cookie },
+    });
+    expect(findRow(second.json())?.calls_total).toBe(1); // still cached
+
+    resetMetaWarmupCacheForTests();
+    const third = await app.inject({
+      method: 'GET',
+      url: '/v1/system/status',
+      headers: { cookie: t.cookie },
+    });
+    expect(findRow(third.json())?.calls_total).toBe(2);
   });
 });
