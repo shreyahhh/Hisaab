@@ -3,7 +3,6 @@ import { cleanupTestTenant, seedTestTenant, type TestTenant } from '@truepath/db
 import { storeContext } from '@truepath/privacy';
 import { collectorStoreKey, storeBoundScope, suppressionSetKey } from '@truepath/shared';
 import { createIntegrationRepository, jobScope, schema, type Db } from '@truepath/db';
-import type { ShopifyAdapter, ShopifyOrderSnapshot } from '@truepath/integrations';
 import { eq } from 'drizzle-orm';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
@@ -14,7 +13,6 @@ import {
   testHasher,
   testIdentityStitchQueue,
   testRedis,
-  testShopify,
   testShopifySyncQueue,
 } from '../testApp.js';
 
@@ -30,37 +28,6 @@ function orderWebhookPayload(overrides: Record<string, unknown> = {}) {
     financial_status: 'paid',
     fulfillment_status: null,
     payment_gateway_names: ['razorpay'],
-    ...overrides,
-  };
-}
-
-/** A ShopifyAdapter whose fetchOrder is controllable, for the refund/fulfillment hint tests. */
-function appWithFetchOrder(fetchOrderImpl: ShopifyAdapter['fetchOrder']) {
-  return buildTestApp({
-    shopify: { ...testShopify, adapter: { ...testShopify.adapter, fetchOrder: fetchOrderImpl } },
-  });
-}
-
-function graphQlSnapshot(overrides: Partial<ShopifyOrderSnapshot> = {}): ShopifyOrderSnapshot {
-  return {
-    externalOrderId: '1001',
-    createdAtPlatform: '2026-09-01T10:00:00Z',
-    updatedAtPlatform: '2026-09-01T10:05:00Z',
-    cancelledAt: null,
-    currency: 'INR',
-    totalPrice: '1299.00',
-    totalRefunded: '100.00',
-    totalOutstanding: '0.00',
-    financialStatus: 'PAID',
-    fulfillmentStatus: 'UNFULFILLED',
-    paymentGatewayNames: ['razorpay'],
-    email: null,
-    phone: null,
-    shippingAddressZip: null,
-    landingSite: null,
-    referringSite: null,
-    noteAttributes: [],
-    discountCodes: [],
     ...overrides,
   };
 }
@@ -897,7 +864,7 @@ describe('POST /webhooks/shopify/orders — validation failures log field paths 
   });
 });
 
-describe('POST /webhooks/shopify/order-hints — refunds/fulfillments (M1-2)', () => {
+describe('POST /webhooks/shopify/order-hints — refunds/fulfillments (issue #41)', () => {
   async function tenantWithIntegration(label: string) {
     const t = await tenant(label);
     await createIntegrationRepository(testDb).upsertShopify(jobScope(t.organizationId, t.storeId), {
@@ -916,50 +883,53 @@ describe('POST /webhooks/shopify/order-hints — refunds/fulfillments (M1-2)', (
     return t;
   }
 
-  it('refunds/create fetches the full order and updates refunded_amount_paise', async () => {
+  // The queue is the real local one — remove what a test enqueues so a worker running against the
+  // same Redis never picks up a leftover test job.
+  async function jobFor(storeId: string, externalOrderId: string) {
+    const job = await testShopifySyncQueue.getJob(`shopify-refresh-${storeId}-${externalOrderId}`);
+    if (job) cleanups.push(async () => void (await job.remove().catch(() => undefined)));
+    return job;
+  }
+
+  it('refunds/create enqueues a debounced order_refresh job, tied to the store and order id', async () => {
     const t = await tenantWithIntegration('webhook-refund-hint');
     const [store] = await testDb
       .select()
       .from(schema.stores)
       .where(eq(schema.stores.id, t.storeId));
-    const app2 = appWithFetchOrder(async () => graphQlSnapshot());
-    try {
-      const payload = JSON.stringify({ order_id: 1001, created_at: '2026-09-01T11:00:00Z' });
-      const res = await app2.inject({
-        method: 'POST',
-        url: '/webhooks/shopify/order-hints',
-        payload,
-        headers: {
-          'content-type': 'application/json',
-          'x-shopify-hmac-sha256': sign(payload),
-          'x-shopify-shop-domain': store!.shopDomain,
-          'x-shopify-topic': 'refunds/create',
-          'x-shopify-webhook-id': randomUUID(),
-        },
-      });
-      expect(res.statusCode).toBe(200);
+    const payload = JSON.stringify({ order_id: 1001, created_at: '2026-09-01T11:00:00Z' });
+    const res = await app.inject({
+      method: 'POST',
+      url: '/webhooks/shopify/order-hints',
+      payload,
+      headers: {
+        'content-type': 'application/json',
+        'x-shopify-hmac-sha256': sign(payload),
+        'x-shopify-shop-domain': store!.shopDomain,
+        'x-shopify-topic': 'refunds/create',
+        'x-shopify-webhook-id': randomUUID(),
+      },
+    });
+    expect(res.statusCode).toBe(200);
 
-      const [row] = await testDb
-        .select()
-        .from(schema.orders)
-        .where(eq(schema.orders.storeId, t.storeId));
-      expect(row?.externalOrderId).toBe('1001');
-      expect(row?.refundedAmountPaise).toBe(10000);
-    } finally {
-      await app2.close();
-    }
+    const job = await jobFor(t.storeId, '1001');
+    expect(job?.data).toEqual({
+      storeId: t.storeId,
+      mode: 'order_refresh',
+      externalOrderIds: ['1001'],
+    });
+    expect(job?.opts.delay).toBe(30_000);
   });
 
-  it('a hint for an order that does not exist yet creates it from the fetched snapshot (out-of-order delivery)', async () => {
-    const t = await tenantWithIntegration('webhook-hint-order-not-yet-created');
+  it('fulfillments/create and fulfillments/update also enqueue order_refresh', async () => {
+    const t = await tenantWithIntegration('webhook-fulfillment-hint');
     const [store] = await testDb
       .select()
       .from(schema.stores)
       .where(eq(schema.stores.id, t.storeId));
-    const app2 = appWithFetchOrder(async () => graphQlSnapshot({ externalOrderId: '5001' }));
-    try {
+    for (const shopifyTopic of ['fulfillments/create', 'fulfillments/update'] as const) {
       const payload = JSON.stringify({ order_id: 5001, updated_at: '2026-09-01T11:00:00Z' });
-      const res = await app2.inject({
+      const res = await app.inject({
         method: 'POST',
         url: '/webhooks/shopify/order-hints',
         payload,
@@ -967,31 +937,58 @@ describe('POST /webhooks/shopify/order-hints — refunds/fulfillments (M1-2)', (
           'content-type': 'application/json',
           'x-shopify-hmac-sha256': sign(payload),
           'x-shopify-shop-domain': store!.shopDomain,
-          'x-shopify-topic': 'fulfillments/create',
+          'x-shopify-topic': shopifyTopic,
           'x-shopify-webhook-id': randomUUID(),
         },
       });
       expect(res.statusCode).toBe(200);
-      const [row] = await testDb
-        .select()
-        .from(schema.orders)
-        .where(eq(schema.orders.storeId, t.storeId));
-      expect(row?.externalOrderId).toBe('5001'); // created purely from the hint's fetchOrder call
-    } finally {
-      await app2.close();
     }
+    expect((await jobFor(t.storeId, '5001'))?.data.externalOrderIds).toEqual(['5001']);
   });
 
-  it('acks and skips when Shopify has no such order (never retries forever)', async () => {
-    const t = await tenantWithIntegration('webhook-hint-order-missing');
+  it('collapses a redelivery (a different webhook id for the same order) into the one debounced job', async () => {
+    const t = await tenantWithIntegration('webhook-hint-redelivery');
     const [store] = await testDb
       .select()
       .from(schema.stores)
       .where(eq(schema.stores.id, t.storeId));
-    const app2 = appWithFetchOrder(async () => null);
+    for (const webhookId of [randomUUID(), randomUUID()]) {
+      const payload = JSON.stringify({ order_id: 2002 });
+      const res = await app.inject({
+        method: 'POST',
+        url: '/webhooks/shopify/order-hints',
+        payload,
+        headers: {
+          'content-type': 'application/json',
+          'x-shopify-hmac-sha256': sign(payload),
+          'x-shopify-shop-domain': store!.shopDomain,
+          'x-shopify-topic': 'refunds/create',
+          'x-shopify-webhook-id': webhookId,
+        },
+      });
+      expect(res.statusCode).toBe(200);
+    }
+    const jobs = await testShopifySyncQueue.getJobs(['waiting', 'delayed', 'active', 'completed']);
+    const matching = jobs.filter(
+      (j) => j.data.mode === 'order_refresh' && j.data.externalOrderIds?.includes('2002'),
+    );
+    expect(matching).toHaveLength(1);
+    await jobFor(t.storeId, '2002');
+  });
+
+  it('acks a malformed payload without enqueueing, logging field paths only', async () => {
+    const t = await tenantWithIntegration('webhook-hint-malformed');
+    const [store] = await testDb
+      .select()
+      .from(schema.stores)
+      .where(eq(schema.stores.id, t.storeId));
+    const poison = 'poison-value-never-logged';
+    const original = console.error;
+    const logged: string[] = [];
+    console.error = (...args: unknown[]) => logged.push(args.map(String).join(' '));
     try {
-      const payload = JSON.stringify({ order_id: 9999 });
-      const res = await app2.inject({
+      const payload = JSON.stringify({ note: poison }); // missing order_id entirely
+      const res = await app.inject({
         method: 'POST',
         url: '/webhooks/shopify/order-hints',
         payload,
@@ -1004,69 +1001,11 @@ describe('POST /webhooks/shopify/order-hints — refunds/fulfillments (M1-2)', (
         },
       });
       expect(res.statusCode).toBe(200);
-      const rows = await testDb
-        .select()
-        .from(schema.orders)
-        .where(eq(schema.orders.storeId, t.storeId));
-      expect(rows).toHaveLength(0);
     } finally {
-      await app2.close();
+      console.error = original;
     }
-  });
-
-  it('calls fetchOrder before ever touching the database — never inside a transaction (M1-2 review item 1)', async () => {
-    const t = await tenantWithIntegration('webhook-hint-fetch-order');
-    const [store] = await testDb
-      .select()
-      .from(schema.stores)
-      .where(eq(schema.stores.id, t.storeId));
-    const callOrder: string[] = [];
-    const realTransaction = testDb.transaction.bind(testDb);
-    const spiedDb = new Proxy(testDb, {
-      get(target, prop, receiver) {
-        if (prop === 'transaction') {
-          return (...args: Parameters<typeof realTransaction>) => {
-            callOrder.push('transaction-start');
-            return realTransaction(...args);
-          };
-        }
-        const value = Reflect.get(target, prop, receiver);
-        return typeof value === 'function' ? value.bind(target) : value;
-      },
-    });
-    const app2 = buildTestApp({
-      db: spiedDb,
-      shopify: {
-        ...testShopify,
-        adapter: {
-          ...testShopify.adapter,
-          fetchOrder: async () => {
-            callOrder.push('fetch-order');
-            return graphQlSnapshot();
-          },
-        },
-      },
-    });
-    try {
-      const payload = JSON.stringify({ order_id: 1001 });
-      await app2.inject({
-        method: 'POST',
-        url: '/webhooks/shopify/order-hints',
-        payload,
-        headers: {
-          'content-type': 'application/json',
-          'x-shopify-hmac-sha256': sign(payload),
-          'x-shopify-shop-domain': store!.shopDomain,
-          'x-shopify-topic': 'refunds/create',
-          'x-shopify-webhook-id': randomUUID(),
-        },
-      });
-      expect(callOrder[0]).toBe('fetch-order');
-      expect(callOrder).toContain('transaction-start');
-      expect(callOrder.indexOf('fetch-order')).toBeLessThan(callOrder.indexOf('transaction-start'));
-    } finally {
-      await app2.close();
-    }
+    expect(logged.some((l) => l.includes('order_id'))).toBe(true);
+    expect(logged.some((l) => l.includes(poison))).toBe(false);
   });
 });
 

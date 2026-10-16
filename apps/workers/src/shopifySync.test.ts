@@ -42,6 +42,7 @@ interface FakeAdapterOptions {
   readonly startBulkOrders?: ReturnType<typeof vi.fn>;
   readonly refresh?: ReturnType<typeof vi.fn>;
   readonly bulkOperation?: ReturnType<typeof vi.fn>;
+  readonly fetchOrder?: ReturnType<typeof vi.fn>;
   readonly lines?: readonly ShopifyBulkOrderLine[];
 }
 
@@ -50,6 +51,7 @@ function fakeAdapter(options: FakeAdapterOptions = {}) {
     options.startBulkOrders ?? vi.fn().mockResolvedValue('gid://shopify/BulkOperation/1');
   const refresh = options.refresh ?? vi.fn().mockRejectedValue(new Error('not used'));
   const bulkOperation = options.bulkOperation ?? vi.fn().mockRejectedValue(new Error('not used'));
+  const fetchOrder = options.fetchOrder ?? vi.fn().mockRejectedValue(new Error('not used'));
   const streamBulkOrders = vi.fn(async function* () {
     for (const line of options.lines ?? []) yield line;
   });
@@ -61,14 +63,14 @@ function fakeAdapter(options: FakeAdapterOptions = {}) {
     shopInfo: () => Promise.reject(new Error('not used')),
     healthCheck: () => Promise.resolve({ healthy: true }),
     verifyWebhook: () => true,
-    fetchOrder: () => Promise.reject(new Error('not used')),
+    fetchOrder,
     startBulkOrders,
     bulkOperation,
     streamBulkOrders,
     upsertWebPixel: () => Promise.reject(new Error('not used')),
     uninstallApp: () => Promise.reject(new Error('not used')),
   };
-  return { adapter, startBulkOrders, refresh, bulkOperation, streamBulkOrders };
+  return { adapter, startBulkOrders, refresh, bulkOperation, fetchOrder, streamBulkOrders };
 }
 
 // No shopper is erased and no stitch queue is real unless a test says so.
@@ -646,8 +648,8 @@ describe('shopify-sync processor — bulk_result: identity stitching and erased 
 });
 
 describe('shopify-sync processor — unimplemented modes', () => {
-  it.each(['reconcile', 'order_refresh'] as const)(
-    'throws a clear error for %s (not built yet)',
+  it.each(['reconcile'] as const)(
+    'throws a clear error for %s (not built yet, issue #111)',
     async (mode) => {
       const { adapter } = fakeAdapter();
       await expect(
@@ -655,4 +657,115 @@ describe('shopify-sync processor — unimplemented modes', () => {
       ).rejects.toThrow(`'${mode}' is not implemented yet`);
     },
   );
+});
+
+describe('shopify-sync processor — mode: order_refresh (issue #41)', () => {
+  const refreshJob = (storeId: string, externalOrderIds: readonly string[]) =>
+    job({ storeId, mode: 'order_refresh', externalOrderIds });
+
+  it('re-fetches and applies the order, then enqueues stitch at attempt 0', async () => {
+    const tenant = await seedTestTenant('shopify-sync-refresh-apply');
+    try {
+      await connectStore(tenant);
+      const { adapter, fetchOrder } = fakeAdapter({
+        fetchOrder: vi.fn().mockResolvedValue(snapshot({ externalOrderId: '5001' })),
+      });
+      const identityStitchQueue = { addBulk: vi.fn(async () => []) };
+      await createShopifySyncProcessor(
+        depsFor(adapter, {
+          identityStitchQueue:
+            identityStitchQueue as unknown as ShopifySyncDeps['identityStitchQueue'],
+        }),
+      )(refreshJob(tenant.storeId, ['5001']));
+
+      expect(fetchOrder).toHaveBeenCalledTimes(1);
+      const rows = await ordersOf(tenant.storeId);
+      expect(rows).toHaveLength(1);
+      expect(rows[0]!.externalOrderId).toBe('5001');
+      expect(identityStitchQueue.addBulk).toHaveBeenCalledWith([
+        expect.objectContaining({
+          data: { storeId: tenant.storeId, orderId: rows[0]!.id, attempt: 0 },
+        }),
+      ]);
+    } finally {
+      await cleanupTestTenant(tenant);
+    }
+  });
+
+  it('refreshes several orders in one job', async () => {
+    const tenant = await seedTestTenant('shopify-sync-refresh-multi');
+    try {
+      await connectStore(tenant);
+      const { adapter } = fakeAdapter({
+        fetchOrder: vi
+          .fn()
+          .mockResolvedValueOnce(snapshot({ externalOrderId: '7001' }))
+          .mockResolvedValueOnce(snapshot({ externalOrderId: '7002' })),
+      });
+      await createShopifySyncProcessor(depsFor(adapter))(
+        refreshJob(tenant.storeId, ['7001', '7002']),
+      );
+
+      const rows = await ordersOf(tenant.storeId);
+      expect(rows.map((r) => r.externalOrderId).sort()).toEqual(['7001', '7002']);
+    } finally {
+      await cleanupTestTenant(tenant);
+    }
+  });
+
+  it('logs and skips (never retries forever) when Shopify has no such order', async () => {
+    const tenant = await seedTestTenant('shopify-sync-refresh-missing');
+    try {
+      await connectStore(tenant);
+      const { adapter } = fakeAdapter({ fetchOrder: vi.fn().mockResolvedValue(null) });
+
+      await expect(
+        createShopifySyncProcessor(depsFor(adapter))(refreshJob(tenant.storeId, ['9999'])),
+      ).resolves.toBeUndefined();
+      expect(await ordersOf(tenant.storeId)).toHaveLength(0);
+    } finally {
+      await cleanupTestTenant(tenant);
+    }
+  });
+
+  it('is idempotent: re-running the same fetched state adds no duplicate event row', async () => {
+    const tenant = await seedTestTenant('shopify-sync-refresh-idempotent');
+    try {
+      await connectStore(tenant);
+      const { adapter } = fakeAdapter({
+        fetchOrder: vi.fn().mockResolvedValue(snapshot({ externalOrderId: '8001' })),
+      });
+      const process = createShopifySyncProcessor(depsFor(adapter));
+
+      await process(refreshJob(tenant.storeId, ['8001']));
+      await process(refreshJob(tenant.storeId, ['8001']));
+
+      const rows = await ordersOf(tenant.storeId);
+      expect(rows).toHaveLength(1);
+      const events = (await db.select().from(schema.orderStatusEvents)).filter(
+        (e) => e.orderId === rows[0]!.id,
+      );
+      expect(events).toHaveLength(1);
+    } finally {
+      await cleanupTestTenant(tenant);
+    }
+  });
+
+  it('throws when the job carries no externalOrderIds', async () => {
+    const { adapter } = fakeAdapter();
+    await expect(
+      createShopifySyncProcessor(depsFor(adapter))(
+        job({ storeId: 'irrelevant', mode: 'order_refresh' }),
+      ),
+    ).rejects.toThrow('no externalOrderIds');
+  });
+
+  it('is a no-op when the store no longer exists', async () => {
+    const { adapter } = fakeAdapter();
+    await expect(
+      createShopifySyncProcessor(depsFor(adapter))(
+        refreshJob('00000000-0000-0000-0000-000000000000', ['1']),
+      ),
+    ).resolves.toBeUndefined();
+  });
 });

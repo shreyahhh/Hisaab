@@ -162,12 +162,12 @@ Both shapes map to one internal `ShopifyOrderSnapshot`. For webhook snapshots, `
 ### 2.6 Queue job
 `ShopifySyncJob{storeId, mode:'backfill'|'reconcile'|'bulk_result'|'order_refresh', bulkOperationId?, externalOrderIds?}` on `shopify-sync` (SPEC v0.3).
 
-| mode | `jobId` | Notes |
+| mode | `jobId` (as written here) | Notes |
 |---|---|---|
-| `backfill` | `shopify-backfill:<storeId>:<days>` | `days` = 60 or 90 |
-| `bulk_result` | `shopify-bulk:<bulkOperationId>` | |
-| `reconcile` | `shopify-reconcile:<storeId>:<yyyymmdd>` | |
-| `order_refresh` | `shopify-refresh:<storeId>:<externalOrderId>` | **Debounced, 30 s**: enqueued with `delay: 30000`. While a job with that id is waiting or delayed, BullMQ ignores further adds with the same `jobId`, so a burst of `orders/create` + `refunds/create` + `fulfillments/*` for one order collapses into one fetch ~30 s after the first hint. `removeOnComplete: true`, so the next hint after completion schedules a new refresh. One job per order (`externalOrderIds` has length 1). |
+| `backfill` | `shopify-backfill:<storeId>:<days>` | `days` = 60 or 90. **Built as `backfill-<storeId>`** (no `:days` — BullMQ custom job ids reject a 2nd/3rd colon; see `routes/integrations.ts`). |
+| `bulk_result` | `shopify-bulk:<bulkOperationId>` | **Built as `bulk-result-<bulkOperationId's last segment>`**, same colon constraint. |
+| `reconcile` | `shopify-reconcile:<storeId>:<yyyymmdd>` | Not built yet — issue #111. |
+| `order_refresh` | `shopify-refresh:<storeId>:<externalOrderId>` | **Built as `shopify-refresh-<storeId>-<externalOrderId>`**, same colon constraint. **Debounced, 30 s**: enqueued with `delay: 30000`. While a job with that id is waiting or delayed, BullMQ ignores further adds with the same `jobId`, so a burst of `orders/create` + `refunds/create` + `fulfillments/*` for one order collapses into one fetch ~30 s after the first hint. `removeOnComplete: true`, so the next hint after completion schedules a new refresh. One job per order (`externalOrderIds` has length 1). The apply reuses `bulk_result`'s per-order logic (`shopifySync.ts`'s `applyBulkOrder`) rather than a third copy, so it also shares that path's `eventStatus: 'updated'` — the refund-vs-fulfillment distinction the old synchronous webhook handler used to record is not reconstructed (issue #41). |
 
 ### 2.7 Adapter (`packages/integrations/src/shopify`)
 
@@ -298,46 +298,49 @@ was a specific M1-2 review requirement, not an incidental design choice.
 8. Webhooks only create orders with `created_at ≥ install_time − backfill days` — **not enforced in
    M1-2** (no install-time gating yet; every order webhook received is processed).
 
-**M1-2 implementation note**: this diagram shows the target end-state, including the ClickHouse
-projection and debounced-refresh queue neither of which M1-2 builds (§4.4 steps 6–7). What M1-2
-actually does for a hint webhook is call `fetchOrder` synchronously, inline in the request — no
-queue, no debounce, no delay — *before* opening any transaction, then applies the resulting full
-snapshot the same way an `orders/*` webhook would. See `apps/api/src/shopifyOrderCredentials.ts`
-(`fetchOrderWithTokenRefresh`) and `apps/api/src/routes/shopifyWebhooks.ts`
-(`handleOrderHintWebhook`). This keeps the response within Shopify's 5-second budget only because
-`fetchOrder` itself is capped at 2 attempts / a fixed 250 ms retry delay (§4.7) and fails fast
-(throws, relying on Shopify's own webhook retry) if Shopify's GraphQL API is still throttling past
-that — there is no BullMQ debounce to fall back on in M1-2, so a slow or throttled Shopify response
-is a webhook failure, not a deferred job. Issue #27 tracks adding the debounce once M1-6's queue
-infrastructure exists — it is more valuable there than as a delay in front of a call this ticket
-already makes synchronous.
+**M1-2 implementation note**: this diagram shows the target end-state, except for the ClickHouse
+projection (§4.4 step 6, still not built — M1-6). The debounced-refresh queue step **is now built**
+(issue #41): a hint webhook (`refunds/*`, `fulfillments/*`) enqueues `ShopifySyncJob{mode:
+'order_refresh'}` (debounced 30 s, §2.6) and returns `200` immediately — it no longer calls
+`fetchOrder` synchronously, inline in the request. The worker's `order_refresh` processor
+(`apps/workers/src/shopifySync.ts`) is what actually calls `fetchOrder` and applies the result,
+reusing `bulk_result`'s per-order apply path (`applyBulkOrder`) rather than this diagram's §4.4 steps
+verbatim — see §2.6's table for exactly what that reuse does and doesn't preserve (the
+refund-vs-fulfillment `eventStatus` distinction). `IdentityStitchJob{attempt:0}` enqueues after a
+successful apply, same as the synchronous path used to (M1-7).
 
 ```mermaid
 sequenceDiagram
   participant S as Shopify
   participant API as Core API /webhooks/shopify/:topic
-  participant SH as Shopify GraphQL (fetchOrder, hints only)
+  participant Q as shopify-sync (order_refresh, debounced 30s)
+  participant SH as Shopify GraphQL (fetchOrder)
   participant PG as Postgres
   participant CH as ClickHouse order_status
-  participant Q as shopify-sync / identity-stitch
+  participant IS as identity-stitch
   S->>API: orders/updated or refunds/create (HMAC, X-Shopify-Webhook-Id)
   API->>API: verify HMAC; parse; hash email/phone; drop raw
-  opt partial hint (refunds/*, fulfillments/*)
-    API->>SH: fetchOrder (outside any transaction/lock; ≤2 attempts, 250ms delay, fails fast on sustained throttling)
-    SH-->>API: full ShopifyOrderSnapshot, or thrown error (Shopify retries the webhook)
+  alt partial hint (refunds/*, fulfillments/*)
+    API->>Q: enqueue order_refresh{storeId, externalOrderIds:[id]}, jobId stable per (store, order)
+    API-->>S: 200 (the apply below happens later, in the worker)
+  else full webhook (orders/*)
+    API->>PG: BEGIN; INSERT order (ON CONFLICT DO NOTHING); SELECT ... FOR UPDATE; INSERT order_status_events(raw_ref) ON CONFLICT DO NOTHING
+    alt duplicate (order_id, source, raw_ref)
+      API-->>S: 200 (no-op)
+    else T ≥ last shopify event
+      API->>PG: apply mapping (+cancelled if pending); COMMIT
+      API->>CH: INSERT full row, source_updated_at = max over sources — not built in M1-2 (M1-6)
+      API-->>S: 200
+    else stale (T < last shopify event)
+      API->>PG: keep event row only; COMMIT
+      API-->>S: 200
+    end
+    API->>IS: IdentityStitchJob{attempt:0}
   end
-  API->>PG: BEGIN; INSERT order (ON CONFLICT DO NOTHING); SELECT ... FOR UPDATE; INSERT order_status_events(raw_ref) ON CONFLICT DO NOTHING
-  alt duplicate (order_id, source, raw_ref)
-    API-->>S: 200 (no-op)
-  else T ≥ last shopify event
-    API->>PG: apply mapping (+cancelled if pending); COMMIT
-    API->>CH: INSERT full row, source_updated_at = max over sources — not built in M1-2 (M1-6)
-    API-->>S: 200
-  else stale (T < last shopify event)
-    API->>PG: keep event row only; COMMIT
-    API-->>S: 200
-  end
-  Note over API,Q: order_refresh / IdentityStitchJob enqueue — not built in M1-2 (M1-7, issue #27)
+  Q->>SH: fetchOrder (after the 30s debounce window)
+  SH-->>Q: full ShopifyOrderSnapshot, or null (order not found — logged, skipped)
+  Q->>PG: apply via bulk_result's per-order path (applyBulkOrder), raw_ref = recon:<updatedAt>
+  Q->>IS: IdentityStitchJob{attempt:0} (on a successful apply)
 ```
 
 ### 4.5 Field mapping (`ShopifyOrderSnapshot` → `orders`)
@@ -399,28 +402,30 @@ Deviations from the text below, all deliberate:
 - Orders are applied one at a time, each in its own transaction, not in batches of 1,000.
 - A result with any unreadable line applies the rest, then fails the job and marks the backfill
   `failed` (`error_code: invalid_lines`) instead of reporting a partly-read backfill as complete.
-- Not built, tracked in issue #41: the `partialDataUrl` restart, `IdentityStitchJob` enqueueing (waits
-  on the `identity-stitch` queue, M1-7), the audit row for backfill counts, `reconcile`,
-  `order_refresh`, the 60→90-day auto-extend, and the up-to-5-concurrent-queries accounting.
+- Not built: the `partialDataUrl` restart, the audit row for backfill counts (issue #41); `reconcile`
+  (issue #111); the 60→90-day auto-extend (issue #112); the up-to-5-concurrent-queries accounting
+  (issue #113). `IdentityStitchJob` enqueueing and `order_refresh` **are** built (the latter moved
+  off the synchronous webhook path onto `shopify-sync`, see §2.6 and below).
 
 - **`backfill`**:
   - `startBulkOrders(since = now − days)`, where `days` = 60 without `read_all_orders`, else 90.
-  - Up to 5 concurrent bulk queries per shop are allowed from API 2026-01 ([bulk queries](https://shopify.dev/docs/api/usage/bulk-operations/queries)); we use 1.
-  - **Auto-extend**: when a re-authorisation adds `read_all_orders`, enqueue `backfill` with `days = 90` for the 60–90-day range only (`untilIso = now − 60 d`, or the earliest order already held).
+  - Up to 5 concurrent bulk queries per shop are allowed from API 2026-01 ([bulk queries](https://shopify.dev/docs/api/usage/bulk-operations/queries)); we use 1 — nothing enforces that yet (issue #113).
+  - **Auto-extend** (not built — issue #112): when a re-authorisation adds `read_all_orders`, enqueue `backfill` for the 60–90-day range only (`untilIso = now − 60 d`, or the earliest order already held).
 - **`bulk_result`**:
   - **Stream** the JSONL from the signed URL (valid one week); nothing touches disk or S3.
-  - Apply each line through §4.4 with `raw_ref = recon:<updatedAt>`, in batches of 1,000.
+  - Apply each line through §4.4 with `raw_ref = recon:<updatedAt>`, one at a time (not batched 1,000 — see the deviations list above).
   - Bulk-enqueue `IdentityStitchJob{attempt:2}` and project each batch.
-  - If only `partialDataUrl` is available, process it and restart from the last `createdAt` seen.
+  - If only `partialDataUrl` is available, process it and restart from the last `createdAt` seen (not built — issue #41).
   - Set `settings.backfill.status='done'`, `last_synced_at`; audit counts.
-- **`reconcile`** (daily 03:30 IST, `SystemScope` fan-out):
+- **`reconcile`** (not built — issue #111; daily 03:30 IST, `SystemScope` fan-out):
   - `ordersUpdatedSince(last_reconcile_at − 1 h)`, 250 per page, applied through §4.4. More than 10,000 changed orders → bulk instead.
   - Refreshes `shop_hosts` and republishes the collector config on change. Keeps the refresh token in use.
   - **Consent-region check** (SPEC v0.6, if the scope is approved): `consentPolicy(countryCode: IN) { consentRequired }` ([consentPolicy](https://shopify.dev/docs/api/admin-graphql/latest/queries/consentPolicy)). `consentRequired = false` → republish the collector config `inactive` (`consent_policy_not_required`), with a banner and email (privacy-dpdp §4.13). The query also runs at onboarding step 8. The required access scope isn't documented — **VERIFY** in a dev store (pending in HLD §8).
-- **`order_refresh`**: `fetchOrder` → §4.4 (debounced as in §2.6). **Not built in M1-2**: M1-2's
-  `refunds/*`/`fulfillments/*` handlers call `fetchOrder` synchronously inline instead (§4.4), since
-  no `shopify-sync` queue exists yet to debounce into. Issue #27 tracks adding this job and moving
-  hint-triggered refreshes onto it.
+- **`order_refresh`** (built, issue #41): `fetchOrder` → applied via `bulk_result`'s per-order apply
+  (`applyBulkOrder`, reused rather than duplicated), then `IdentityStitchJob{attempt:0}` — same
+  attempt the old synchronous handler used (identity-stitching.md §2.1), debounced as in §2.6. The
+  `refunds/*`/`fulfillments/*` webhook handlers used to call `fetchOrder` synchronously, inline in
+  the request, before `shopify-sync` existed to debounce into; they now just enqueue this mode.
 - **Rate limits** ([GraphQL rate limits](https://shopify.dev/docs/apps/build/apis/graphql-admin/rate-limits)):
   - The calculated-cost leaky bucket restores 100 points/s (Standard), 200 (Advanced), 1,000 (Plus), 2,000 (Commerce Components).
   - A single query may not exceed 1,000 points.
