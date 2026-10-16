@@ -29,9 +29,11 @@ import {
 } from '@truepath/shared';
 
 // The `shopify-sync` queue's processor (HLD §8; shopify-integration.md §4.7). Implements
-// `mode: 'backfill'` (start the bulk order query, M1-3) and `mode: 'bulk_result'` (stream and apply
-// its JSONL, M1-3b). `reconcile`, `order_refresh` and the 60→90-day auto-extend are deferred
-// (issue #41); nothing enqueues them yet.
+// `mode: 'backfill'` (start the bulk order query, M1-3), `mode: 'bulk_result'` (stream and apply its
+// JSONL, M1-3b), and `mode: 'order_refresh'` (re-fetch and apply one or more orders — the debounced
+// replacement for the refund/fulfillment hint webhook's old synchronous apply, issue #41).
+// `reconcile` and the 60→90-day auto-extend are tracked separately (issues #111, #112): each is its
+// own fan-out/scheduling surface, not a small addition to this file.
 
 export interface ShopifySyncDeps {
   readonly db: Db;
@@ -267,13 +269,13 @@ async function runBulkResult(deps: ShopifySyncDeps, job: ShopifySyncJob): Promis
         applied += 1;
         toStitch.push(result.orderId);
         if (toStitch.length >= STITCH_ENQUEUE_CHUNK)
-          await enqueueStitch(deps, job.storeId, toStitch.splice(0));
+          await enqueueStitch(deps, job.storeId, toStitch.splice(0), 2);
       } else {
         skippedNonInr += 1;
       }
     }
   }
-  await enqueueStitch(deps, job.storeId, toStitch.splice(0));
+  await enqueueStitch(deps, job.storeId, toStitch.splice(0), 2);
 
   if (skippedNonInr > 0) {
     console.error(
@@ -314,23 +316,72 @@ async function runBulkResult(deps: ShopifySyncDeps, job: ShopifySyncJob): Promis
 const STITCH_ENQUEUE_CHUNK = 500;
 
 /**
- * Backfilled orders have no pixel data to wait for, so they enter the stitch chain at its last attempt:
- * the HMAC fallback, then the UTM fallback (identity-stitching.md §5, shopify-integration.md §4.7).
- * The job ids dedupe a re-run of the same bulk result.
+ * Enqueues a stitch attempt for each order id. `attempt` is the caller's choice: backfilled orders
+ * (no pixel data to wait for) enter at the last attempt, 2 — the HMAC fallback, then the UTM fallback
+ * (identity-stitching.md §5, shopify-integration.md §4.7) — while an `order_refresh` apply re-enters
+ * at attempt 0, same as the webhook path it replaces (shopifyWebhooks.ts's `applyOrderSnapshot`). The
+ * job ids dedupe a re-run of the same result.
  */
 async function enqueueStitch(
   deps: ShopifySyncDeps,
   storeId: string,
   orderIds: readonly string[],
+  attempt: 0 | 2,
 ): Promise<void> {
   if (orderIds.length === 0) return;
   await deps.identityStitchQueue.addBulk(
     orderIds.map((orderId) => ({
       name: 'stitch',
-      data: { storeId, orderId, attempt: 2 as const },
-      opts: { jobId: identityStitchJobId(orderId, 2), ...IDENTITY_STITCH_JOB_OPTIONS },
+      data: { storeId, orderId, attempt },
+      opts: { jobId: identityStitchJobId(orderId, attempt), ...IDENTITY_STITCH_JOB_OPTIONS },
     })),
   );
+}
+
+/**
+ * `order_refresh` (issue #41): re-fetches one or more orders and applies them, same as the
+ * refund/fulfillment "hint" webhook path used to do synchronously, inline in the request
+ * (shopifyWebhooks.ts's `handleOrderHintWebhook`) — moved here so the webhook handler can debounce
+ * instead (LLD §2.6: 30s, one job per order, stable job id). Reuses `applyBulkOrder` rather than a
+ * third near-copy of the apply logic: a refetched order and a bulk-result row are the same shape
+ * (`ShopifyOrderSnapshot`), and `recon:<updatedAtPlatform>` is in fact a better idempotency key here
+ * than the old path's webhook id — it's keyed to the data, not the delivery, so several webhooks
+ * collapsing into one debounced fetch still applies cleanly exactly once per distinct order state.
+ */
+async function runOrderRefresh(deps: ShopifySyncDeps, job: ShopifySyncJob): Promise<void> {
+  const externalOrderIds = job.externalOrderIds ?? [];
+  if (externalOrderIds.length === 0) {
+    throw new Error('shopify-sync order_refresh: job has no externalOrderIds');
+  }
+  const loaded = await loadStoreAndIntegration(deps, job);
+  if (!loaded) return;
+  const { scope, store, integration } = loaded;
+
+  const stitched: string[] = [];
+  for (const externalOrderId of externalOrderIds) {
+    const snapshot = await withTokenRefresh(
+      deps,
+      scope,
+      job.storeId,
+      store.shopDomain,
+      integration,
+      (creds) => deps.adapter.fetchOrder(store.shopDomain, creds, externalOrderId),
+    );
+    if (!snapshot) {
+      // Same reasoning as the webhook path this replaces: shouldn't happen for a refund/fulfillment
+      // hint in practice; log and move on to the next id rather than retrying forever.
+      console.error(
+        JSON.stringify({
+          event: 'shopify_order_refresh_order_not_found',
+          store_id: job.storeId,
+        }),
+      );
+      continue;
+    }
+    const result = await applyBulkOrder(deps, scope, job.storeId, snapshot);
+    if (result.outcome === 'applied') stitched.push(result.orderId);
+  }
+  await enqueueStitch(deps, job.storeId, stitched, 0);
 }
 
 export function createShopifySyncProcessor(deps: ShopifySyncDeps) {
@@ -340,8 +391,9 @@ export function createShopifySyncProcessor(deps: ShopifySyncDeps) {
         return runBackfill(deps, job.data);
       case 'bulk_result':
         return runBulkResult(deps, job.data);
-      case 'reconcile':
       case 'order_refresh':
+        return runOrderRefresh(deps, job.data);
+      case 'reconcile':
         throw new Error(`shopify-sync: mode '${job.data.mode}' is not implemented yet`);
     }
   };

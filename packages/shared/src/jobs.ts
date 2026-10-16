@@ -59,9 +59,10 @@ export type ShopifySyncMode = (typeof SHOPIFY_SYNC_MODES)[number];
 /**
  * HLD §8: `ShopifySyncJob{storeId, mode, bulkOperationId?, externalOrderIds?}`.
  * - `backfill`: starts a bulk order query for the last `days` days (shopify-integration.md §4.7).
- * - `bulk_result`: processes the JSONL result of `bulkOperationId` (not yet built — tracked
- *   separately; this mode/field exists so the payload shape doesn't need to change later).
- * - `reconcile` / `order_refresh`: not yet built.
+ * - `bulk_result`: processes the JSONL result of `bulkOperationId`.
+ * - `order_refresh`: re-fetches and applies each of `externalOrderIds` — the debounced replacement
+ *   for a refund/fulfillment hint webhook's old synchronous apply (issue #41).
+ * - `reconcile`: not yet built (issue #111).
  */
 export interface ShopifySyncJob {
   readonly storeId: string;
@@ -70,6 +71,20 @@ export interface ShopifySyncJob {
   readonly bulkOperationId?: string;
   readonly externalOrderIds?: readonly string[];
 }
+
+/**
+ * shopify-integration.md §2.6: a refund/fulfillment hint webhook enqueues `order_refresh` delayed by
+ * this much, under a job id stable per (store, order) — several webhooks for the same order within
+ * the window collapse into the one delayed job BullMQ already has waiting, rather than queuing a
+ * fresh one each time.
+ */
+export const SHOPIFY_ORDER_REFRESH_DEBOUNCE_MS = 30_000;
+
+/** `removeOnComplete`: nothing re-reads a finished order_refresh job, unlike `identity-stitch`'s 30-day keep (used to dedupe a *repeat* of a completed job, which this job id never needs — see above). */
+export const SHOPIFY_ORDER_REFRESH_JOB_OPTIONS = {
+  delay: SHOPIFY_ORDER_REFRESH_DEBOUNCE_MS,
+  removeOnComplete: true,
+} as const;
 
 /** HLD §8: `identity-stitch`. */
 export const IDENTITY_STITCH_QUEUE = 'identity-stitch';
