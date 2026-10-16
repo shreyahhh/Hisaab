@@ -831,6 +831,48 @@ export function SystemPage() {
             Not shown, no worker yet: ad-sync-google-ads, shiprocket-sync, attribution-run's
             consumer, capi-dispatch, order-status-reconcile, retention (M2+).
           </p>
+          <section className="card">
+            <h2>Meta warm-up (issue #63)</h2>
+            <p className="muted small">
+              Advanced Access needs ≥ 1,500 calls and &lt; 15% errors in 15 days, per store.
+              Refreshes at most every 30s.
+            </p>
+            {q.data.meta_warmup.length === 0 ? (
+              <p className="muted small">No store has a Meta integration yet.</p>
+            ) : (
+              <table>
+                <thead>
+                  <tr>
+                    <th>Store</th>
+                    <th>Calls</th>
+                    <th>Errors</th>
+                    <th>Error rate</th>
+                    <th>Last run</th>
+                    <th>Last error</th>
+                    <th>Meets bar</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {q.data.meta_warmup.map((w) => (
+                    <tr key={w.store_id}>
+                      <td>{w.store_id}</td>
+                      <td>
+                        {w.calls_total.toLocaleString('en-IN')} (
+                        {w.calls_success.toLocaleString('en-IN')} ok)
+                      </td>
+                      <td>{w.calls_error.toLocaleString('en-IN')}</td>
+                      <td>{w.error_rate === null ? '—' : `${(w.error_rate * 100).toFixed(1)}%`}</td>
+                      <td>
+                        {w.last_run_at ? new Date(w.last_run_at).toLocaleString('en-IN') : 'never'}
+                      </td>
+                      <td>{w.last_error_code ?? '—'}</td>
+                      <td>{w.meets_advanced_access_bar ? 'yes' : 'no'}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
+          </section>
         </>
       )}
     </AppShell>
