@@ -75,6 +75,8 @@ const NOT_PLAIN_200 = new Set([
   '/reset-password/:token',
   // Requires a real token in its query string; tested properly, with a real one, below.
   '/verify-email',
+  // Requires a real authenticated session and the correct current password; tested properly below.
+  '/change-password',
 ]);
 
 const json = { origin: ORIGIN, 'content-type': 'application/json' };
@@ -623,5 +625,113 @@ describe('email verification (issue #16)', () => {
     } finally {
       await verify.app.close();
     }
+  });
+});
+
+// issue #16: /change-password is bridged straight to Better Auth (no wrapper route of our own),
+// audited via the generic hooks.after middleware in packages/auth/src/betterAuth.ts, matched on
+// ctx.path. Unlike reset/verify, this needs a real authenticated session (sensitiveSessionMiddleware)
+// rather than an emailed token, so seedRealTenant's known fixed password is the "real, found" account.
+describe('password change (issue #16)', () => {
+  const SEED_PASSWORD = 'a-very-long-password-123';
+
+  async function passwordChangedAuditRows(userId: string) {
+    return testDb
+      .select()
+      .from(schema.auditLog)
+      .where(
+        and(
+          eq(schema.auditLog.action, 'password_changed'),
+          eq(schema.auditLog.targetId, 'password_change'),
+          eq(schema.auditLog.actorUserId, userId),
+        ),
+      );
+  }
+
+  it('a correct current password changes it, signs in with the new one, and audits password_changed with revoked_other_sessions: false', async () => {
+    const owner = await seedRealTenant(testAuth, testDb, 'change-pw-ok');
+    try {
+      const before = (await passwordChangedAuditRows(owner.userId)).length;
+      const newPassword = 'a-different-long-password-789';
+
+      const res = await app.inject({
+        method: 'POST',
+        url: `${AUTH_BASE_PATH}/change-password`,
+        headers: { ...json, cookie: owner.cookie, 'x-forwarded-for': '10.95.1.1' },
+        remoteAddress: '10.95.1.1',
+        payload: { currentPassword: SEED_PASSWORD, newPassword },
+      });
+      expect(res.statusCode).toBe(200);
+
+      const rows = await passwordChangedAuditRows(owner.userId);
+      expect(rows.length).toBe(before + 1);
+      const latest = rows.sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime())[0]!;
+      expect(latest).toMatchObject({
+        organizationId: null,
+        actorUserId: owner.userId,
+        actorType: 'user',
+        metadata: { target_user_id: owner.userId, revoked_other_sessions: false },
+      });
+
+      const signIn = await testAuth.api.signInEmail({
+        body: { email: owner.email, password: newPassword },
+      });
+      expect(signIn.user.id).toBe(owner.userId);
+    } finally {
+      await cleanupRealTenant(testDb, owner);
+    }
+  });
+
+  it('revokeOtherSessions: true audits revoked_other_sessions: true', async () => {
+    const owner = await seedRealTenant(testAuth, testDb, 'change-pw-revoke');
+    try {
+      const newPassword = 'yet-another-long-password-012';
+      const res = await app.inject({
+        method: 'POST',
+        url: `${AUTH_BASE_PATH}/change-password`,
+        headers: { ...json, cookie: owner.cookie, 'x-forwarded-for': '10.95.1.2' },
+        remoteAddress: '10.95.1.2',
+        payload: { currentPassword: SEED_PASSWORD, newPassword, revokeOtherSessions: true },
+      });
+      expect(res.statusCode).toBe(200);
+
+      const rows = await passwordChangedAuditRows(owner.userId);
+      const latest = rows.sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime())[0]!;
+      expect(latest).toMatchObject({ metadata: { revoked_other_sessions: true } });
+    } finally {
+      await cleanupRealTenant(testDb, owner);
+    }
+  });
+
+  it('a wrong current password is rejected and audits nothing (failure path)', async () => {
+    const owner = await seedRealTenant(testAuth, testDb, 'change-pw-wrong');
+    try {
+      const before = (await passwordChangedAuditRows(owner.userId)).length;
+      const res = await app.inject({
+        method: 'POST',
+        url: `${AUTH_BASE_PATH}/change-password`,
+        headers: { ...json, cookie: owner.cookie, 'x-forwarded-for': '10.95.1.3' },
+        remoteAddress: '10.95.1.3',
+        payload: {
+          currentPassword: 'not-the-real-password-123',
+          newPassword: 'irrelevant-long-pw-456',
+        },
+      });
+      expect(res.statusCode).toBe(400);
+      expect((await passwordChangedAuditRows(owner.userId)).length).toBe(before);
+    } finally {
+      await cleanupRealTenant(testDb, owner);
+    }
+  });
+
+  it('without a session cookie it is unauthenticated and audits nothing', async () => {
+    const res = await app.inject({
+      method: 'POST',
+      url: `${AUTH_BASE_PATH}/change-password`,
+      headers: { ...json, 'x-forwarded-for': '10.95.1.4' },
+      remoteAddress: '10.95.1.4',
+      payload: { currentPassword: SEED_PASSWORD, newPassword: 'irrelevant-long-pw-789' },
+    });
+    expect(res.statusCode).toBe(401);
   });
 });
