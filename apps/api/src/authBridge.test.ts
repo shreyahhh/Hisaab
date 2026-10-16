@@ -55,7 +55,7 @@ const exposed = (method: string, path: string) =>
   EXPOSED_AUTH_ROUTES.some((route) => route.method === method && route.path === path);
 
 // Paths `disabledPaths` can't list because they carry a parameter, so only the allow-list covers them.
-const ALLOW_LIST_ONLY = ['/reset-password/:token'];
+const ALLOW_LIST_ONLY = ['/reset-password/:token', '/callback/:id'];
 
 // issue #16: unlike the three original GET routes (always 200, no input), these validate their body/
 // query and can't return 200 from an empty payload. `/request-password-reset` still can, with any
@@ -66,8 +66,19 @@ const ALLOW_LIST_ONLY = ['/reset-password/:token'];
 // a real body and a real audit row, in the dedicated tests further down this file instead.
 const PAYLOAD_OVERRIDES: Record<string, unknown> = {
   '/request-password-reset': { email: 'auth-bridge-smoke-test@example.invalid' },
+  // issue #16: a provider is all this needs to return Google's authorization URL (200) rather than a
+  // body-validation 400 — the real idToken sign-in / audit path is proven properly, with a full OAuth
+  // callback round-trip, in packages/auth/src/betterAuth.test.ts instead.
+  '/sign-in/social': { provider: 'google' },
 };
-const NOT_PLAIN_200 = new Set(['/reset-password', '/reset-password/:token']);
+const NOT_PLAIN_200 = new Set([
+  '/reset-password',
+  '/reset-password/:token',
+  // No code/state in this generic sweep's empty query, so Better Auth redirects to its error page
+  // (c.redirect — a 3xx, never a 404) rather than returning 200. A real, successful callback is
+  // proven end to end in packages/auth/src/betterAuth.test.ts instead.
+  '/callback/:id',
+]);
 
 const json = { origin: ORIGIN, 'content-type': 'application/json' };
 function viaApp(e: Endpoint) {

@@ -62,12 +62,23 @@ describe('SPEC §5.10 test 7 — Fastify routes (via routeRegistry)', () => {
     const app = buildTestApp();
     try {
       await app.ready();
-      const discovered = discoverCrossTenantRoutes(app.routeRegistry, {
-        id: tenantB.organizationId,
-        orgId: tenantB.organizationId,
-        storeId: tenantB.storeId,
-        userId: tenantB.userId,
-      });
+      const discovered = discoverCrossTenantRoutes(
+        app.routeRegistry,
+        {
+          id: tenantB.organizationId,
+          orgId: tenantB.organizationId,
+          storeId: tenantB.storeId,
+          userId: tenantB.userId,
+        },
+        {
+          // issue #16: GET /v1/auth/callback/:id's `:id` is Better Auth's OAuth provider id
+          // (`google`), not a tenant-owned resource — substituting tenant B's organizationId for it
+          // tests nothing about tenant isolation (a missing `state`/`code` 302s to Better Auth's own
+          // error page regardless of what :id is). Exempted below in EXEMPT_ROUTES instead, same as
+          // every other bridged Better Auth route.
+          allowlist: ['/v1/auth/callback/:id'],
+        },
+      );
 
       // Grows automatically as routes are registered — no edits needed here. As of this ticket
       // that's GET /v1/orgs/:id/stores, GET /v1/orgs/:id/audit-log, POST /v1/orgs/:id/invites,

@@ -269,7 +269,11 @@ const platformScenarios: PlatformScenario[] = [
       const u: RealUser = await user('trail-login-ok');
       return {
         status: 200,
-        expected: { action: 'login_succeeded', metadata: {}, actorUserId: u.userId },
+        expected: {
+          action: 'login_succeeded',
+          metadata: { method: 'password' },
+          actorUserId: u.userId,
+        },
         send: (app) =>
           app.inject({
             method: 'POST',

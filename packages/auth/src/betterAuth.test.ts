@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { eq } from 'drizzle-orm';
+import { and, eq, gte } from 'drizzle-orm';
 import { schema } from '@truepath/db';
 import { db } from '@truepath/db/testing';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
@@ -361,6 +361,95 @@ describe('createAuth — exposure (ADR-0022)', () => {
       ).toThrow(/exposeAllPathsForTests is test-only/);
     } finally {
       process.env.NODE_ENV = before;
+    }
+  });
+});
+
+describe('createAuth — Google sign-in end to end (issue #16)', () => {
+  // Google's token-exchange response carries the user's profile as an id_token JWT. Better Auth's
+  // Google provider only decodes this (jose's decodeJwt — no signature check) for the authorization-
+  // code flow; signature verification is only exercised for the separate idToken sign-in branch
+  // (packages/auth/src/hooks.test.ts covers that branch's audit behaviour directly, without a real
+  // signed token). So an arbitrary, unsigned token is enough to drive a real callback end to end.
+  function fakeGoogleIdToken(claims: Record<string, unknown>): string {
+    const part = (data: unknown) => Buffer.from(JSON.stringify(data)).toString('base64url');
+    return `${part({ alg: 'none', typ: 'JWT' })}.${part(claims)}.`;
+  }
+
+  it('a successful OAuth callback creates the user, signs them in, and audits login_succeeded with method: google', async () => {
+    const email = uniqueEmail('google-callback');
+    const idToken = fakeGoogleIdToken({
+      sub: `google-sub-${Date.now()}`,
+      email,
+      email_verified: true,
+      name: 'Google Callback Test',
+    });
+
+    const start = await auth.api.signInSocial({
+      body: { provider: 'google', callbackURL: 'http://localhost:5173/' },
+      asResponse: true,
+    });
+    // Better Auth binds the state to a signed cookie as well as its own server-side record
+    // (parseGenericState's stateCookieValue check) — a real browser carries that cookie from the
+    // redirect to Google back to our callback, so the test does too.
+    const stateCookie = start.headers.get('set-cookie');
+    if (!stateCookie) throw new Error('setup: signInSocial returned no state cookie');
+    const { url } = (await start.json()) as { url?: string };
+    const state = new URL(url ?? '').searchParams.get('state');
+    if (!state) throw new Error('setup: signInSocial returned no state');
+
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+      if (String(input) === 'https://oauth2.googleapis.com/token') {
+        return new Response(
+          JSON.stringify({
+            access_token: 'fake-access-token',
+            id_token: idToken,
+            token_type: 'Bearer',
+            expires_in: 3600,
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        );
+      }
+      return originalFetch(input, init);
+    }) as typeof fetch;
+
+    const since = new Date();
+    try {
+      const response = await auth.api.callbackOAuth({
+        params: { id: 'google' },
+        query: { code: 'fake-code', state },
+        headers: new Headers({ cookie: stateCookie }),
+        asResponse: true,
+      });
+      // Both success and failure throw a redirect (c.redirect) in Better Auth's callback handler —
+      // the real signal checked below is the session and the audit row, not the HTTP status.
+      expect(response.status).toBeGreaterThanOrEqual(300);
+      expect(response.status).toBeLessThan(400);
+
+      const [user] = await db.select().from(schema.users).where(eq(schema.users.email, email));
+      expect(user).toBeDefined();
+
+      const [account] = await db
+        .select()
+        .from(schema.authAccounts)
+        .where(eq(schema.authAccounts.userId, user!.id));
+      expect(account?.providerId).toBe('google');
+
+      const rows = await db
+        .select()
+        .from(schema.auditLog)
+        .where(
+          and(
+            eq(schema.auditLog.action, 'login_succeeded'),
+            eq(schema.auditLog.actorUserId, user!.id),
+            gte(schema.auditLog.createdAt, since),
+          ),
+        );
+      expect(rows).toHaveLength(1);
+      expect(rows[0]).toMatchObject({ organizationId: null, metadata: { method: 'google' } });
+    } finally {
+      globalThis.fetch = originalFetch;
     }
   });
 });

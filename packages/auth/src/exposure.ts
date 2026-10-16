@@ -60,23 +60,35 @@ export const EXPOSED_AUTH_ROUTES = [
     reason:
       'Audited as password_reset_completed via the onPasswordReset hook (betterAuth.ts), which only fires after the token is verified, consumed and the password actually changed — an invalid/expired token never reaches it.',
   },
+  {
+    method: 'POST',
+    path: '/sign-in/social',
+    reason:
+      "Starts Google sign-in: for a normal request (no idToken) it only returns Google's authorization URL — no session, no account, nothing to audit, same reasoning as the read-only routes above. It also doubles as the completion of Better Auth's idToken sign-in branch (a client that already holds a Google ID token, which our Google provider config accepts by default) — that branch creates a session directly here rather than via /callback/google below, and is audited the same way, by the auditGoogleSessionCreate databaseHooks.session.create.after hook (hooks.ts), matched on ctx.path.",
+  },
+  {
+    method: 'GET',
+    path: '/callback/:id',
+    reason:
+      "Google's own redirect target after consent: exchanges the code for tokens and creates or signs the user into their account, then 302s to the dashboard. :id is Better Auth's own route template (it has only ever registered a google provider here, so :id is google in practice — a request for any other id hits Better Auth's own \"provider not found\" error, not ours). Audited as login_succeeded (method: 'google') via the auditGoogleSessionCreate databaseHooks.session.create.after hook (hooks.ts), matched on ctx.path === '/callback/:id' and ctx.params.id === 'google' — it only fires once Better Auth has actually created a session, so every failure path (state mismatch, missing code, no email) redirects before reaching it and is not audited here (issue #16's open question on callback failures; left for a follow-up rather than guessed at).",
+  },
 ] as const satisfies readonly ExposedAuthRoute[];
 
 /**
  * Better Auth's `disabledPaths` (relative to AUTH_BASE_PATH, exact match): every concrete path we
  * don't use. Defence in depth behind the allow-list, so a bridge mistake still can't reach them.
- * Two paths can't be listed because they carry a parameter and `disabledPaths` matches literally —
- * `/callback/:id` (only `/callback/google` is concrete, and is listed) and `/reset-password/:token`;
- * those are covered by the allow-list alone. authBridge.test.ts fails if Better Auth gains a path
- * that is in neither list, so an upgrade or a new plugin can't add a route silently.
+ * `/reset-password/:token` can't be listed here because it carries a parameter and `disabledPaths`
+ * matches literally — it is instead exposed (see EXPOSED_AUTH_ROUTES), so the allow-list alone
+ * covers it. authBridge.test.ts fails if Better Auth gains a path that is in neither list, so an
+ * upgrade or a new plugin can't add a route silently.
  */
 export const DISABLED_AUTH_PATHS = [
-  // Sign-in and sign-up: our wrappers (/v1/auth/login, /signup) do these, with our rate limits and audit.
+  // Sign-in and sign-up: our wrappers (/v1/auth/login, /signup) do these, with our rate limits and
+  // audit. Google sign-in (/sign-in/social, /callback/:id) is exposed and audited instead — see
+  // EXPOSED_AUTH_ROUTES (issue #16).
   '/sign-in/email',
-  '/sign-in/social',
   '/sign-up/email',
   '/sign-out',
-  '/callback/google',
   // Sessions and accounts.
   '/list-sessions',
   '/list-accounts',

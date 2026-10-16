@@ -19,7 +19,8 @@ describe('audit metadata schemas', () => {
   });
 
   it.each([
-    ['login_succeeded', {}],
+    ['login_succeeded', { method: 'password' }],
+    ['login_succeeded', { method: 'google' }],
     ['login_failed', { target_user_id: UUID }],
     ['login_failed', { unknown_account: true }],
     ['member_invited', { role: 'admin' }],
@@ -41,6 +42,8 @@ describe('audit metadata schemas', () => {
     ['login_failed', {}],
     ['login_failed', { unknown_account: false }],
     ['login_succeeded', { email: 'x' }],
+    ['login_succeeded', {}],
+    ['login_succeeded', { method: 'facebook' }],
     ['member_invited', { role: 'superuser' }],
     ['member_invited', { role: 'admin', email: 'a@example.com' }],
     ['member_removed', { role: 'viewer', self: 'yes' }],
@@ -102,10 +105,10 @@ describe('audit entry types (compile-time)', () => {
       metadata: { from: 'viewer', to: 'analyst', email: 'a@example.com' },
     };
     const optional: AuditEntryInput = {
-      action: 'login_succeeded',
+      action: 'member_invite_accepted',
       actorType: 'user',
-      targetType: 'auth',
-      targetId: 'login',
+      targetType: 'invite',
+      targetId: UUID,
     };
     expect([missing, wrongShape, optional]).toHaveLength(3);
   });
